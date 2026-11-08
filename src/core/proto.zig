@@ -1,0 +1,139 @@
+//! Протокол между хостом и зрителем (веб-версия поверх WebSocket).
+//!
+//! Хост → зритель, двоичное сообщение — кадр:
+//!   [0] вид (1 — H.264 Annex B, 2 — JPEG), [1] флаги (бит 0 — ключевой кадр),
+//!   [2..10] время хоста в мкс (u64 LE), дальше — данные.
+//! Хост → зритель, текст — JSON: ok, size, pong, err, bye.
+//! Зритель → хост, текст — JSON: hello {code, h264}, ping {ts}.
+//! Зритель → хост, двоичное — ввод (все числа little-endian):
+//!   1 move  f32 x, f32 y (0..1)        2 button u8 btn, u8 down, f32 x, f32 y
+//!   3 wheel f32 dx, f32 dy (пиксели)   4 key u16 hid, u8 down
+//!   5 release_all                      16 keyframe
+const std = @import("std");
+
+pub const frame_header_len = 10;
+
+pub const FrameKind = enum(u8) { h264 = 1, jpeg = 2 };
+
+pub fn frameHeader(buf: *[frame_header_len]u8, kind: FrameKind, keyframe: bool, ts_us: u64) void {
+    buf[0] = @intFromEnum(kind);
+    buf[1] = if (keyframe) 1 else 0;
+    std.mem.writeInt(u64, buf[2..10], ts_us, .little);
+}
+
+pub const Input = union(enum) {
+    move: struct { x: f32, y: f32 },
+    button: struct { button: u8, down: bool, x: f32, y: f32 },
+    wheel: struct { dx: f32, dy: f32 },
+    key: struct { usage: u16, down: bool },
+    release_all,
+    keyframe,
+};
+
+fn readF32(b: *const [4]u8) f32 {
+    const v = @as(f32, @bitCast(std.mem.readInt(u32, b, .little)));
+    return if (std.math.isFinite(v)) v else 0;
+}
+
+pub fn decodeInput(b: []const u8) ?Input {
+    if (b.len == 0) return null;
+    switch (b[0]) {
+        1 => {
+            if (b.len < 9) return null;
+            return .{ .move = .{ .x = readF32(b[1..5]), .y = readF32(b[5..9]) } };
+        },
+        2 => {
+            if (b.len < 11) return null;
+            return .{ .button = .{ .button = b[1], .down = b[2] != 0, .x = readF32(b[3..7]), .y = readF32(b[7..11]) } };
+        },
+        3 => {
+            if (b.len < 9) return null;
+            return .{ .wheel = .{ .dx = readF32(b[1..5]), .dy = readF32(b[5..9]) } };
+        },
+        4 => {
+            if (b.len < 4) return null;
+            return .{ .key = .{ .usage = std.mem.readInt(u16, b[1..3], .little), .down = b[3] != 0 } };
+        },
+        5 => return .release_all,
+        16 => return .keyframe,
+        else => return null,
+    }
+}
+
+// --- JSON: мелкие сообщения своего же клиента, разбираем без аллокаций.
+
+/// Значение строкового поля "key":"..." (без экранирования — наши поля его не содержат).
+pub fn jsonString(msg: []const u8, comptime key: []const u8) ?[]const u8 {
+    const pat = "\"" ++ key ++ "\":\"";
+    const i = std.mem.indexOf(u8, msg, pat) orelse return null;
+    const start = i + pat.len;
+    const end = std.mem.indexOfScalarPos(u8, msg, start, '"') orelse return null;
+    return msg[start..end];
+}
+
+/// true, если в сообщении есть "key":true.
+pub fn jsonTrue(msg: []const u8, comptime key: []const u8) bool {
+    return std.mem.indexOf(u8, msg, "\"" ++ key ++ "\":true") != null;
+}
+
+/// Сырое числовое значение поля "key":123.45 — для эха (ping → pong).
+pub fn jsonNumber(msg: []const u8, comptime key: []const u8) ?[]const u8 {
+    const pat = "\"" ++ key ++ "\":";
+    const i = std.mem.indexOf(u8, msg, pat) orelse return null;
+    const start = i + pat.len;
+    var end = start;
+    while (end < msg.len and (std.ascii.isDigit(msg[end]) or msg[end] == '.' or msg[end] == '-' or msg[end] == 'e' or msg[end] == 'E' or msg[end] == '+')) end += 1;
+    return if (end > start) msg[start..end] else null;
+}
+
+/// Копирует s в out, экранируя для JSON-строки. Обрезает, если не влезает.
+pub fn jsonEscape(out: []u8, s: []const u8) []const u8 {
+    var n: usize = 0;
+    for (s) |c| {
+        const need: usize = if (c == '"' or c == '\\') 2 else if (c < 0x20) 0 else 1;
+        if (need == 0) continue;
+        if (n + need > out.len) break;
+        if (need == 2) {
+            out[n] = '\\';
+            n += 1;
+        }
+        out[n] = c;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "proto: ввод" {
+    var b: [11]u8 = undefined;
+    b[0] = 2;
+    b[1] = 0;
+    b[2] = 1;
+    std.mem.writeInt(u32, b[3..7], @as(u32, @bitCast(@as(f32, 0.25))), .little);
+    std.mem.writeInt(u32, b[7..11], @as(u32, @bitCast(@as(f32, 0.75))), .little);
+    const in = decodeInput(&b).?;
+    try std.testing.expectEqual(@as(f32, 0.25), in.button.x);
+    try std.testing.expectEqual(@as(f32, 0.75), in.button.y);
+    try std.testing.expect(in.button.down);
+    try std.testing.expectEqual(@as(?Input, null), decodeInput(b[0..5]));
+    const k = decodeInput(&.{ 4, 0xE3, 0, 1 }).?;
+    try std.testing.expectEqual(@as(u16, 0xE3), k.key.usage);
+    try std.testing.expect(decodeInput(&.{5}).? == .release_all);
+}
+
+test "proto: json" {
+    const m = "{\"t\":\"hello\",\"code\":\"123456789\",\"h264\":true,\"ts\":1234.5}";
+    try std.testing.expectEqualStrings("hello", jsonString(m, "t").?);
+    try std.testing.expectEqualStrings("123456789", jsonString(m, "code").?);
+    try std.testing.expect(jsonTrue(m, "h264"));
+    try std.testing.expectEqualStrings("1234.5", jsonNumber(m, "ts").?);
+    var out: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("a\\\"b", jsonEscape(&out, "a\"b"));
+}
+
+test "proto: заголовок кадра" {
+    var h: [frame_header_len]u8 = undefined;
+    frameHeader(&h, .h264, true, 0x0102);
+    try std.testing.expectEqual(@as(u8, 1), h[0]);
+    try std.testing.expectEqual(@as(u8, 1), h[1]);
+    try std.testing.expectEqual(@as(u64, 0x0102), std.mem.readInt(u64, h[2..10], .little));
+}

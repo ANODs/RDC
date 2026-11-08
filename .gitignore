@@ -2,4 +2,5 @@
 zig-cache/
 zig-out/
 builds/
+third_party/steamworks/
 .DS_Store

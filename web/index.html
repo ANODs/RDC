@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>RDC</title>
+<style>
+  :root { color-scheme: dark; --bg: #0b0c0f; --card: #16181d; --line: #2a2d35; --text: #e8e8ea; --muted: #9a9ca5; --accent: #4f8cff; --danger: #ff6b6b; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  #join { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .card { width: min(380px, 100%); background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 28px; }
+  .card h1 { margin: 0 0 4px; font-size: 22px; font-weight: 600; }
+  .card p { margin: 0 0 18px; color: var(--muted); }
+  #code { width: 100%; font: 600 28px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 2px; text-align: center; padding: 14px 10px; border-radius: 10px; border: 1px solid var(--line); background: #0f1115; color: var(--text); outline: none; }
+  #code:focus { border-color: var(--accent); }
+  .card button { width: 100%; margin-top: 14px; padding: 13px; font: 600 16px/1 inherit; border: 0; border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer; }
+  #err { min-height: 20px; margin: 12px 0 0; color: var(--danger); text-align: center; }
+  #stage { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; touch-action: none; }
+  #screen { display: block; outline: none; cursor: default; background: #000; image-rendering: auto; }
+  #bar { position: absolute; top: 8px; left: 50%; transform: translate(-50%, -64px); display: flex; gap: 6px; align-items: center; padding: 6px 8px; background: rgba(22,24,29,.92); border: 1px solid var(--line); border-radius: 12px; transition: transform .18s ease; white-space: nowrap; max-width: calc(100% - 16px); overflow-x: auto; }
+  #bar.show { transform: translate(-50%, 0); }
+  #bar span { color: var(--muted); font-size: 13px; padding: 0 6px; }
+  #bar button { font: 500 13px/1 inherit; color: var(--text); background: #232631; border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; cursor: pointer; }
+  #bar button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #veil { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.45); font-size: 17px; pointer-events: none; }
+  #handle { display: none; position: absolute; top: 6px; right: 8px; width: 36px; height: 36px; border-radius: 10px; border: 1px solid var(--line); background: rgba(22,24,29,.75); color: var(--text); font-size: 18px; line-height: 1; }
+  @media (pointer: coarse) { #handle { display: block; } }
+
+  /* Экранная клавиатура */
+  body:not(.live) #osk, body:not(.live) #kbtn { display: none !important; }
+  #kbtn { position: absolute; right: 14px; bottom: calc(14px + env(safe-area-inset-bottom)); width: 52px; height: 52px; border-radius: 26px; border: 1px solid var(--line); background: rgba(22,24,29,.82); color: var(--text); font-size: 24px; display: none; align-items: center; justify-content: center; z-index: 20; touch-action: manipulation; }
+  @media (pointer: coarse) { #kbtn { display: flex; } }
+  #kbtn.hidden { display: none !important; }
+  #osk { position: absolute; z-index: 30; width: 640px; --u: 40px; background: rgba(26,28,35,.97); border: 1px solid #343846; border-radius: 16px; box-shadow: 0 14px 40px rgba(0,0,0,.55); touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; transition: opacity .15s ease; }
+  #osk[hidden] { display: none; }
+  #osk.docked { left: 0 !important; right: 0; top: auto !important; bottom: 0; width: auto !important; border-radius: 16px 16px 0 0; border-bottom: 0; padding-bottom: env(safe-area-inset-bottom); }
+  #osk.ghost { opacity: .58; }
+  #osk.ghost:active { opacity: .97; }
+  .osk-head { display: flex; align-items: center; gap: 6px; height: 38px; padding: 0 6px 0 12px; cursor: grab; }
+  .osk-head:active { cursor: grabbing; }
+  .osk-grip { width: 34px; height: 5px; border-radius: 3px; background: #5b6070; flex: none; }
+  .osk-title { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .osk-head button { flex: none; width: 34px; height: 30px; border-radius: 9px; border: 0; background: #2b2f3a; color: var(--text); font-size: 15px; line-height: 1; }
+  .osk-head button.on { background: var(--accent); color: #fff; }
+  .osk-cuts { display: flex; gap: 6px; overflow-x: auto; padding: 0 8px 8px; touch-action: pan-x; scrollbar-width: none; }
+  .osk-cuts::-webkit-scrollbar { display: none; }
+  .osk-cuts button { flex: none; height: 32px; padding: 0 11px; border-radius: 9px; border: 1px solid #383c49; background: #22252e; color: var(--text); font: 500 12.5px/1 inherit; white-space: nowrap; }
+  .osk-cuts button b { font-weight: 600; margin-right: 6px; }
+  .osk-cuts button:active { background: var(--accent); border-color: var(--accent); }
+  .osk-keys { display: flex; flex-direction: column; gap: calc(var(--u) * .14); padding: 0 8px 10px; }
+  .osk-row { display: flex; gap: calc(var(--u) * .12); }
+  .osk-key { flex: 1 1 0; min-width: 0; height: calc(var(--u) * 1.25); min-height: 36px; border: 0; border-radius: calc(var(--u) * .18); background: #3a3f4c; color: var(--text); font: 500 calc(var(--u) * .5)/1 -apple-system, system-ui, sans-serif; display: flex; align-items: center; justify-content: center; position: relative; padding: 0; box-shadow: 0 1px 0 rgba(0,0,0,.45); }
+  .osk-key.sp { visibility: hidden; }
+  .osk-key.fn { background: #2b2f3a; font-size: calc(var(--u) * .34); }
+  .osk-key.down { background: #5a6070; transform: translateY(1px); box-shadow: none; }
+  .osk-key.armed { background: var(--accent); color: #fff; }
+  .osk-key.locked { background: #f2f3f5; color: #14161b; }
+  .osk-key .alt { position: absolute; top: calc(var(--u) * .1); right: calc(var(--u) * .14); font-size: calc(var(--u) * .25); color: #9ba0ad; font-weight: 400; }
+  .osk-key.armed .alt, .osk-key.locked .alt { color: inherit; opacity: .7; }
+  .osk-key[data-mod] { flex-direction: column; gap: 2px; }
+  .osk-key small { display: block; font-size: calc(var(--u) * .2); opacity: .7; }
+  .osk-size { position: absolute; right: 0; bottom: 0; width: 26px; height: 26px; cursor: nwse-resize; touch-action: none; }
+  .osk-size::after { content: ''; position: absolute; right: 6px; bottom: 6px; width: 9px; height: 9px; border-right: 2px solid #6b7080; border-bottom: 2px solid #6b7080; border-radius: 0 0 3px 0; }
+  #osk.docked .osk-size { display: none; }
+  #osk.docked .osk-keys, #osk.docked .osk-cuts { max-width: 980px; margin: 0 auto; }
+  #osk-bubble { position: absolute; z-index: 40; display: none; min-width: 44px; height: 54px; padding: 0 10px; border-radius: 12px; background: #4a5060; color: #fff; font: 600 28px/54px -apple-system, system-ui, sans-serif; text-align: center; pointer-events: none; box-shadow: 0 6px 18px rgba(0,0,0,.5); }
+</style>
+</head>
+<body>
+<div id="join">
+  <form class="card" id="form" autocomplete="off">
+    <h1>RDC</h1>
+    <p>Введите код из окна RDC на компьютере</p>
+    <input id="code" inputmode="numeric" placeholder="123 456 789" maxlength="11" autofocus>
+    <button type="submit">Подключиться</button>
+    <div id="err"></div>
+  </form>
+</div>
+<div id="stage">
+  <canvas id="screen" tabindex="0"></canvas>
+  <div id="veil">Переподключение…</div>
+  <button id="handle" aria-label="Панель">☰</button>
+  <div id="bar">
+    <span id="who"></span>
+    <span id="stat"></span>
+    <button id="swap" title="Ctrl на этом компьютере работает как ⌘ на Mac">Ctrl → ⌘</button>
+    <button id="kbd">Клавиатура</button>
+    <button id="full">Во весь экран</button>
+    <button id="leave">Отключиться</button>
+  </div>
+</div>
+<button id="kbtn" aria-label="Показать клавиатуру">⌨</button>
+<div id="osk" hidden>
+  <div class="osk-head" id="osk-head">
+    <div class="osk-grip" aria-hidden="true"></div>
+    <div class="osk-title" id="osk-title">Клавиатура</div>
+    <button data-act="ghost" title="Прозрачность">◐</button>
+    <button data-act="dock" title="Закрепить внизу">⤓</button>
+    <button data-act="hide" title="Скрыть">✕</button>
+  </div>
+  <div class="osk-cuts" id="osk-cuts"></div>
+  <div class="osk-keys" id="osk-keys"></div>
+  <div class="osk-size" id="osk-size" title="Размер"></div>
+</div>
+<div id="osk-bubble"></div>
+<script src="/viewer.js"></script>
+</body>
+</html>

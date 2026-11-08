@@ -1,0 +1,14 @@
+.{
+    .name = .rdc,
+    .version = "0.2.0",
+    .minimum_zig_version = "0.17.1",
+    .fingerprint = 0x7d1efb6d1f0310d1,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "web",
+        "macos",
+        "tools",
+    },
+}

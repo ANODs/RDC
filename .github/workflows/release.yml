@@ -1,0 +1,107 @@
+name: Релиз
+
+# Релиз собирается по тегу v<версия> или кнопкой «Run workflow» (тогда тег ставится сам).
+# Версия — в build.zig.zon, заметки — docs/releases/<версия>.md.
+# Секрет RDC_UPDATE_KEY — ключ подписи обновлений (~/.config/rdc/update-signing.key).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  ZIG_VERSION: 0.17.1
+
+jobs:
+  version:
+    name: Версия
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          version=$(sed -n 's/^ *\.version = "\(.*\)",.*/\1/p' build.zig.zon)
+          test -n "$version" || { echo "::error::нет версии в build.zig.zon"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::тег $GITHUB_REF_NAME, а в build.zig.zon версия $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Тесты (${{ matrix.os }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test
+
+  # Сборки по ОС: каждая кладёт свой архив RDC-<версия>-<платформа>.zip.
+  # Windows и Linux добавятся сюда, когда появятся их хосты (веха M3).
+  macos:
+    name: Сборка macOS
+    needs: [version, test]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build package -Doptimize=ReleaseSafe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rdc-macos
+          path: zig-out/package/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Публикация
+    needs: [version, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Манифест обновлений с подписью
+        env:
+          RDC_UPDATE_KEY: ${{ secrets.RDC_UPDATE_KEY }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          test -n "$RDC_UPDATE_KEY" || { echo "::error::нет секрета RDC_UPDATE_KEY"; exit 1; }
+          assets=()
+          for f in dist/RDC-"$VERSION"-*.zip; do
+            p=$(basename "$f" .zip)
+            assets+=("${p#RDC-$VERSION-}=$f")
+          done
+          notes="docs/releases/$VERSION.md"
+          [ -f "$notes" ] || notes=-
+          zig run tools/release.zig -- manifest "$VERSION" release "$notes" "${assets[@]}"
+      - name: Релиз на GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          notes="docs/releases/$VERSION.md"
+          if [ -f "$notes" ]; then flags=(--notes-file "$notes"); else flags=(--generate-notes); fi
+          gh release create "v$VERSION" release/* --title "RDC $VERSION" --target "$GITHUB_SHA" "${flags[@]}"

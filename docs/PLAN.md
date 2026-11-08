@@ -354,6 +354,22 @@ UDP-датаграмма ≤ 1200 Б (позже PMTU до ~1450)
 - Репозиторий публичный, на GitHub.
 - Свой сервер на VPS и свой протокол.
 - Разработка начинается на macOS, контракты платформы сразу рассчитаны на все ОС.
+- Подключение — по ссылке, по коду и через Steam (тест на Spacewar, AppID 480); доступ из браузера.
+- Обновления — сами из релизов GitHub, манифест подписан Ed25519; релизы собирает GitHub Actions под все ОС.
+
+## 16. Вехи
+
+Веха — то, что можно запустить и увидеть. Этапы из раздела 14 остаются полным объёмом работ, а вехи задают порядок показа.
+
+| Веха | Что видно | Готово, когда |
+|---|---|---|
+| M1 «Первый показ» | RDC.app на Mac показывает код и ссылку; по ним в браузере — экран Mac вживую, с мышью и клавиатурой | ссылка открывается на этом Mac, на ПК и на телефоне в той же сети; H.264 через WebCodecs, где браузер его даёт, иначе JPEG |
+| M2 «Свой клиент» | нативный зритель RDC на macOS | подключение по коду в LAN, транспорт UDP + Noise, задержка ≤ 16 мс p50 |
+| M3 «Windows» | RDC на ПК: хост и зритель | Mac управляет ПК, и наоборот |
+| M4 «Steam» | подключение через Steam: друзья, приглашения, реле Valve (SDR) | два компьютера с RDC соединяются по SteamID через Steam Networking Sockets на Spacewar (AppID 480); затем свой AppID и страница в Steam |
+| M5 «Отовсюду» | подключение по коду и ссылке из любой сети, браузер — через сервер | rdc-server на VPS: ID, пробивка NAT, реле; веб-зритель по HTTPS/WSS |
+
+Для M4 нужен Steamworks SDK: его скачивают с partner.steamgames.com в `third_party/steamworks/`, в репозиторий он не попадает.
 
 ## Ссылки
 
@@ -364,3 +380,4 @@ UDP-датаграмма ≤ 1200 Б (позже PMTU до ~1450)
 - [Entitlement Persistent Content Capture](https://developer.apple.com/forums/thread/761641)
 - [Разрешение «Remote Desktop» в новых macOS](https://developer.apple.com/forums/thread/841530)
 - [xdg-desktop-portal: RemoteDesktop](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html)
+- [Steamworks: ISteamNetworkingSockets](https://partner.steamgames.com/doc/api/ISteamNetworkingSockets)
