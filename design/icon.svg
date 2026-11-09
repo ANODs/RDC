@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- RDC icon: a screen with a connection coming in from anywhere, and the pointer that
+       controls it. Everything else (PNG, ICNS, ICO) is rendered from this file by
+       tools/make_icons.sh. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b3040"/>
+      <stop offset="1" stop-color="#11141b"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4a8dff"/>
+      <stop offset="1" stop-color="#1f4fd6"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="204" fill="url(#bg)"/>
+  <!-- the screen and its stand -->
+  <rect x="196" y="236" width="632" height="416" rx="52" fill="url(#screen)" stroke="#eef1f8" stroke-width="30"/>
+  <rect x="452" y="668" width="120" height="60" rx="14" fill="#eef1f8"/>
+  <rect x="344" y="724" width="336" height="44" rx="22" fill="#eef1f8"/>
+  <!-- the connection: arcs coming in from the far corner -->
+  <circle cx="306" cy="548" r="30" fill="#ffffff"/>
+  <path d="M306 440 a108 108 0 0 1 108 108" fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round" transform="rotate(180 360 494)"/>
+  <path d="M306 332 a216 216 0 0 1 216 216" fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round" opacity=".72" transform="rotate(180 414 440)"/>
+  <!-- the pointer -->
+  <path d="M598 420 L598 754 L690 668 L752 806 L808 782 L746 646 L854 646 Z" fill="#ffffff" stroke="#11141b" stroke-width="26" stroke-linejoin="round"/>
+</svg>

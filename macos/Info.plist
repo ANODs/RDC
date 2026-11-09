@@ -8,6 +8,8 @@
 	<string>RDC</string>
 	<key>CFBundleExecutable</key>
 	<string>rdc</string>
+	<key>CFBundleIconFile</key>
+	<string>RDC</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.anods.rdc</string>
 	<key>CFBundleInfoDictionaryVersion</key>

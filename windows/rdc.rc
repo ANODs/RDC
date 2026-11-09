@@ -3,6 +3,9 @@
 // to check that the right file was downloaded. The version numbers and string come from build.zig:
 // RDC_VERSION_NUM (comma-separated) and RDC_VERSION_STR.
 
+// The icon of RDC.exe in Explorer and of its window (shim.c loads resource 1).
+1 ICON "rdc.ico"
+
 1 VERSIONINFO
 FILEVERSION RDC_VERSION_NUM
 PRODUCTVERSION RDC_VERSION_NUM

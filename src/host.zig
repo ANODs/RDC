@@ -504,6 +504,8 @@ pub const Host = struct {
             return h.serveWeb(stream, "index.html", "text/html; charset=utf-8", web.index_html);
         if (eql(u8, req.path, "/viewer.js"))
             return h.serveWeb(stream, "viewer.js", "text/javascript; charset=utf-8", web.viewer_js);
+        if (eql(u8, req.path, "/icon.png"))
+            return h.serveWeb(stream, "icon.png", "image/png", web.icon_png);
         h.respond(stream, "404 Not Found", "text/plain; charset=utf-8", "Not found");
     }
 

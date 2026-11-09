@@ -24,6 +24,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/server"
 sed "s/@VERSION@/$version/" "$root/mcpb/manifest.json" > "$work/manifest.json"
+cp "$root/mcpb/icon.png" "$work/icon.png"
 [ -z "$mac" ] || { cp "$mac" "$work/server/rdc"; chmod 755 "$work/server/rdc"; }
 [ -z "$win" ] || cp "$win" "$work/server/rdc.exe"
 
@@ -31,7 +32,7 @@ case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
 mkdir -p "$(dirname "$out")"
 rm -f "$out"
 if command -v zip >/dev/null 2>&1; then
-  (cd "$work" && zip -qrX "$out" manifest.json server)
+  (cd "$work" && zip -qrX "$out" manifest.json icon.png server)
 else
   python3 - "$work" "$out" <<'EOF'
 import os, sys, zipfile

@@ -117,6 +117,7 @@ pub fn build(b: *std.Build) void {
         const plist_text = std.mem.replaceOwned(u8, b.allocator, @embedFile("macos/Info.plist"), "@VERSION@", version) catch @panic("OOM");
         const plist_file = b.addWriteFiles().add("Info.plist", plist_text);
         const plist = b.addInstallFileWithDir(plist_file, .{ .custom = "RDC.app/Contents" }, "Info.plist");
+        const icon = b.addInstallFileWithDir(b.path("macos/RDC.icns"), .{ .custom = "RDC.app/Contents/Resources" }, "RDC.icns");
         const bin = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "RDC.app/Contents/MacOS" } } });
 
         // "-" means ad-hoc signing. By default macOS recognizes such a build by its code hash,
@@ -129,6 +130,7 @@ pub fn build(b: *std.Build) void {
         sign.addDirectoryArg(b.graph.path(.install_prefix, "RDC.app"));
         sign.has_side_effects = true;
         sign.step.dependOn(&plist.step);
+        sign.step.dependOn(&icon.step);
         sign.step.dependOn(&bin.step);
         b.step("app", "Build zig-out/RDC.app").dependOn(&sign.step);
 
