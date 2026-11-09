@@ -1,7 +1,9 @@
 name: Pages
 
-# Publishes the browser viewer (web/) at https://anods.github.io/RDC/ after every push to main.
+# Publishes the browser viewer (web/) at https://anods.github.io/RDC/ after every push to main
+# that changes it, or by hand (Run workflow).
 # One-time setup on GitHub: Settings → Pages → Build and deployment → Source: GitHub Actions.
+# Until then the deploy is skipped with a notice instead of failing.
 # Until RDC speaks WebRTC the page can only reach a host that is on the same network and
 # serves plain HTTP, so for now it is a preview of the viewer, not a way in from outside.
 
@@ -15,23 +17,49 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  actions: read
 
 concurrency:
   group: pages
   cancel-in-progress: true
 
 jobs:
+  check:
+    name: Pages enabled?
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.pages.outputs.enabled }}
+    steps:
+      - id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pages")
+          case "$status" in
+            200)
+              echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
+            404)
+              echo "::notice::GitHub Pages is not enabled yet. Enable it once in Settings → Pages → Build and deployment → Source: GitHub Actions, then run this workflow again."
+              echo "enabled=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::warning::Could not check GitHub Pages (HTTP $status); deploying anyway."
+              echo "enabled=true" >> "$GITHUB_OUTPUT" ;;
+          esac
+
   deploy:
     name: Deploy web/
+    needs: check
+    if: needs.check.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/checkout@v7
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: web
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
