@@ -18,6 +18,8 @@ const usage =
     \\  --no-ui         no window: code and link go to the log
     \\  --web-dir DIR   for development: viewer page from disk (DIR is the web folder)
     \\  --update-url U  for testing: updates from U instead of GitHub releases
+    \\  --no-remote     no link from anywhere: no public signaling brokers, no WebRTC
+    \\  --remote-url U  for testing: the page the link from anywhere opens (default https://anods.github.io/RDC/)
     \\
     \\MCP options (stdio by default; Claude Code, Codex and Claude Desktop start it this way):
     \\  --name NAME     how the agent is shown on the controlled computer (default: the client's name)
@@ -59,6 +61,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (i + 1 < args.len and eql(u8, a, "--update-url")) {
             i += 1;
             opts.update_url = args[i];
+        } else if (eql(u8, a, "--no-remote")) {
+            opts.remote = false;
+        } else if (i + 1 < args.len and eql(u8, a, "--remote-url")) {
+            i += 1;
+            opts.remote_url = args[i];
         } else if (std.mem.startsWith(u8, a, "-psn_")) {
             continue; // Finder sometimes passes a process serial number
         } else {

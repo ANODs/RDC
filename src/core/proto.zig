@@ -1,4 +1,8 @@
-//! Protocol between the host and a viewer (web version over WebSocket).
+//! Protocol between the host and a viewer: the same messages over a WebSocket (local
+//! network) or a WebRTC data channel (from anywhere, net/webrtc.zig). Over a data channel,
+//! host → viewer binary messages travel in pieces of at most 16 KiB, each with a one-byte
+//! prefix — 1: more pieces follow, 0: the last one — because browsers cap data-channel
+//! messages at 64–256 KiB. Text messages and everything viewer → host go unchanged.
 //!
 //! Host → viewer, binary message — a frame:
 //!   [0] kind (1 — H.264 Annex B, 2 — JPEG), [1] flags (bit 0 — keyframe),

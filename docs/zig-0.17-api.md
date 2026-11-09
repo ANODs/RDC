@@ -723,3 +723,30 @@ std.mem.trim(u8, "  x y \r\n", " \r\n"); // "x y"
 ```
 Where: `std.zig:52` ArrayList, `array_list.zig` (unmanaged `append` 1026, `Managed` 11 deprecated), `mem.zig` (eql 799, indexOf alias 1482, find 1487, startsWith 3254, cut 3301).
 Gotcha: `std.ArrayList(T)` is unmanaged now (`.empty` / `initCapacity(gpa, n)`, `deinit(gpa)`, `append(gpa, x)`). `getLast` is deprecated in favor of `last()` (returns `?T`).
+
+---
+
+## 11. UDP, DNS, crypto — met while writing the WebRTC host (`src/net/`)
+```zig
+// DNS: A and AAAA records through a queue (verified: stun.l.google.com -> 74.125.250.129, 2001:4860:4864:5:8000::1)
+var results: [16]net.HostName.LookupResult = undefined;
+var q: std.Io.Queue(net.HostName.LookupResult) = .init(&results);
+try (try net.HostName.init("stun.l.google.com")).lookup(io, &q, .{ .port = 19302 });
+while (q.getOne(io)) |r| switch (r) { .address => |a| use(a), .canonical_name => {} } else |_| {}
+
+// One dual-stack UDP socket: IPv4 peers arrive as ::ffff:a.b.c.d, and IPv4 destinations must be sent the same way.
+const sock = try (try net.IpAddress.parse("::", 0)).bind(io, .{ .mode = .dgram, .ip6_only = false });
+try sock.send(io, &dest_v4_mapped, bytes); // a plain .ip4 address here: EINVAL, a panic in debug builds (verified)
+const msg = try sock.receiveTimeout(io, &buf, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } });
+// error.Timeout after ~the timeout (poll under Io.Threaded); msg.from, msg.data
+
+// TCP with a hostname: HostName.connect tries every address.
+const stream = try host_name.connect(io, 1883, .{ .mode = .stream });
+```
+Crypto used: `std.crypto.sign.ecdsa.EcdsaP256Sha256` (`KeyPair.generate(io)`, `sign(msg, noise)`, `Signature.toDer/fromDer`, `PublicKey.fromSec1`), `std.crypto.dh.X25519`, `std.crypto.ecc.P256` (`basePoint.mul`, `fromSec1`, `affineCoordinates().x.toBytes(.big)`), `std.crypto.Certificate` (`.parse()`, `.pubKey()`, `.verify()`), `aead.aes_gcm.Aes128Gcm/Aes256Gcm` (decrypting in place, `m` and `c` the same slice, works), `kdf.hkdf.HkdfSha256`, `auth.hmac.HmacSha1`, `std.hash.Crc32` (STUN), `std.hash.crc.@"CRC-32/ISCSI"` (SCTP's CRC-32C).
+
+Gotchas:
+- `connect` with `.timeout` set panics under `Io.Threaded`: "TODO implement netConnectIpPosix with timeout". Leave the timeout out.
+- A struct of hundreds of kilobytes made by `fn init() T { return .{...}; }` with `@splat` array defaults goes through the stack: a thread with a 512 KB stack died with a bus error in `memcpy`. Initialize such structs in place (`fn init(self: *T)`, assigning `self.* = .{...}` with `undefined` arrays) — a test with a 64 KB thread stack guards it (`src/net/sctp.zig`).
+- Result location aliasing: `addr = .{ .ip6 = .{ .bytes = b, .port = addr.ip4.port } };` panics with "access of union field 'ip4' while field 'ip6' is active". Read the field into a local first.
+- `std.debug.assert` stays on in ReleaseSafe: a length a peer controls must be checked with an `if`, never asserted.

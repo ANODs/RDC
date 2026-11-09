@@ -1,12 +1,16 @@
-//! Host: the computer's screen → viewers in a browser by link or code (local network).
-//! HTTP serves the viewer page, WebSocket carries frames (H.264 or JPEG) and input.
+//! Host: the computer's screen → viewers in a browser by link or code.
+//! On the local network HTTP serves the viewer page and WebSocket carries frames
+//! (H.264 or JPEG) and input. From anywhere the page comes from GitHub Pages, finds
+//! the host through public MQTT brokers (net/signal.zig) and connects over a WebRTC
+//! data channel (net/webrtc.zig) that carries the same messages.
 //! The code is shared by all OSes: network, threads and time come from std.Io, the
 //! rest from the platform layer (src/platform.zig).
 //!
-//! Threads: accepting connections; one per connection (reading); one writer per
-//! viewer; housekeeping (permissions, status, silence, updates). Frames come from
-//! the encoder thread and are handed out to the viewers' queues. A viewer that
-//! falls behind skips frames instead of piling up latency.
+//! Threads: accepting connections; one per connection (reading); one per WebRTC
+//! session; one writer per viewer; one per signaling broker; housekeeping
+//! (permissions, status, silence, updates). Frames come from the encoder thread and
+//! are handed out to the viewers' queues. A viewer that falls behind skips frames
+//! instead of piling up latency.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -14,6 +18,9 @@ const net = std.Io.net;
 const plat = @import("platform.zig");
 const ws = @import("net/ws.zig");
 const http = @import("net/http.zig");
+const dtls = @import("net/dtls.zig");
+const signal = @import("net/signal.zig");
+const webrtc = @import("net/webrtc.zig");
 const proto = @import("core/proto.zig");
 const keymap = @import("core/keymap.zig");
 const Code = @import("core/code.zig").Code;
@@ -22,12 +29,17 @@ const web = @import("web");
 
 pub const version = update.current_version;
 pub const max_viewers = 4;
+/// WebRTC sessions at once, admitted or still connecting.
+const max_rtc = max_viewers + 4;
 const queue_cap = 16;
 const max_frames_queued = 6;
 const max_ws_payload = 16 * 1024;
 const capture_idle_stop_us: u64 = 10_000_000;
 const lockout_us: u64 = 30_000_000;
 const silence_us: u64 = 30_000_000; // the viewer pings once a second
+/// The H.264 bitrate follows the slowest viewer: down when frames have to be dropped, slowly back up.
+const max_bitrate: c_int = 10_000_000;
+const min_bitrate: c_int = 800_000;
 const os_name = @tagName(builtin.os.tag);
 
 pub const Options = struct {
@@ -39,6 +51,10 @@ pub const Options = struct {
     web_dir: ?[]const u8 = null,
     /// For testing updates: where to get latest.json and the archive instead of GitHub releases.
     update_url: ?[]const u8 = null,
+    /// Connections from anywhere: signaling through public MQTT brokers, then WebRTC.
+    remote: bool = true,
+    /// The page the link from anywhere opens; for testing, any copy of web/ served over https or localhost.
+    remote_url: []const u8 = "https://anods.github.io/RDC/",
 };
 
 pub fn log(comptime fmt: []const u8, args: anytype) void {
@@ -70,6 +86,9 @@ const Msg = struct {
     refs: std.atomic.Value(u32),
     bytes: []u8,
     kind: Kind,
+    /// The WebSocket header at the start of bytes; a data channel sends only what follows it.
+    hdr_len: u8 = 0,
+    opcode: ws.Opcode = .binary,
 
     const Kind = enum { control, h264_key, h264_delta, jpeg };
 
@@ -83,13 +102,19 @@ const Msg = struct {
         return m;
     }
 
-    fn text(gpa: std.mem.Allocator, opcode: ws.Opcode, payload: []const u8) ?*Msg {
+    fn text(gpa: std.mem.Allocator, opcode: ws.Opcode, data: []const u8) ?*Msg {
         var hdr: [10]u8 = undefined;
-        const h = ws.header(&hdr, opcode, payload.len);
-        const m = create(gpa, .control, h.len + payload.len) orelse return null;
+        const h = ws.header(&hdr, opcode, data.len);
+        const m = create(gpa, .control, h.len + data.len) orelse return null;
         @memcpy(m.bytes[0..h.len], h);
-        @memcpy(m.bytes[h.len..], payload);
+        @memcpy(m.bytes[h.len..], data);
+        m.hdr_len = @intCast(h.len);
+        m.opcode = opcode;
         return m;
+    }
+
+    fn payload(m: *const Msg) []const u8 {
+        return m.bytes[m.hdr_len..];
     }
 
     fn retain(m: *Msg) void {
@@ -120,8 +145,29 @@ const Peer = struct {
         return p;
     }
 
+    fn fromText(text: []const u8) Peer {
+        var p: Peer = .{};
+        p.len = @min(text.len, p.buf.len);
+        @memcpy(p.buf[0..p.len], text[0..p.len]);
+        return p;
+    }
+
     fn str(p: *const Peer) []const u8 {
         return p.buf[0..p.len];
+    }
+};
+
+/// How a viewer is connected: WebSocket on the local network or a WebRTC data channel from anywhere.
+const Link = union(enum) {
+    ws: net.Stream,
+    rtc: *webrtc.Session,
+
+    /// Wakes the connection's reader, or ends the session. `graceful` lets queued messages (a "bye") get through.
+    fn shutdown(l: Link, io: Io, graceful: bool) void {
+        switch (l) {
+            .ws => |s| s.shutdown(io, .both) catch {},
+            .rtc => |s| if (graceful) s.closeAfter(1000) else s.close(),
+        }
     }
 };
 
@@ -135,7 +181,7 @@ fn setNoDelay(stream: net.Stream) void {
 
 const Viewer = struct {
     host: *Host,
-    stream: net.Stream,
+    link: Link,
     peer: Peer,
     h264: bool,
     mutex: Io.Mutex = .init,
@@ -208,6 +254,7 @@ const Viewer = struct {
             }
             // H.264: the viewer is falling behind — skip until the next keyframe.
             v.need_key = true;
+            _ = v.host.drops.fetchAdd(1, .monotonic);
             plat.rdc_request_keyframe();
             return m.release(gpa);
         }
@@ -262,20 +309,34 @@ const Viewer = struct {
 
     fn writerMain(v: *Viewer) void {
         const io = v.host.io;
-        var buf: [16 * 1024]u8 = undefined;
-        var sw = v.stream.writer(io, &buf);
-        const w = &sw.interface;
-        while (v.pop()) |m| {
-            const ok = blk: {
-                w.writeAll(m.bytes) catch break :blk false;
-                w.flush() catch break :blk false;
-                break :blk true;
-            };
-            m.release(v.host.gpa);
-            if (!ok) break;
+        switch (v.link) {
+            .ws => |stream| {
+                var buf: [16 * 1024]u8 = undefined;
+                var sw = stream.writer(io, &buf);
+                const w = &sw.interface;
+                while (v.pop()) |m| {
+                    const ok = blk: {
+                        w.writeAll(m.bytes) catch break :blk false;
+                        w.flush() catch break :blk false;
+                        break :blk true;
+                    };
+                    m.release(v.host.gpa);
+                    if (!ok) break;
+                }
+            },
+            .rtc => |session| while (v.pop()) |m| {
+                // A WebSocket pong has no meaning on a data channel.
+                const ok = m.opcode == .pong or if (session.send(m.opcode == .binary, m.payload())) true else |_| false;
+                m.release(v.host.gpa);
+                if (!ok) break;
+            },
         }
-        v.abort();
-        v.stream.shutdown(io, .both) catch {}; // wakes this connection's reader thread
+        v.lock();
+        const graceful = v.closing and !v.aborted;
+        v.aborted = true;
+        v.cond.signal(io);
+        v.unlock();
+        v.link.shutdown(io, graceful); // wakes this connection's reader, or ends the WebRTC session
     }
 };
 
@@ -302,7 +363,21 @@ pub const Host = struct {
     capture_mutex: Io.Mutex = .init,
     capturing: bool = false,
     idle_since_us: u64 = 0,
+    /// H.264 frames dropped for a slow viewer since the last housekeeping tick.
+    drops: std.atomic.Value(u32) = .init(0),
+    bitrate: c_int = max_bitrate,
+    calm_ticks: u32 = 0,
     updater: update.Updater,
+    /// The second half of the link from anywhere; new with every code.
+    salt: [signal.salt_len]u8,
+    /// The DTLS certificate of this run.
+    identity: dtls.Identity = undefined,
+    signal: ?*signal.Signal = null,
+    rtc: [max_rtc]?*RtcConn = @splat(null),
+    /// Offer ids already taken: the same offer arrives through every broker.
+    seen_offers: [16][32]u8 = undefined,
+    seen_count: usize = 0,
+    seen_next: usize = 0,
 
     fn lock(h: *Host) void {
         h.mutex.lockUncancelable(h.io);
@@ -313,7 +388,7 @@ pub const Host = struct {
 
     fn create(gpa: std.mem.Allocator, io: Io, opts: Options) !*Host {
         const h = try gpa.create(Host);
-        h.* = .{ .gpa = gpa, .io = io, .opts = opts, .code = newCode(io), .updater = update.Updater.init(gpa, io, opts.update_url, opts.ui) };
+        h.* = .{ .gpa = gpa, .io = io, .opts = opts, .code = newCode(io), .salt = newSalt(io), .updater = update.Updater.init(gpa, io, opts.update_url, opts.ui) };
         if (plat.rdc_lan_ipv4(&h.ip, h.ip.len) == 0) {
             h.ip_len = std.mem.indexOfScalar(u8, &h.ip, 0) orelse 0;
         } else {
@@ -335,6 +410,25 @@ pub const Host = struct {
         var bytes: [8]u8 = undefined;
         io.random(&bytes);
         return Code.fromRandom(std.mem.readInt(u64, &bytes, .little));
+    }
+
+    fn newSalt(io: Io) [signal.salt_len]u8 {
+        var salt: [signal.salt_len]u8 = undefined;
+        io.random(&salt);
+        return salt;
+    }
+
+    /// https://anods.github.io/RDC/#<code>-<key>; empty when connections from anywhere are off.
+    fn remoteLink(h: *Host, buf: []u8) []const u8 {
+        if (h.signal == null) return "";
+        var key: [signal.salt_text_len]u8 = undefined;
+        _ = std.base64.url_safe_no_pad.Encoder.encode(&key, &h.salt);
+        return std.fmt.bufPrint(buf, "{s}#{s}-{s}", .{ h.opts.remote_url, &h.code.digits, &key }) catch "";
+    }
+
+    fn lanIp(h: *Host) ?[4]u8 {
+        const a = net.Ip4Address.parse(h.ip[0..h.ip_len], 0) catch return null;
+        return a.bytes;
     }
 
     fn listen(h: *Host) !void {
@@ -435,10 +529,17 @@ pub const Host = struct {
         w.flush() catch {};
     }
 
-    fn sendError(h: *Host, stream: net.Stream, text: []const u8) void {
+    /// A fatal error for a connection that has no viewer yet; the connection ends after it.
+    fn sendError(h: *Host, link: Link, text: []const u8) void {
         var out: [256]u8 = undefined;
         const json = std.fmt.bufPrint(&out, "{{\"t\":\"err\",\"fatal\":true,\"msg\":\"{s}\"}}", .{text}) catch return;
-        h.sendDirect(stream, json);
+        switch (link) {
+            .ws => |stream| h.sendDirect(stream, json),
+            .rtc => |s| {
+                s.sendText(json);
+                s.closeAfter(1000);
+            },
+        }
     }
 
     fn websocket(h: *Host, stream: net.Stream, r: *Io.Reader, peer: Peer, key: []const u8) void {
@@ -459,7 +560,7 @@ pub const Host = struct {
                 const parsed = ws.parse(r.buffered(), max_ws_payload) catch return;
                 const p = parsed orelse break;
                 if (!p.frame.fin or p.frame.opcode == .continuation) return;
-                if (!h.onMessage(stream, peer, &viewer, p.frame)) return;
+                if (!h.onMessage(.{ .ws = stream }, peer, &viewer, p.frame.opcode, p.frame.payload)) return;
                 r.toss(p.used);
             }
             if (r.bufferedLen() == r.buffer.len) return;
@@ -467,14 +568,15 @@ pub const Host = struct {
         }
     }
 
-    fn onMessage(h: *Host, stream: net.Stream, peer: Peer, viewer: *?*Viewer, f: ws.Frame) bool {
+    /// One message from a viewer, whatever the link. false — end the connection.
+    fn onMessage(h: *Host, link: Link, peer: Peer, viewer: *?*Viewer, opcode: ws.Opcode, payload: []const u8) bool {
         if (viewer.*) |v| v.last_us.store(nowUs(h.io), .monotonic);
-        switch (f.opcode) {
+        switch (opcode) {
             .text => {
-                const msg = f.payload;
+                const msg = payload;
                 const t = proto.jsonString(msg, "t") orelse return true;
                 if (std.mem.eql(u8, t, "hello")) {
-                    if (viewer.* == null) viewer.* = h.admit(stream, peer, msg) orelse return false;
+                    if (viewer.* == null) viewer.* = h.admit(link, peer, msg) orelse return false;
                 } else if (std.mem.eql(u8, t, "ping")) {
                     const v = viewer.* orelse return true;
                     var cx: f64 = 0.5;
@@ -492,12 +594,12 @@ pub const Host = struct {
             },
             .binary => {
                 if (viewer.* == null) return false;
-                if (proto.decodeInput(f.payload)) |in| applyInput(in);
+                if (proto.decodeInput(payload)) |in| applyInput(in);
                 return true;
             },
             .ping => {
                 if (viewer.*) |v| {
-                    if (Msg.text(h.gpa, .pong, f.payload)) |m| v.push(m);
+                    if (Msg.text(h.gpa, .pong, payload)) |m| v.push(m);
                 }
                 return true;
             },
@@ -506,12 +608,12 @@ pub const Host = struct {
         }
     }
 
-    fn admit(h: *Host, stream: net.Stream, peer: Peer, hello: []const u8) ?*Viewer {
+    fn admit(h: *Host, link: Link, peer: Peer, hello: []const u8) ?*Viewer {
         const now = nowUs(h.io);
         h.lock();
         if (now < h.locked_until_us) {
             h.unlock();
-            h.sendError(stream, "Too many wrong attempts — wait half a minute");
+            h.sendError(link, "Too many wrong attempts — wait half a minute");
             return null;
         }
         if (!h.code.matches(proto.jsonString(hello, "code") orelse "")) {
@@ -519,7 +621,7 @@ pub const Host = struct {
             if (h.failed >= 5) h.locked_until_us = now + lockout_us;
             h.unlock();
             log("wrong code from {s}", .{peer.str()});
-            h.sendError(stream, "Wrong code");
+            h.sendError(link, "Wrong code");
             return null;
         }
         h.failed = 0;
@@ -532,7 +634,7 @@ pub const Host = struct {
         }
         const index = slot orelse {
             h.unlock();
-            h.sendError(stream, "Four viewers are already connected — no more can join");
+            h.sendError(link, "Four viewers are already connected — no more can join");
             return null;
         };
         const v = h.gpa.create(Viewer) catch {
@@ -540,7 +642,7 @@ pub const Host = struct {
             return null;
         };
         const can_h264 = plat.rdc_codec_caps() & 1 != 0;
-        v.* = .{ .host = h, .stream = stream, .peer = peer, .h264 = can_h264 and proto.jsonTrue(hello, "h264") };
+        v.* = .{ .host = h, .link = link, .peer = peer, .h264 = can_h264 and proto.jsonTrue(hello, "h264") };
         if (proto.jsonString(hello, "ai")) |name| v.setAi(name);
         v.last_us.store(now, .monotonic);
         var name_buf: [160]u8 = undefined;
@@ -569,10 +671,11 @@ pub const Host = struct {
         h.updateCodecsLocked();
         h.unlock();
 
+        const over: []const u8 = if (link == .rtc) ", WebRTC" else "";
         if (v.ai_len > 0) {
-            log("AI agent {s} connected from {s}", .{ v.ai(), peer.str() });
+            log("AI agent {s} connected from {s}{s}", .{ v.ai(), peer.str(), over });
         } else {
-            log("viewer {s} connected ({s})", .{ peer.str(), if (v.h264) "H.264" else "JPEG" });
+            log("viewer {s} connected ({s}{s})", .{ peer.str(), if (v.h264) "H.264" else "JPEG", over });
         }
         h.ensureCapture();
         plat.rdc_request_keyframe();
@@ -665,7 +768,7 @@ pub const Host = struct {
             if (now -| v.last_us.load(.monotonic) > silence_us) {
                 log("viewer {s} is silent — disconnecting", .{v.peer.str()});
                 v.abort();
-                v.stream.shutdown(h.io, .both) catch {};
+                v.link.shutdown(h.io, false);
             }
         }
     }
@@ -742,6 +845,7 @@ pub const Host = struct {
         var wh_buf: [10]u8 = undefined;
         const wh = ws.header(&wh_buf, .binary, fh.len + data.len);
         const m = Msg.create(h.gpa, kind, wh.len + fh.len + data.len) orelse return;
+        m.hdr_len = @intCast(wh.len);
         @memcpy(m.bytes[0..wh.len], wh);
         @memcpy(m.bytes[wh.len..][0..fh.len], &fh);
         @memcpy(m.bytes[wh.len + fh.len ..], data);
@@ -780,25 +884,159 @@ pub const Host = struct {
     fn renewCode(h: *Host) void {
         h.lock();
         h.code = newCode(h.io);
+        h.salt = newSalt(h.io);
         h.failed = 0;
         h.locked_until_us = 0;
+        const keys = signal.derive(&h.code.digits, &h.salt);
         h.unlock();
+        // The old link from anywhere stops working with the old code.
+        if (h.signal) |s| s.setKeys(keys);
         h.kickAll("The code has changed — a new one is needed");
         h.refreshUi(false);
+    }
+
+    // -----------------------------------------------------------------------
+    // Viewers from anywhere: signaling messages → WebRTC sessions → the viewer logic above.
+
+    fn startRemote(h: *Host) void {
+        h.identity = dtls.Identity.generate(h.io) catch |e| {
+            log("connections from anywhere are off: no DTLS certificate ({t})", .{e});
+            return;
+        };
+        h.signal = signal.Signal.start(h.gpa, h.io, signal.derive(&h.code.digits, &h.salt), onSignal, h, logLine) catch |e| {
+            log("connections from anywhere are off: {t}", .{e});
+            return;
+        };
+    }
+
+    fn logLine(msg: []const u8) void {
+        log("{s}", .{msg});
+    }
+
+    /// A message from a browser through a broker (on a broker thread): an offer or a late candidate.
+    fn onSignal(ctx: *anyopaque, text: []const u8) void {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        const SignalMsg = struct { t: []const u8 = "", id: []const u8 = "", sdp: []const u8 = "", c: []const u8 = "" };
+        const parsed = std.json.parseFromSlice(SignalMsg, h.gpa, text, .{ .ignore_unknown_fields = true }) catch return;
+        defer parsed.deinit();
+        const m = parsed.value;
+        if (m.id.len == 0 or m.id.len > 32) return;
+        for (m.id) |c| if (!std.ascii.isAlphanumeric(c)) return;
+        if (std.mem.eql(u8, m.t, "offer")) {
+            h.onOffer(m.id, m.sdp);
+        } else if (std.mem.eql(u8, m.t, "cand")) {
+            h.lock();
+            defer h.unlock();
+            for (h.rtc) |maybe| {
+                const c = maybe orelse continue;
+                if (std.mem.eql(u8, c.id(), m.id)) c.session.addCandidate(m.c);
+            }
+        }
+        // Our own answers come back too: everything else is ignored.
+    }
+
+    fn onOffer(h: *Host, id: []const u8, offer: []const u8) void {
+        // The reply to a refused offer goes out after the lock: publishing is network I/O.
+        const refusal = h.startSession(id, offer) orelse return;
+        h.signalError(id, refusal);
+    }
+
+    /// null — started or a repeat; otherwise why the offer was refused.
+    fn startSession(h: *Host, id: []const u8, offer: []const u8) ?[]const u8 {
+        h.lock();
+        defer h.unlock();
+        for (h.seen_offers[0..h.seen_count]) |*seen| {
+            if (std.mem.eql(u8, std.mem.sliceTo(seen, 0), id)) return null;
+        }
+        h.seen_offers[h.seen_next] = @splat(0);
+        @memcpy(h.seen_offers[h.seen_next][0..id.len], id);
+        h.seen_next = (h.seen_next + 1) % h.seen_offers.len;
+        h.seen_count = @min(h.seen_count + 1, h.seen_offers.len);
+
+        const slot = for (h.rtc, 0..) |c, i| {
+            if (c == null) break i;
+        } else return "The computer has too many connections — try again in a minute";
+        const conn = h.gpa.create(RtcConn) catch return null;
+        conn.* = .{ .host = h, .session = undefined, .id_buf = @splat(0), .id_len = id.len };
+        @memcpy(conn.id_buf[0..id.len], id);
+        // The session thread may call back at once; its callbacks wait for this lock.
+        conn.session = webrtc.Session.start(h.gpa, h.io, &h.identity, offer, h.lanIp(), .{
+            .ctx = conn,
+            .answer = rtcAnswer,
+            .message = rtcMessage,
+            .closed = rtcClosed,
+        }) catch |e| {
+            h.gpa.destroy(conn);
+            log("a browser's offer was refused: {t}", .{e});
+            return "RDC on the computer cannot use this browser's offer";
+        };
+        h.rtc[slot] = conn;
+        return null;
+    }
+
+    fn signalError(h: *Host, id: []const u8, msg: []const u8) void {
+        const s = h.signal orelse return;
+        var buf: [256]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"t\":\"err\",\"id\":\"{s}\",\"msg\":\"{s}\"}}", .{ id, msg }) catch return;
+        s.send(json);
+    }
+
+    fn rtcAnswer(ctx: *anyopaque, s: *webrtc.Session, sdp_text: []const u8) void {
+        _ = s;
+        const c: *RtcConn = @ptrCast(@alignCast(ctx));
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.print("{{\"t\":\"answer\",\"id\":\"{s}\",\"sdp\":\"", .{c.id()}) catch return;
+        for (sdp_text) |ch| switch (ch) {
+            '\r' => w.writeAll("\\r") catch return,
+            '\n' => w.writeAll("\\n") catch return,
+            '"', '\\' => w.print("\\{c}", .{ch}) catch return,
+            0...0x09, 0x0b, 0x0c, 0x0e...0x1f => {},
+            else => w.writeByte(ch) catch return,
+        };
+        w.writeAll("\"}") catch return;
+        if (c.host.signal) |sig| sig.send(w.buffered());
+    }
+
+    fn rtcMessage(ctx: *anyopaque, s: *webrtc.Session, binary: bool, data: []const u8) void {
+        const c: *RtcConn = @ptrCast(@alignCast(ctx));
+        if (!c.host.onMessage(.{ .rtc = s }, Peer.fromText(s.peer()), &c.viewer, if (binary) .binary else .text, data)) {
+            s.closeAfter(1000);
+        }
+    }
+
+    fn rtcClosed(ctx: *anyopaque, s: *webrtc.Session, reason: []const u8) void {
+        const c: *RtcConn = @ptrCast(@alignCast(ctx));
+        const h = c.host;
+        if (c.viewer) |v| {
+            h.removeViewer(v);
+        } else {
+            log("a browser from anywhere did not connect{s}{s}: {s}", .{ if (s.peer().len > 0) " from " else "", s.peer(), reason });
+        }
+        h.lock();
+        for (&h.rtc) |*slot| {
+            if (slot.* == c) slot.* = null;
+        }
+        h.unlock();
+        h.gpa.destroy(c);
     }
 
     fn refreshUi(h: *Host, prompt: bool) void {
         if (!h.opts.ui) return;
         var code_buf: [12]u8 = undefined;
         var link_buf: [160]u8 = undefined;
+        var remote_buf: [200]u8 = undefined;
         h.lock();
         const shown = h.code.display(code_buf[0..11]);
         const digits = h.code.digits;
+        const remote = h.remoteLink(remote_buf[0 .. remote_buf.len - 1]);
         h.unlock();
         code_buf[shown.len] = 0;
+        remote_buf[remote.len] = 0;
         const link = std.fmt.bufPrint(link_buf[0 .. link_buf.len - 1], "http://{s}:{d}/#{s}", .{ h.ip[0..h.ip_len], h.port, &digits }) catch return;
         link_buf[link.len] = 0;
         plat.rdc_app_set_info(code_buf[0..shown.len :0].ptr, link_buf[0..link.len :0].ptr);
+        plat.rdc_app_set_remote_link(remote_buf[0..remote.len :0].ptr);
         const p: c_int = @intFromBool(prompt);
         plat.rdc_app_set_permissions(plat.rdc_screen_access(p), plat.rdc_input_access(p));
         h.updateStatus();
@@ -831,17 +1069,56 @@ pub const Host = struct {
         plat.rdc_app_set_ai(@intFromBool(ai_active));
     }
 
+    /// A viewer on a slow network (mobile data) makes frames pile up and get dropped: lower the
+    /// bitrate at once, raise it again after a few calm seconds. With no viewers, start over.
+    fn adaptBitrate(h: *Host) void {
+        const drops = h.drops.swap(0, .monotonic);
+        var next = h.bitrate;
+        if (h.viewerCount() == 0) {
+            next = max_bitrate;
+            h.calm_ticks = 0;
+        } else if (drops > 0) {
+            next = @max(min_bitrate, @divTrunc(h.bitrate * 6, 10));
+            h.calm_ticks = 0;
+        } else {
+            h.calm_ticks += 1;
+            if (h.calm_ticks >= 4) {
+                h.calm_ticks = 0;
+                next = @min(max_bitrate, @divTrunc(h.bitrate * 23, 20));
+            }
+        }
+        if (next == h.bitrate) return;
+        if (next < h.bitrate) log("video: {d} kbit/s — a viewer cannot keep up", .{@divTrunc(next, 1000)});
+        h.bitrate = next;
+        plat.rdc_set_bitrate(next);
+    }
+
     fn housekeeping(h: *Host) void {
         var tick: u32 = 0;
         while (true) : (tick +%= 1) {
             h.io.sleep(.fromMilliseconds(1000), .awake) catch {};
             h.stopCaptureIfIdle();
+            h.adaptBitrate();
             h.dropSilent();
             if (h.opts.ui and tick % 2 == 0) {
                 plat.rdc_app_set_permissions(plat.rdc_screen_access(0), plat.rdc_input_access(0));
             }
+            if (h.signal) |s| s.keepalive();
             h.updater.tick(h.viewerCount());
         }
+    }
+};
+
+/// A WebRTC session and, once the browser has sent the right code, its viewer.
+const RtcConn = struct {
+    host: *Host,
+    session: *webrtc.Session,
+    viewer: ?*Viewer = null,
+    id_buf: [32]u8,
+    id_len: usize,
+
+    fn id(c: *const RtcConn) []const u8 {
+        return c.id_buf[0..c.id_len];
     }
 };
 
@@ -886,8 +1163,13 @@ fn onAction(ctx: ?*anyopaque, action: c_int) callconv(.c) void {
 pub fn run(gpa: std.mem.Allocator, io: Io, opts: Options) !void {
     const h = try Host.create(gpa, io, opts);
     try h.listen();
+    if (opts.remote) h.startRemote();
     var code_buf: [11]u8 = undefined;
     log("RDC {s} ({s}): code {s}, link http://{s}:{d}/#{s}", .{ version, os_name, h.code.display(&code_buf), h.ip[0..h.ip_len], h.port, &h.code.digits });
+    var remote_buf: [200]u8 = undefined;
+    const remote = h.remoteLink(&remote_buf);
+    // The link holds the key: into the log only when there is no window to copy it from.
+    if (remote.len > 0 and !opts.ui) log("from anywhere: {s}", .{remote});
     const server = try std.Thread.spawn(.{}, Host.serve, .{h});
     const keeper = try std.Thread.spawn(.{}, Host.housekeeping, .{h});
     keeper.detach();

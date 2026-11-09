@@ -1228,16 +1228,17 @@ void rdc_set_pref_bool(const char *key, int value) {
 // ---------------------------------------------------------------------------
 // App window
 
-enum { ID_COPY = 101, ID_OPEN, ID_NEWCODE, ID_KICK, ID_AUTO, ID_CHECK, ID_INSTALL };
+enum { ID_COPY = 101, ID_OPEN, ID_NEWCODE, ID_KICK, ID_AUTO, ID_CHECK, ID_INSTALL, ID_COPY_REMOTE, ID_OPEN_REMOTE };
 #define WM_RDC_REFRESH (WM_APP + 1)
 #define WM_RDC_READY (WM_APP + 2)
 #define TIMER_COPIED 1
 #define CLIENT_W 440
-#define CLIENT_H 388
+#define CLIENT_H 482
 static const DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 
 static HWND volatile g_hwnd;
 static HWND g_code, g_link, g_copy, g_status, g_upd_status, g_auto, g_check, g_install, g_lbl_code, g_lbl_link, g_kick;
+static HWND g_lbl_remote, g_remote, g_copy_remote, g_open_remote;
 static volatile LONG g_ai_active;  // an AI agent is connected: the kick button stops it
 static HFONT g_font, g_font_big, g_font_small;
 static rdc_ctx_cb g_on_ready;
@@ -1247,7 +1248,7 @@ static int g_dpi = 96;
 
 // Window state: written from any thread, shown on the window thread.
 static SRWLOCK g_ui_lock = SRWLOCK_INIT;
-static wchar_t g_ui_code[32] = L"— — —", g_ui_link[256] = L"", g_ui_status[512] = L"Starting…";
+static wchar_t g_ui_code[32] = L"— — —", g_ui_link[256] = L"", g_ui_remote[256] = L"", g_ui_status[512] = L"Starting…";
 static wchar_t g_ui_version[32] = L"", g_ui_upd[512] = L"";
 static int g_ui_auto = 1, g_ui_can_install, g_ui_busy;
 
@@ -1262,10 +1263,11 @@ static void set_text(HWND w, const wchar_t *text) {
 static void refresh_ui(void) {
     HWND hwnd = g_hwnd;
     if (!hwnd) return;
-    wchar_t code[32], link[256], status[512], ver[32], upd[512], title[64];
+    wchar_t code[32], link[256], remote[256], status[512], ver[32], upd[512], title[64];
     AcquireSRWLockShared(&g_ui_lock);
     wcscpy(code, g_ui_code);
     wcscpy(link, g_ui_link);
+    wcscpy(remote, g_ui_remote);
     wcscpy(status, g_ui_status);
     wcscpy(ver, g_ui_version);
     wcscpy(upd, g_ui_upd);
@@ -1273,6 +1275,13 @@ static void refresh_ui(void) {
     ReleaseSRWLockShared(&g_ui_lock);
     set_text(g_code, code);
     set_text(g_link, link);
+    set_text(g_remote, remote);
+    int has_remote = remote[0] != 0;
+    set_text(g_lbl_remote, has_remote ? L"From anywhere — a phone on mobile data, another network"
+                                      : L"Connections from anywhere are off");
+    ShowWindow(g_remote, has_remote ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_copy_remote, has_remote ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_open_remote, has_remote ? SW_SHOW : SW_HIDE);
     set_text(g_status, status);
     set_text(g_upd_status, upd);
     if (ver[0])
@@ -1313,19 +1322,25 @@ static void build_controls(HWND p) {
     const DWORD btn = BS_PUSHBUTTON | WS_TABSTOP;
     g_lbl_code = make(p, L"STATIC", L"Connection code", SS_CENTER, 0, 0, 14, CLIENT_W, 18, 0, g_font_small);
     g_code = make(p, L"STATIC", L"— — —", SS_CENTER, 0, 0, 32, CLIENT_W, 52, 0, g_font_big);
-    g_lbl_link = make(p, L"STATIC", L"Browser link", SS_CENTER, 0, 0, 90, CLIENT_W, 18, 0, g_font_small);
+    g_lbl_link = make(p, L"STATIC", L"Browser link on this network", SS_CENTER, 0, 0, 90, CLIENT_W, 18, 0, g_font_small);
     g_link = make(p, L"EDIT", L"", ES_CENTER | ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 24, 110, 392, 26,
                   0, g_font);
     g_copy = make(p, L"BUTTON", L"Copy link", btn, 0, 45, 144, 170, 30, ID_COPY, g_font);
     make(p, L"BUTTON", L"Open in browser", btn, 0, 225, 144, 170, 30, ID_OPEN, g_font);
-    g_status = make(p, L"STATIC", L"", SS_CENTER | SS_ENDELLIPSIS, 0, 12, 186, 416, 20, 0, g_font);
-    make(p, L"BUTTON", L"New code", btn, 0, 45, 212, 170, 30, ID_NEWCODE, g_font);
-    g_kick = make(p, L"BUTTON", L"Disconnect all", btn, 0, 225, 212, 170, 30, ID_KICK, g_font);
-    make(p, L"STATIC", L"", SS_ETCHEDHORZ, 0, 24, 256, 392, 2, 0, g_font);
-    g_auto = make(p, L"BUTTON", L"Update automatically", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 28, 270, 210, 26, ID_AUTO, g_font);
-    g_check = make(p, L"BUTTON", L"Check for updates", btn, 0, 245, 268, 170, 30, ID_CHECK, g_font);
-    g_upd_status = make(p, L"STATIC", L"", SS_CENTER, 0, 12, 306, 416, 34, 0, g_font_small);
-    g_install = make(p, L"BUTTON", L"Update and restart", btn, 0, 110, 344, 220, 30, ID_INSTALL, g_font);
+    // The link from anywhere: GitHub Pages finds this computer through public brokers and connects over WebRTC.
+    g_lbl_remote = make(p, L"STATIC", L"", SS_CENTER, 0, 0, 186, CLIENT_W, 18, 0, g_font_small);
+    g_remote = make(p, L"EDIT", L"", ES_CENTER | ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 24, 206, 392, 26,
+                    0, g_font);
+    g_copy_remote = make(p, L"BUTTON", L"Copy link", btn, 0, 45, 240, 170, 30, ID_COPY_REMOTE, g_font);
+    g_open_remote = make(p, L"BUTTON", L"Open in browser", btn, 0, 225, 240, 170, 30, ID_OPEN_REMOTE, g_font);
+    g_status = make(p, L"STATIC", L"", SS_CENTER | SS_ENDELLIPSIS, 0, 12, 280, 416, 20, 0, g_font);
+    make(p, L"BUTTON", L"New code", btn, 0, 45, 306, 170, 30, ID_NEWCODE, g_font);
+    g_kick = make(p, L"BUTTON", L"Disconnect all", btn, 0, 225, 306, 170, 30, ID_KICK, g_font);
+    make(p, L"STATIC", L"", SS_ETCHEDHORZ, 0, 24, 350, 392, 2, 0, g_font);
+    g_auto = make(p, L"BUTTON", L"Update automatically", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 28, 364, 210, 26, ID_AUTO, g_font);
+    g_check = make(p, L"BUTTON", L"Check for updates", btn, 0, 245, 362, 170, 30, ID_CHECK, g_font);
+    g_upd_status = make(p, L"STATIC", L"", SS_CENTER, 0, 12, 400, 416, 34, 0, g_font_small);
+    g_install = make(p, L"BUTTON", L"Update and restart", btn, 0, 110, 438, 220, 30, ID_INSTALL, g_font);
     ShowWindow(g_install, SW_HIDE);
 }
 
@@ -1344,10 +1359,10 @@ static void window_size(int dpi, int *w, int *h) {
     *h = r.bottom - r.top;
 }
 
-static void copy_link(HWND hwnd) {
+static void copy_link(HWND hwnd, int remote) {
     wchar_t link[256];
     AcquireSRWLockShared(&g_ui_lock);
-    wcscpy(link, g_ui_link);
+    wcscpy(link, remote ? g_ui_remote : g_ui_link);
     ReleaseSRWLockShared(&g_ui_lock);
     if (!link[0]) return;
     size_t bytes = (wcslen(link) + 1) * sizeof(wchar_t);
@@ -1367,7 +1382,7 @@ static void copy_link(HWND hwnd) {
     EmptyClipboard();
     if (!SetClipboardData(CF_UNICODETEXT, mem)) GlobalFree(mem);
     CloseClipboard();
-    SetWindowTextW(g_copy, L"Copied ✓");
+    SetWindowTextW(remote ? g_copy_remote : g_copy, L"Copied ✓");
     SetTimer(hwnd, TIMER_COPIED, 1500, NULL);
 }
 
@@ -1398,17 +1413,20 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_COPIED) {
             KillTimer(hwnd, TIMER_COPIED);
             SetWindowTextW(g_copy, L"Copy link");
+            SetWindowTextW(g_copy_remote, L"Copy link");
         }
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case ID_COPY:
-            copy_link(hwnd);
+        case ID_COPY_REMOTE:
+            copy_link(hwnd, LOWORD(wp) == ID_COPY_REMOTE);
             break;
-        case ID_OPEN: {
+        case ID_OPEN:
+        case ID_OPEN_REMOTE: {
             wchar_t link[256];
             AcquireSRWLockShared(&g_ui_lock);
-            wcscpy(link, g_ui_link);
+            wcscpy(link, LOWORD(wp) == ID_OPEN_REMOTE ? g_ui_remote : g_ui_link);
             ReleaseSRWLockShared(&g_ui_lock);
             if (link[0]) ShellExecuteW(hwnd, L"open", link, NULL, NULL, SW_SHOWNORMAL);
             break;
@@ -1499,6 +1517,13 @@ void rdc_app_set_info(const char *code, const char *link) {
     AcquireSRWLockExclusive(&g_ui_lock);
     to_wide(code, g_ui_code, 32);
     to_wide(link, g_ui_link, 256);
+    ReleaseSRWLockExclusive(&g_ui_lock);
+    post_refresh();
+}
+
+void rdc_app_set_remote_link(const char *link) {
+    AcquireSRWLockExclusive(&g_ui_lock);
+    to_wide(link, g_ui_remote, 256);
     ReleaseSRWLockExclusive(&g_ui_lock);
     post_refresh();
 }

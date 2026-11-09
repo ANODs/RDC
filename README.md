@@ -2,17 +2,18 @@
 
 Lightweight, low-latency cross-platform remote desktop written in Zig.
 
-> Status: milestone M1. A Mac shares its screen to any browser on the local network via a link or a 9-digit code. Architecture, protocol and roadmap: [docs/PLAN.md](docs/PLAN.md).
+> Status: milestone M1. A Mac shares its screen to any browser: on the local network via a link or a 9-digit code, and from anywhere via a link that opens the viewer from GitHub Pages and connects over WebRTC. Architecture, protocol and roadmap: [docs/PLAN.md](docs/PLAN.md).
 
 ## Features
 
 - Your Mac's screen in any browser on the same network: open the link or enter the code.
+- From anywhere — a phone on mobile data, another network: the RDC window shows a second link that opens the viewer from [GitHub Pages](https://anods.github.io/RDC/). The page finds the computer through public MQTT brokers, with the handshake sealed by a key from the link, and connects to it directly over WebRTC. No servers of our own, no relay, nothing to install on the phone.
 - Full mouse and keyboard control. On phones, a touchpad mode: tap for left click, double tap for right click, two fingers to scroll.
 - On-screen keyboard that matches the host OS (⌘/⌥/⌃ for macOS, Ctrl/Win/Alt for Windows), with OS-specific shortcuts. It can be moved, resized, docked and hidden.
 - H.264 via WebCodecs where the browser supports it, JPEG otherwise.
 - Automatic updates from GitHub Releases, verified with an Ed25519 signature.
 - An MCP server for AI agents (Claude, Codex, ChatGPT and any other MCP client): the agent sees the screen and controls the mouse and keyboard, and the person at the computer can stop it at any time.
-- Tiny: the whole app is a ~360 KB download.
+- Tiny: the whole app is a ~600 KB download, its WebRTC stack included (written in Zig on `std.crypto`).
 
 ## AI agents
 
@@ -38,7 +39,7 @@ Prebuilt builds are on the [Releases](https://github.com/ANODs/RDC/releases) pag
 zig build run-app -Doptimize=ReleaseSafe
 ```
 
-RDC shows a code and a link. Open the link in a browser on any device on the same network, or open `http://<computer IP>:7700/` and enter the code. On first launch, allow RDC Screen Recording and Accessibility (System Settings → Privacy & Security), then restart it.
+RDC shows a code and two links. Open the first one in a browser on any device on the same network, or open `http://<computer IP>:7700/` and enter the code. The second one, "From anywhere", works from any network; `--no-remote` turns it off. On first launch, allow RDC Screen Recording and Accessibility (System Settings → Privacy & Security), then restart it.
 
 Tests: `zig build test`. Local release build: `zig build release -Doptimize=ReleaseSafe`. CI releases: [.github/workflows/release.yml](.github/workflows/release.yml).
 

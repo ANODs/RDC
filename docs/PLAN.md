@@ -135,6 +135,17 @@ Overhead is 29 bytes per packet. The Noise IK handshake takes 1 RTT because the 
 
 A session starts on whichever path answers first and moves to a better one mid-session without a break.
 
+### The browser from anywhere: WebRTC without servers of our own
+
+The page from GitHub Pages finds the host and connects to it directly; only free public services take part.
+
+- **Link.** `https://anods.github.io/RDC/#<code>-<key>`: the 9-digit code and a 128-bit random key (base64url, 22 characters). The host makes a new key with every code; the key never leaves the link.
+- **Rendezvous.** Public MQTT brokers: broker.emqx.io and broker.hivemq.com. The host keeps plain MQTT 3.1.1 connections (TCP 1883) to both, the browser speaks MQTT over WebSocket (wss, ports 8084 and 8884). Both sides derive 48 bytes with HKDF-SHA256 (salt — the key, input — the code): the topic `rdc/<32 hex>` and an AES-256-GCM key. Every message (offer, answer, late candidates) is sealed with that key, with the topic as associated data. A broker sees a random topic and ciphertext, carries only the handshake (a few kilobytes) and never the session. Without the link a stranger cannot find the topic, and cannot forge or read the SDP.
+- **Connection.** The browser creates an `RTCPeerConnection` with public STUN (stun.l.google.com:19302, stun.cloudflare.com:3478) and one negotiated data channel (id 0, reliable, ordered) and sends the offer. The host answers from one dual-stack UDP socket with a host candidate and the public addresses it learned from the same STUN servers, then sends ICE checks to the browser's candidates, so both NATs open toward each other. The browser is the ICE controlling agent and the DTLS client.
+- **Host stack, pure Zig in `src/net/`:** `stun.zig` (STUN and ICE checks), `sdp.zig`, `dtls.zig` (DTLS 1.2 server: ECDHE X25519, a self-signed ECDSA P-256 certificate made at startup, AES-128-GCM, extended master secret; the browser's certificate must match the fingerprint in the sealed offer), `sctp.zig` (one association, RFC 4960 retransmission and congestion control), `webrtc.zig` (the session), `mqtt.zig`, `signal.zig`. All cryptography is `std.crypto`.
+- **Protocol.** The data channel carries the viewer protocol of `core/proto.zig` unchanged: JSON as text messages, input as binary. Browsers accept data-channel messages of 64–256 KiB at most, so host → viewer binary messages travel in pieces of up to 16 KiB, each with a one-byte prefix (1 — more follows, 0 — the last piece), and the viewer glues them back together.
+- **No relay.** When both NATs are strict (a symmetric carrier NAT on the phone and a port-restricted router at home), ICE fails; the page says so in about 15 seconds instead of spinning.
+
 ## 7. Stability and input buffering
 
 | What | Target |
@@ -354,6 +365,7 @@ Steps are small and verifiable. Each one ends with a short report and a choice o
 - The repository is public, on GitHub.
 - License: Apache-2.0.
 - No servers of our own: direct connections and free public infrastructure; our own protocol.
+- WebRTC in the host is our own small stack in Zig (ICE, DTLS 1.2, SCTP on `std.crypto`), not libdatachannel (about 2 MB of C++ plus a TLS library) and not WebTransport (it cannot cross NAT); the browser finds the host through public MQTT brokers.
 - Main focus: RDC as a tool for AI agents that see and control other devices.
 - Agent mode as a plugin for Claude and for ChatGPT/Codex: the `rdc mcp` MCP server and a skill.
 - The Claude plugin ships the binary as an MCP bundle (`rdc-mcp.mcpb`, a release asset); the Codex plugin launches an installed RDC through `plugins/rdc/scripts/rdc-mcp`.
@@ -380,12 +392,12 @@ M4 needs the Steamworks SDK: it is downloaded from partner.steamgames.com into `
 ## 17. Scenarios
 
 1. **At home, on the same network.** Works today. You open the link from the RDC window. The computer serves the page itself; GitHub Pages is not needed.
-2. **Away from home, from a phone.** Planned. RDC is running on the computer. You open https://anods.github.io/RDC/#123456789: the page comes from GitHub Pages, finds the computer through public relays and connects to it directly (WebRTC). Nothing needs to be installed on the phone.
+2. **Away from home, from a phone.** Works in builds after 0.3.0. RDC is running on the computer; its window shows a second link, "From anywhere": https://anods.github.io/RDC/#123456789-key. The page comes from GitHub Pages and finds the computer through public MQTT brokers (broker.emqx.io, broker.hivemq.com): both sides derive the topic and an encryption key from the code and the key in the link, so a broker carries only sealed SDP and cannot tell who talks to whom. Then the browser connects to the computer directly over a WebRTC data channel (public STUN, ICE hole punching, DTLS, SCTP — section 6). If the networks on both sides block a direct path, the page says so after about 15 seconds: there is no relay. Nothing needs to be installed on the phone; the link changes with every new code, and `rdc --no-remote` turns this off.
 3. **An AI agent on your computer (Claude Code, Codex, Claude Desktop).** Works since 0.3.0. You install the RDC plugin (`plugins/rdc`: a Claude Code plugin, a portable Agent Plugin for Codex, and the `rdc-mcp.mcpb` bundle for Claude Desktop), and through `rdc mcp` the agent connects by link or code to any device running RDC. The agent gets `connect`, `screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `devices`, `disconnect`; every action answers with a fresh screenshot. GitHub Pages is not involved.
 4. **An AI agent in the cloud (claude.ai, ChatGPT in a browser).** Works since 0.3.0. `rdc mcp --http --tunnel` serves Streamable HTTP on this computer, opens a Cloudflare quick tunnel and logs a URL with a secret path; that URL is added as a connector. Without `cloudflared`, any tunnel to `127.0.0.1:7710` does.
 5. **Supervising an agent.** Works since 0.3.0. The RDC window shows "AI agent <name>" and its Disconnect button becomes **Stop AI agent**; a browser viewer on the same link shows a red banner with a Stop button. Stop disconnects the AI agents and keeps the people connected.
 
-GitHub Pages publishes the `web/` folder at https://anods.github.io/RDC/ (`.github/workflows/pages.yml`; enabled once in Settings → Pages → Source: GitHub Actions). The page can reach computers only once RDC has WebRTC.
+GitHub Pages publishes the `web/` folder at https://anods.github.io/RDC/ (`.github/workflows/pages.yml`; enabled once in Settings → Pages → Source: GitHub Actions). There the viewer connects only by a link from anywhere; the code alone works on the computer's own network, where the computer serves the page itself. For testing, `rdc --remote-url http://localhost:8000/` makes the window link to any local copy of `web/` (localhost counts as a secure context, so WebCrypto and WebRTC work).
 
 The MCP server (`src/agent/mcp.zig`) speaks both protocol eras: the `initialize` handshake of 2025-11-25 and earlier, and the per-request `_meta` of 2026-07-28 with `server/discover`. Over HTTP it validates the `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers and checks the `Origin` header when there is no token.
 

@@ -862,6 +862,9 @@ int rdc_computer_name(char *buf, int buflen) {
 @property(nonatomic, strong) NSWindow *window;
 @property(nonatomic, strong) NSTextField *codeLabel;
 @property(nonatomic, strong) NSTextField *linkLabel;
+@property(nonatomic, strong) NSTextField *remoteCaption;
+@property(nonatomic, strong) NSTextField *remoteLabel;
+@property(nonatomic, strong) NSStackView *remoteButtons;
 @property(nonatomic, strong) NSTextField *statusLabel;
 @property(nonatomic, strong) NSTextField *permLabel;
 @property(nonatomic, strong) NSButton *screenButton;
@@ -870,6 +873,7 @@ int rdc_computer_name(char *buf, int buflen) {
 @property(nonatomic, strong) NSButton *kickButton;
 @property(nonatomic) BOOL aiActive;
 @property(nonatomic, copy) NSString *link;
+@property(nonatomic, copy) NSString *remoteLink;
 @property(nonatomic, strong) NSWindow *settingsWindow;
 @property(nonatomic, strong) NSTextField *setVersion;
 @property(nonatomic, strong) NSButton *setAuto;
@@ -912,7 +916,7 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     appItem.submenu = appMenu;
     NSApp.mainMenu = bar;
 
-    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 440, 360)
+    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 440, 450)
                                               styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                                         NSWindowStyleMaskMiniaturizable
                                                 backing:NSBackingStoreBuffered
@@ -923,7 +927,7 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     self.codeLabel = make_label(@"— — —", 40, NSFontWeightSemibold, NSColor.labelColor);
     self.codeLabel.font = [NSFont monospacedDigitSystemFontOfSize:40 weight:NSFontWeightSemibold];
     self.codeLabel.selectable = YES;
-    NSTextField *linkCaption = make_label(@"Browser link", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    NSTextField *linkCaption = make_label(@"Browser link on this network", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
     self.linkLabel = make_label(@"", 14, NSFontWeightRegular, NSColor.linkColor);
     self.linkLabel.selectable = YES;
     self.linkLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
@@ -932,6 +936,19 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     NSButton *open = [NSButton buttonWithTitle:@"Open in browser" target:self action:@selector(openLink:)];
     NSStackView *linkButtons = [NSStackView stackViewWithViews:@[ copy, open ]];
     linkButtons.spacing = 8;
+
+    // The link from anywhere: GitHub Pages finds this computer through public brokers and connects over WebRTC.
+    self.remoteCaption = make_label(@"From anywhere — a phone on mobile data, another network", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    self.remoteLabel = make_label(@"", 13, NSFontWeightRegular, NSColor.linkColor);
+    self.remoteLabel.selectable = YES;
+    self.remoteLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    NSButton *copyRemote = [NSButton buttonWithTitle:@"Copy link" target:self action:@selector(copyRemoteLink:)];
+    NSButton *openRemote = [NSButton buttonWithTitle:@"Open in browser" target:self action:@selector(openRemoteLink:)];
+    self.remoteButtons = [NSStackView stackViewWithViews:@[ copyRemote, openRemote ]];
+    self.remoteButtons.spacing = 8;
+    self.remoteCaption.hidden = YES;
+    self.remoteLabel.hidden = YES;
+    self.remoteButtons.hidden = YES;
 
     self.statusLabel = make_label(@"Starting…", 13, NSFontWeightMedium, NSColor.labelColor);
     self.permLabel = make_label(@"", 12, NSFontWeightRegular, NSColor.systemOrangeColor);
@@ -950,7 +967,8 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     sessionButtons.spacing = 8;
 
     NSStackView *stack = [NSStackView stackViewWithViews:@[
-        caption, self.codeLabel, linkCaption, self.linkLabel, linkButtons, self.statusLabel, self.permLabel, permButtons,
+        caption, self.codeLabel, linkCaption, self.linkLabel, linkButtons, self.remoteCaption, self.remoteLabel,
+        self.remoteButtons, self.statusLabel, self.permLabel, permButtons,
         sessionButtons
     ]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -961,7 +979,10 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     [stack setCustomSpacing:18 afterView:self.codeLabel];
     [stack setCustomSpacing:2 afterView:linkCaption];
     [stack setCustomSpacing:18 afterView:linkButtons];
+    [stack setCustomSpacing:2 afterView:self.remoteCaption];
+    [stack setCustomSpacing:18 afterView:self.remoteButtons];
     [self.linkLabel.widthAnchor constraintLessThanOrEqualToConstant:390].active = YES;
+    [self.remoteLabel.widthAnchor constraintLessThanOrEqualToConstant:390].active = YES;
     self.window.contentView = stack;
     [self.window center];
     [self.window makeKeyAndOrderFront:nil];
@@ -982,6 +1003,16 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
 
 - (void)openLink:(id)sender {
     if (self.link) [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:self.link]];
+}
+
+- (void)copyRemoteLink:(id)sender {
+    if (self.remoteLink.length == 0) return;
+    [NSPasteboard.generalPasteboard clearContents];
+    [NSPasteboard.generalPasteboard setString:self.remoteLink forType:NSPasteboardTypeString];
+}
+
+- (void)openRemoteLink:(id)sender {
+    if (self.remoteLink.length) [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:self.remoteLink]];
 }
 
 - (void)askScreen:(id)sender {
@@ -1095,6 +1126,18 @@ void rdc_app_set_info(const char *code, const char *link) {
         g_app.codeLabel.stringValue = c;
         g_app.linkLabel.stringValue = l;
         g_app.link = l;
+    });
+}
+
+void rdc_app_set_remote_link(const char *link) {
+    NSString *l = [NSString stringWithUTF8String:link];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_app.remoteLink = l;
+        g_app.remoteLabel.stringValue = l;
+        BOOL off = l.length == 0;
+        g_app.remoteCaption.hidden = off;
+        g_app.remoteLabel.hidden = off;
+        g_app.remoteButtons.hidden = off;
     });
 }
 

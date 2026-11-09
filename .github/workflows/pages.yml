@@ -4,8 +4,9 @@ name: Pages
 # that changes it, or by hand (Run workflow).
 # One-time setup on GitHub: Settings → Pages → Build and deployment → Source: GitHub Actions.
 # Until then the deploy is skipped with a notice instead of failing.
-# Until RDC speaks WebRTC the page can only reach a host that is on the same network and
-# serves plain HTTP, so for now it is a preview of the viewer, not a way in from outside.
+# The page reaches a computer by the link from anywhere in its RDC window (#<code>-<key>):
+# it finds the computer through public MQTT brokers and connects over WebRTC (docs/PLAN.md,
+# section 6). viewer.js is loaded by a relative path, so the page works under /RDC/.
 
 on:
   push:

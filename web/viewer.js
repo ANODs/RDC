@@ -1,5 +1,8 @@
 'use strict';
-// RDC web viewer: WebSocket → H.264 (WebCodecs) or JPEG → canvas; mouse and keyboard → host.
+// RDC web viewer: H.264 (WebCodecs) or JPEG → canvas; mouse and keyboard → host.
+// Transport: WebSocket to the host that served this page (local network), or, with a link
+// from anywhere (#<code>-<key>), a WebRTC data channel to a host found through public MQTT
+// brokers. Both carry the same messages (src/core/proto.zig).
 
 const $ = (id) => document.getElementById(id);
 const canH264 = typeof VideoDecoder === 'function' && typeof EncodedVideoChunk === 'function';
@@ -34,8 +37,9 @@ const HID = (() => {
 const canvas = $('screen');
 const ctx2d = canvas.getContext('2d', { alpha: false, desynchronized: true });
 
-let ws = null;
+let conn = null;               // the current transport: {send(data), close()}
 let code = '';
+let key = '';                  // the key of a link from anywhere; empty — this network
 let host = null;               // {w, h, os, name, codec}
 let wantConnected = false;
 let forceJpeg = false;
@@ -58,12 +62,22 @@ function formatCode(s) {
 
 function showJoin(error) {
   wantConnected = false;
+  osk.reset(); // releases held on-screen keys while the connection is still up
+  closeConn();
+  host = null;
   document.body.classList.remove('live');
-  osk.reset();
   $('stage').style.display = 'none';
   $('join').style.display = 'flex';
+  $('err').classList.remove('info');
   $('err').textContent = error || '';
   $('code').focus();
+}
+
+// Progress while connecting: on the join card, or on the veil over the last picture.
+function progress(text) {
+  if (host) { $('veil').textContent = text; $('veil').style.display = 'flex'; return; }
+  $('err').classList.add('info');
+  $('err').textContent = text;
 }
 
 // Damm check digit: the last digit of the code catches typos before connecting.
@@ -75,38 +89,345 @@ const DAMM = [
 ];
 const dammOk = (digits) => [...digits].reduce((i, d) => DAMM[i][+d], 0) === 0;
 
+// "#123456789-<key>" (from anywhere), "#123456789" (this network), or a whole link pasted into the field.
+function parseEntry(text) {
+  let s = (text || '').trim();
+  const hash = s.lastIndexOf('#');
+  if (hash >= 0) s = s.slice(hash + 1);
+  s = s.replace(/\s/g, '');
+  const m = /^(\d{9})(?:-([A-Za-z0-9_-]{22}))?$/.exec(s);
+  if (m) return { code: m[1], key: m[2] || '' };
+  return { code: s.replace(/\D/g, ''), key: '' };
+}
+
+// The host serves the viewer only over plain HTTP; on https (GitHub Pages) only a link from anywhere works.
+const servedByHost = location.protocol === 'http:';
+const canRtc = typeof RTCPeerConnection === 'function' && !!(window.crypto && crypto.subtle) && window.isSecureContext;
+
 function start(raw) {
-  code = raw.replace(/\D/g, '');
-  if (code.length !== 9) return showJoin('The code must be 9 digits');
+  const e = parseEntry(raw);
+  code = e.code;
+  key = e.key;
+  if (code.length !== 9) return showJoin(servedByHost ? 'The code must be 9 digits' : 'Open the link from the RDC window on the computer');
   if (!dammOk(code)) return showJoin('Typo in the code — check the digits');
-  $('err').textContent = 'Connecting…';
+  if (!key && !servedByHost) {
+    return showJoin('This page needs the link from anywhere: copy it from the RDC window on the computer (the code alone works only on the computer\'s network)');
+  }
+  if (key && !canRtc) {
+    if (!servedByHost) return showJoin('This browser cannot connect from anywhere: it has no WebRTC');
+    key = ''; // the page came from the host itself: talk to it directly
+  }
+  // A new target starts from scratch, even if another computer was on screen.
+  closeConn();
+  resetDecoder();
+  host = null;
+  document.body.classList.remove('live');
+  $('stage').style.display = 'none';
+  $('join').style.display = 'flex';
+  progress('Connecting…');
   wantConnected = true;
   connect();
 }
 
+function closeConn() {
+  const c = conn;
+  conn = null;
+  if (c) c.close();
+}
+
 function connect() {
-  if (ws) { ws.onclose = null; ws.close(); }
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${proto}//${location.host}/ws`);
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = () => {
-    send(JSON.stringify({ t: 'hello', code, h264: canH264 && !forceJpeg, agent: navigator.userAgent }));
+  closeConn();
+  let c = null;
+  const handlers = {
+    open() { send(JSON.stringify({ t: 'hello', code, h264: canH264 && !forceJpeg, agent: navigator.userAgent })); },
+    message(data) {
+      if (typeof data === 'string') onControl(JSON.parse(data));
+      else onFrame(data);
+    },
+    // why — what went wrong, for the person; fatal — retrying the same way will not help.
+    close(why, fatal) {
+      if (conn !== c) return;
+      conn = null;
+      resetDecoder();
+      if (!wantConnected) return;
+      if (fatal && !host) return showJoin(why);
+      if (host) { $('veil').textContent = why || 'Reconnecting…'; $('veil').style.display = 'flex'; }
+      setTimeout(() => wantConnected && !conn && connect(), fatal ? 3000 : 1000);
+    },
   };
-  ws.onmessage = (ev) => {
-    if (typeof ev.data === 'string') onControl(JSON.parse(ev.data));
-    else onFrame(ev.data);
-  };
-  ws.onclose = () => {
-    ws = null;
-    resetDecoder();
-    if (!wantConnected) return;
-    if (host) $('veil').style.display = 'flex';
-    setTimeout(() => wantConnected && connect(), 1000);
-  };
+  c = key ? rtcLink(code, key, handlers) : wsLink(handlers);
+  conn = c;
 }
 
 function send(data) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(data);
+  if (conn) conn.send(data);
+}
+
+// ---------------------------------------------------------------- transport: this network
+
+function wsLink(h) {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const sock = new WebSocket(`${proto}//${location.host}/ws`);
+  sock.binaryType = 'arraybuffer';
+  sock.onopen = () => h.open();
+  sock.onmessage = (ev) => h.message(ev.data);
+  sock.onclose = () => h.close('', false);
+  return {
+    send(d) { if (sock.readyState === WebSocket.OPEN) sock.send(d); },
+    close() { sock.onclose = null; sock.close(); },
+  };
+}
+
+// ---------------------------------------------------------------- transport: from anywhere
+// The page finds the host through public MQTT brokers: both sides derive the topic and an
+// AES-GCM key from the code and the key in the link (HKDF), so a broker sees only noise.
+// Then a WebRTC data channel connects them directly (keep in sync with src/net/signal.zig
+// and src/net/webrtc.zig).
+
+const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+const ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
+const NO_BROKER = 'Could not reach the public servers that find the computer — check the internet connection';
+const NO_ANSWER = 'The computer does not answer. Is RDC running there? The link changes with every new code.';
+const NO_PATH = 'Could not connect directly: the networks on both sides do not allow it (RDC has no relay). Try another network, for example Wi-Fi instead of mobile data.';
+
+const te = new TextEncoder();
+const td = new TextDecoder();
+const hex = (b) => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+const randomHex = (n) => hex(crypto.getRandomValues(new Uint8Array(n)));
+
+function b64urlBytes(s) {
+  const bin = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (s.length % 4)) % 4));
+  return Uint8Array.from(bin, (ch) => ch.charCodeAt(0));
+}
+
+async function deriveSignal(code, key) {
+  const ikm = await crypto.subtle.importKey('raw', te.encode(code), 'HKDF', false, ['deriveBits']);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: b64urlBytes(key), info: te.encode('rdc signal v1') }, ikm, 48 * 8));
+  const topic = 'rdc/' + hex(bits.subarray(0, 16));
+  const aes = await crypto.subtle.importKey('raw', bits.slice(16, 48), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  return { topic, aes, ad: te.encode(topic) };
+}
+
+async function seal(k, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: k.ad }, k.aes, te.encode(JSON.stringify(obj))));
+  const out = new Uint8Array(12 + ct.length);
+  out.set(iv);
+  out.set(ct, 12);
+  return out;
+}
+
+async function unseal(k, bytes) {
+  if (bytes.length < 28) return null;
+  try {
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.subarray(0, 12), additionalData: k.ad }, k.aes, bytes.subarray(12));
+    return JSON.parse(td.decode(pt));
+  } catch (_) { return null; } // not ours
+}
+
+// MQTT 3.1.1 over WebSocket: CONNECT, SUBSCRIBE and PUBLISH at QoS 0 — all the signaling needs.
+function mqttPacket(first, parts) {
+  const n = parts.reduce((s, p) => s + p.length, 0);
+  const len = [];
+  let x = n;
+  do { let b = x % 128; x = Math.floor(x / 128); if (x > 0) b |= 128; len.push(b); } while (x > 0);
+  const out = new Uint8Array(1 + len.length + n);
+  out[0] = first;
+  out.set(len, 1);
+  let o = 1 + len.length;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+function mqttStr(s) {
+  const b = te.encode(s);
+  return Uint8Array.of(b.length >> 8, b.length & 255, ...b);
+}
+
+function mqttClient(url, topic, onPayload) {
+  let sock;
+  try { sock = new WebSocket(url, ['mqtt']); } catch (_) { return null; }
+  sock.binaryType = 'arraybuffer';
+  let buf = new Uint8Array(0);
+  let drop = 0; // bytes of an oversized packet still to discard
+  let ping = 0;
+  const cl = { ready: false, closed: false, onready: null };
+  sock.onopen = () => {
+    sock.send(mqttPacket(0x10, [mqttStr('MQTT'), Uint8Array.of(4, 2, 0, 60), mqttStr('rdcv-' + randomHex(6))]));
+    ping = setInterval(() => sock.readyState === WebSocket.OPEN && sock.send(Uint8Array.of(0xc0, 0)), 30000);
+  };
+  sock.onmessage = (ev) => {
+    let add = new Uint8Array(ev.data);
+    if (drop > 0) {
+      const d = Math.min(drop, add.length);
+      drop -= d;
+      add = add.subarray(d);
+      if (!add.length) return;
+    }
+    const joined = new Uint8Array(buf.length + add.length);
+    joined.set(buf);
+    joined.set(add, buf.length);
+    buf = joined;
+    for (;;) {
+      let i = 1, n = 0, mult = 1;
+      for (; i < buf.length && i <= 4; i++) { n += (buf[i] & 127) * mult; mult *= 128; if (!(buf[i] & 128)) break; }
+      if (i >= buf.length) return;
+      const total = i + 1 + n;
+      if (n > 1 << 18) {
+        // Anyone can publish to a public topic: skip what we would never keep, keep the connection.
+        if (buf.length >= total) { buf = buf.slice(total); continue; }
+        drop = total - buf.length;
+        buf = new Uint8Array(0);
+        return;
+      }
+      if (buf.length < total) return;
+      const type = buf[0] >> 4, qos = (buf[0] >> 1) & 3, body = buf.subarray(i + 1, total);
+      buf = buf.slice(total);
+      if (type === 2 && body[1] === 0) sock.send(mqttPacket(0x82, [Uint8Array.of(0, 1), mqttStr(topic), Uint8Array.of(0)]));
+      else if (type === 9) { cl.ready = true; if (cl.onready) cl.onready(); }
+      else if (type === 3 && body.length >= 2) {
+        const tl = (body[0] << 8) | body[1];
+        if (td.decode(body.subarray(2, 2 + tl)) === topic) onPayload(body.slice(2 + tl + (qos ? 2 : 0)));
+      }
+    }
+  };
+  sock.onclose = () => { cl.closed = true; cl.ready = false; clearInterval(ping); };
+  cl.publish = (payload) => { if (cl.ready && sock.readyState === WebSocket.OPEN) sock.send(mqttPacket(0x30, [mqttStr(topic), payload])); };
+  cl.close = () => { sock.onclose = null; clearInterval(ping); sock.close(); cl.closed = true; };
+  return cl;
+}
+
+// Broker connections for the current code and key, shared by reconnects.
+let sigCache = null;
+
+function signaling(code, key) {
+  const name = code + '-' + key;
+  if (sigCache && sigCache.name === name && sigCache.alive()) return sigCache.promise;
+  if (sigCache) sigCache.close();
+  const listeners = new Set();
+  let clients = [];
+  const entry = {
+    name,
+    alive: () => clients.length === 0 || clients.some((c) => !c.closed),
+    close: () => { for (const c of clients) c.close(); clients = []; },
+  };
+  entry.promise = (async () => {
+    const k = await deriveSignal(code, key);
+    clients = BROKERS.map((url) => mqttClient(url, k.topic, async (payload) => {
+      const m = await unseal(k, payload);
+      if (m) for (const fn of [...listeners]) fn(m);
+    })).filter(Boolean);
+    // Ready when the first broker has subscribed; the others join as they come.
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error(NO_BROKER)), 8000);
+      const done = () => { clearTimeout(t); resolve(); };
+      for (const c of clients) c.onready = done;
+    });
+    let order = Promise.resolve(); // messages leave in the order they were sent: the offer before its candidates
+    return {
+      send(obj) {
+        order = order.then(async () => {
+          const bytes = await seal(k, obj);
+          for (const c of clients) c.publish(bytes);
+        }).catch(() => {});
+        return order;
+      },
+      on(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+    };
+  })();
+  entry.promise.catch(() => { if (sigCache === entry) { entry.close(); sigCache = null; } });
+  sigCache = entry;
+  return entry.promise;
+}
+
+// Resolves when ICE gathering is complete, or soon after the first public candidate, or after max_ms.
+function gathered(pc, max_ms) {
+  return new Promise((resolve) => {
+    let soon = 0;
+    const done = () => {
+      clearTimeout(cap);
+      clearTimeout(soon);
+      pc.removeEventListener('icegatheringstatechange', onState);
+      pc.removeEventListener('icecandidate', onCand);
+      resolve();
+    };
+    const onState = () => pc.iceGatheringState === 'complete' && done();
+    const onCand = (e) => { if (e.candidate && / typ srflx /.test(e.candidate.candidate) && !soon) soon = setTimeout(done, 300); };
+    const cap = setTimeout(done, max_ms);
+    pc.addEventListener('icegatheringstatechange', onState);
+    pc.addEventListener('icecandidate', onCand);
+    onState();
+  });
+}
+
+function rtcLink(code, key, h) {
+  let pc = null, dc = null, off = null, timer = 0, ended = false;
+  let parts = [];
+  const id = randomHex(8);
+  const end = () => {
+    ended = true;
+    clearTimeout(timer);
+    if (off) off();
+    if (dc) { dc.onclose = null; dc.onmessage = null; try { dc.close(); } catch (_) {} }
+    if (pc) { pc.onconnectionstatechange = null; try { pc.close(); } catch (_) {} }
+  };
+  const fail = (why, fatal) => { if (ended) return; end(); h.close(why, fatal); };
+
+  (async () => {
+    progress(host ? 'Reconnecting…' : 'Looking for the computer…');
+    // The brokers connect while the browser gathers its candidates.
+    const sigReady = signaling(code, key);
+    sigReady.catch(() => {});
+    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    dc = pc.createDataChannel('rdc', { negotiated: true, id: 0, ordered: true });
+    dc.binaryType = 'arraybuffer';
+    dc.onopen = () => { clearTimeout(timer); h.open(); };
+    dc.onclose = () => fail('', false);
+    dc.onmessage = (ev) => {
+      if (typeof ev.data === 'string') return h.message(ev.data);
+      // Binary messages from the host come in pieces: [1] — more follow, [0] — the last one.
+      const b = new Uint8Array(ev.data);
+      if (b.length === 0) return;
+      parts.push(b.subarray(1));
+      if (b[0] === 1) return;
+      const n = parts.reduce((s, p) => s + p.length, 0);
+      const msg = new Uint8Array(n);
+      let o = 0;
+      for (const p of parts) { msg.set(p, o); o += p.length; }
+      parts = [];
+      h.message(msg.buffer);
+    };
+    pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') fail(NO_PATH, true); };
+    let offered = false;
+    let sig = null;
+    pc.addEventListener('icecandidate', (e) => {
+      if (offered && e.candidate && e.candidate.candidate) sig.send({ t: 'cand', id, c: e.candidate.candidate });
+    });
+    await pc.setLocalDescription(await pc.createOffer());
+    await gathered(pc, 2000);
+    sig = await sigReady;
+    if (ended) return;
+    let answered = false;
+    off = sig.on(async (m) => {
+      if (m.id !== id || ended) return;
+      if (m.t === 'err') return fail(m.msg || NO_ANSWER, true);
+      if (m.t !== 'answer' || answered) return;
+      answered = true;
+      clearTimeout(timer);
+      progress(host ? 'Reconnecting…' : 'Connecting directly…');
+      try { await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp }); } catch (e) { return fail(String(e.message || e), true); }
+      timer = setTimeout(() => fail(NO_PATH, true), 15000);
+    });
+    offered = true; // candidates found from now on follow the offer
+    await sig.send({ t: 'offer', id, sdp: pc.localDescription.sdp });
+    timer = setTimeout(() => fail(NO_ANSWER, true), 10000);
+  })().catch((e) => fail(String((e && e.message) || e), true));
+
+  return {
+    send(d) { if (dc && dc.readyState === 'open') dc.send(d); },
+    close() { if (!ended) end(); },
+  };
 }
 
 function onControl(m) {
@@ -139,13 +460,13 @@ function onControl(m) {
       syncCursor(m);
       break;
     case 'err':
-      if (m.fatal) { if (ws) { ws.onclose = null; ws.close(); ws = null; } showJoin(m.msg); break; }
+      if (m.fatal) { closeConn(); host = null; showJoin(m.msg); break; }
       $('veil').textContent = m.msg;
       $('veil').style.display = 'flex';
       gotFrame = false;
       break;
     case 'bye':
-      if (ws) { ws.onclose = null; ws.close(); ws = null; }
+      closeConn();
       host = null;
       showJoin(m.msg || 'The host ended the session');
       break;
@@ -491,7 +812,7 @@ $('leave').addEventListener('click', () => {
   releaseAll();
   wantConnected = false;
   host = null;
-  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  closeConn();
   resetDecoder();
   showJoin('');
 });
@@ -508,7 +829,8 @@ setInterval(() => {
   const mbps = (stats.bytes * 8 / dt / 1e6).toFixed(1);
   stats.frames = 0; stats.bytes = 0; stats.t0 = now;
   const codec = host ? (host.codec === 'h264' ? 'H.264' : 'JPEG') : '';
-  $('stat').textContent = host ? `${codec} · ${fps} fps · ${mbps} Mbps · ${Math.round(stats.rtt)} ms` : '';
+  const via = key ? ' · WebRTC' : '';
+  $('stat').textContent = host ? `${codec} · ${fps} fps · ${mbps} Mbps · ${Math.round(stats.rtt)} ms${via}` : '';
   send(JSON.stringify({ t: 'ping', ts: now }));
 }, 1000);
 
@@ -912,12 +1234,23 @@ const osk = (() => {
   };
 })();
 
-$('code').addEventListener('input', (e) => { e.target.value = formatCode(e.target.value); });
+// Digits get grouped as they are typed; a pasted link stays as it is.
+$('code').addEventListener('input', (e) => { if (/^[\d ]*$/.test(e.target.value)) e.target.value = formatCode(e.target.value); });
 $('form').addEventListener('submit', (e) => { e.preventDefault(); start($('code').value); });
 
+if (!servedByHost) {
+  // GitHub Pages: only a link from anywhere works here.
+  $('hint').textContent = 'Open the link from the RDC window on the computer, or paste it here';
+  $('code').setAttribute('inputmode', 'url');
+  $('code').placeholder = 'Link from the RDC window';
+  $('code').classList.add('link');
+}
+
 function startFromHash() {
-  const fromLink = location.hash.replace(/\D/g, '');
-  if (fromLink.length === 9 && fromLink !== code) { $('code').value = formatCode(fromLink); start(fromLink); }
+  const e = parseEntry(location.hash);
+  if (e.code.length !== 9 || (e.code === code && e.key === key && wantConnected)) return;
+  $('code').value = e.key ? location.hash.slice(1) : formatCode(e.code);
+  start(location.hash);
 }
 window.addEventListener('hashchange', startFromHash);
 startFromHash();

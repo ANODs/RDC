@@ -6,6 +6,7 @@ A cross-platform remote desktop in Zig: macOS, Windows, Linux, then Android, iOS
 - `docs/PLAN.md` — goals, architecture, protocol, stability, and stages with acceptance criteria; section 17 — the usage scenarios and which of them work.
 - Current milestone — M3 "Windows" (`docs/PLAN.md`, section 16): a host on the PC; the Mac and the PC control each other through a browser. The product's main focus is AI agents that control other devices.
 - `src/agent/` — the agent side: `client.zig` (a viewer connection to a host: frames in, input out), `keys.zig` (key names → HID codes), `tools.zig` (the MCP tools and their descriptions), `mcp.zig` (JSON-RPC over stdio and Streamable HTTP, both protocol eras). `plugins/rdc/` — one plugin directory for Claude Code (`.claude-plugin/plugin.json` → the `rdc-mcp.mcpb` release asset), for Codex and other Agent Plugins clients (`plugin.json`, `mcp.json` → `scripts/rdc-mcp`), with the shared skill `skills/rdc/SKILL.md`. Marketplaces: `.claude-plugin/marketplace.json`, `.agents/plugins/marketplace.json`. `mcpb/manifest.json` + `tools/make_mcpb.sh` build the bundle.
+- `src/net/` — the network. Local network: `http.zig`, `ws.zig`. From anywhere (`docs/PLAN.md`, section 6): `signal.zig` + `mqtt.zig` (the host finds browsers through public MQTT brokers; topic and AES-GCM key from the code and the link's key), `webrtc.zig` (one session: socket, ICE, glue), `stun.zig`, `sdp.zig`, `dtls.zig` (DTLS 1.2 server), `sctp.zig` (data channel). The browser side is in `web/viewer.js` (`rtcLink`, `signaling`).
 
 ## Build
 `ZIG=~/Applications/zig-0.17.1/zig`; run commands from the project root:
@@ -14,9 +15,10 @@ A cross-platform remote desktop in Zig: macOS, Windows, Linux, then Android, iOS
 - `"$ZIG" build package -Dtarget=x86_64-windows -Doptimize=ReleaseSafe` — `zig-out/package/RDC.exe` (built on the Mac; the log on the PC is `%LOCALAPPDATA%\RDC\rdc.log`)
 - `zig-out/bin/rdc host --no-ui` — host without a window; the code and link are in the log `~/Library/Logs/RDC/rdc.log`
 - `open -n zig-out/RDC.app --args --web-dir "$PWD/web"` — the viewer is served from `web/` without rebuilding; `--update-url URL` — updates from URL instead of GitHub (for testing)
+- The link from anywhere without GitHub Pages: `python3 -m http.server 8765 --bind 127.0.0.1 --directory web`, then `open -n zig-out/RDC.app --args --remote-url http://localhost:8765/` and open the "From anywhere" link (localhost is a secure context, so WebCrypto and WebRTC work). `--no-remote` turns connections from anywhere off.
 - `zig-out/bin/rdc mcp` — the MCP server on stdio (JSON-RPC, one message per line; the log goes to stderr and the file); `rdc mcp --http [PORT] [--token T] [--public] [--tunnel]` — Streamable HTTP. A quick check: pipe `{"jsonrpc":"2.0","id":1,"method":"tools/list"}` into it, or POST it to `http://127.0.0.1:7710/mcp`.
 - `tools/make_mcpb.sh <version> <out.mcpb> --mac <rdc> --win <rdc.exe>` — the MCP bundle for Claude Desktop (CI does this in the release).
-- A host started from `zig-out/` has no Screen Recording permission (TCC knows the installed `~/Applications/RDC.app`); for a live test of screenshots connect to the installed RDC (its link is in `~/Library/Logs/RDC/rdc.log`).
+- `zig-out/bin/rdc` started from a shell has no Screen Recording permission; `zig-out/RDC.app` opened with `open -n` had it on 2026-11-09 (same identifier as the installed `~/Applications/RDC.app`). Otherwise, for a live test of screenshots connect to the installed RDC (its link is in `~/Library/Logs/RDC/rdc.log`).
 - Ad-hoc signing with the designated requirement `identifier "com.anods.rdc"`: macOS permissions (Screen Recording, Accessibility) survive rebuilds and updates. If the permissions get stuck — `tccutil reset ScreenCapture com.anods.rdc` and `tccutil reset Accessibility com.anods.rdc` (the user runs these).
 - The installed RDC is `~/Applications/RDC.app`; it updates itself. Builds from `zig-out` do not update themselves.
 

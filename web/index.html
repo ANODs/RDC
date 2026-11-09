@@ -14,8 +14,10 @@
   .card p { margin: 0 0 18px; color: var(--muted); }
   #code { width: 100%; font: 600 28px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 2px; text-align: center; padding: 14px 10px; border-radius: 10px; border: 1px solid var(--line); background: #0f1115; color: var(--text); outline: none; }
   #code:focus { border-color: var(--accent); }
+  #code.link { font: 500 15px/1.3 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 0; }
   .card button { width: 100%; margin-top: 14px; padding: 13px; font: 600 16px/1 inherit; border: 0; border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer; }
   #err { min-height: 20px; margin: 12px 0 0; color: var(--danger); text-align: center; }
+  #err.info { color: var(--muted); }
   #stage { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; touch-action: none; }
   #screen { display: block; outline: none; cursor: default; background: #000; image-rendering: auto; }
   #bar { position: absolute; top: 8px; left: 50%; transform: translate(-50%, -64px); display: flex; gap: 6px; align-items: center; padding: 6px 8px; background: rgba(22,24,29,.92); border: 1px solid var(--line); border-radius: 12px; transition: transform .18s ease; white-space: nowrap; max-width: calc(100% - 16px); overflow-x: auto; }
@@ -73,8 +75,8 @@
 <div id="join">
   <form class="card" id="form" autocomplete="off">
     <h1>RDC</h1>
-    <p>Enter the code from the RDC window on the computer</p>
-    <input id="code" inputmode="numeric" placeholder="123 456 789" maxlength="11" autofocus>
+    <p id="hint">Enter the code from the RDC window on the computer</p>
+    <input id="code" inputmode="numeric" placeholder="123 456 789" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus>
     <button type="submit">Connect</button>
     <div id="err"></div>
   </form>
@@ -107,6 +109,6 @@
   <div class="osk-size" id="osk-size" title="Resize"></div>
 </div>
 <div id="osk-bubble"></div>
-<script src="/viewer.js"></script>
+<script src="viewer.js"></script>
 </body>
 </html>
