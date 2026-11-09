@@ -3,6 +3,7 @@
 //! X25519 or P-256, a self-signed ECDSA P-256 certificate, extended master secret
 //! (RFC 7627). The client must present a certificate whose SHA-256 matches the
 //! fingerprint from its SDP offer, and prove it owns the key (CertificateVerify).
+//! Encrypted records pass an anti-replay window (RFC 6347, section 4.1.2.6).
 //! Pure logic: datagrams in, datagrams and decrypted data out through a Sink.
 const std = @import("std");
 const crypto = std.crypto;
@@ -143,6 +144,84 @@ fn selfSignedCert(out: []u8, key: Ecdsa.KeyPair, serial: [8]u8, noise: [Ecdsa.no
 }
 
 // ---------------------------------------------------------------------------
+// The browser's certificate. Only its public key is needed. std.crypto.Certificate.parse
+// trusts its input (a long length overflows, a missing field is read past the end), so the
+// browser's bytes never reach it: they are walked with bounds first, then the key is read here.
+
+const der_sequence: u8 = 0x30;
+/// Deeper than any certificate nests.
+const der_max_depth = 16;
+
+const Der = struct {
+    tag: u8,
+    body: []const u8,
+    /// Header and contents.
+    size: usize,
+};
+
+/// The element at the start of `b`: a one-byte tag, a short length or a long one of 1–4 bytes,
+/// contents within `b`. null — truncated, an indefinite or over-long length, or a multi-byte tag.
+fn derNext(b: []const u8) ?Der {
+    if (b.len < 2 or b[0] & 0x1f == 0x1f) return null;
+    var len: usize = b[1];
+    var header: usize = 2;
+    if (len & 0x80 != 0) {
+        const n = len & 0x7f;
+        if (n == 0 or n > 4 or b.len - 2 < n) return null;
+        len = 0;
+        for (b[2..][0..n]) |byte| len = (len << 8) | byte;
+        header += n;
+    }
+    if (len > b.len - header) return null;
+    return .{ .tag = b[0], .body = b[header..][0..len], .size = header + len };
+}
+
+/// Every element of `b` is complete and within its parent, down through every constructed one.
+fn derWellFormed(b: []const u8, depth: u8) bool {
+    if (depth == 0) return false;
+    var rest = b;
+    while (rest.len > 0) {
+        const e = derNext(rest) orelse return false;
+        if (e.tag & 0x20 != 0 and !derWellFormed(e.body, depth - 1)) return false;
+        rest = rest[e.size..];
+    }
+    return true;
+}
+
+fn derTake(rest: *[]const u8) error{Decode}!Der {
+    const e = derNext(rest.*) orelse return error.Decode;
+    rest.* = rest.*[e.size..];
+    return e;
+}
+
+/// The subject public key (SEC1) of an X.509 certificate with an ECDSA P-256 key.
+fn certP256Key(cert: []const u8) error{ Decode, Unsupported }![]const u8 {
+    if (!derWellFormed(cert, der_max_depth)) return error.Decode;
+    var all = cert;
+    const outer = try derTake(&all);
+    if (outer.tag != der_sequence or all.len != 0) return error.Decode;
+    var top = outer.body;
+    const tbs = try derTake(&top);
+    if (tbs.tag != der_sequence) return error.Decode;
+    // TBSCertificate: [0] version (optional), serial number, signature algorithm, issuer,
+    // validity, subject, subject public key info, then the rest.
+    var fields = tbs.body;
+    var field = try derTake(&fields);
+    if (field.tag == 0xa0) field = try derTake(&fields);
+    if (field.tag != 0x02) return error.Decode;
+    for (0..4) |_| if ((try derTake(&fields)).tag != der_sequence) return error.Decode;
+    const spki = try derTake(&fields);
+    if (spki.tag != der_sequence) return error.Decode;
+    var parts = spki.body;
+    const algorithm = try derTake(&parts);
+    const key = try derTake(&parts);
+    if (algorithm.tag != der_sequence or key.tag != 0x03 or key.body.len < 1 or key.body[0] != 0) return error.Decode;
+    // id-ecPublicKey with the named curve prime256v1, as in our own certificate.
+    if (!std.mem.eql(u8, algorithm.body, spki_prefix[4..23])) return error.Unsupported;
+    return key.body[1..];
+}
+
+// ---------------------------------------------------------------------------
 // TLS 1.2 PRF with SHA-256 (RFC 5246, section 5).
 
 pub fn prf(out: []u8, secret: []const u8, label: []const u8, seed_a: []const u8, seed_b: []const u8) void {
@@ -249,6 +328,34 @@ const Slot = struct {
     buf: [max_message]u8 = undefined,
 };
 
+/// RFC 6347, section 4.1.2.6: the highest record sequence number accepted and the 63 before it.
+const ReplayWindow = struct {
+    top: u64 = 0,
+    /// Bit i: record top - i was accepted. 0 — none yet.
+    seen: u64 = 0,
+
+    /// false — a repeat, or too old to tell.
+    fn fresh(w: *const ReplayWindow, seq: u64) bool {
+        if (w.seen == 0 or seq > w.top) return true;
+        const back = w.top - seq;
+        return back < 64 and (w.seen >> @intCast(back)) & 1 == 0;
+    }
+
+    /// Only for a record that proved genuine: a forged one must not move the window.
+    fn accept(w: *ReplayWindow, seq: u64) void {
+        if (w.seen == 0) {
+            w.top = seq;
+            w.seen = 1;
+        } else if (seq > w.top) {
+            const ahead = seq - w.top;
+            w.seen = if (ahead >= 64) 1 else (w.seen << @intCast(ahead)) | 1;
+            w.top = seq;
+        } else if (w.top - seq < 64) {
+            w.seen |= @as(u64, 1) << @intCast(w.top - seq);
+        }
+    }
+};
+
 pub const Server = struct {
     io: std.Io,
     identity: *const Identity,
@@ -284,6 +391,9 @@ pub const Server = struct {
 
     /// Record sequence numbers of epochs 0 and 1.
     out_seq: [2]u64 = .{ 0, 0 },
+    /// The client's encrypted records accepted so far. Epoch 0 has no window: without a MAC a
+    /// forged sequence number would move it, and its repeats are caught by the message sequence.
+    in_window: ReplayWindow = .{},
     /// The last flight, for retransmission: handshake messages with their headers.
     flight: [2048]u8 = undefined,
     flight_len: usize = 0,
@@ -326,7 +436,10 @@ pub const Server = struct {
                     else => {},
                 }
             } else if (epoch == 1 and s.have_keys) {
+                const seq = std.mem.readInt(u48, header[5..11], .big);
+                if (!s.in_window.fresh(seq)) continue; // a replay, or too old: not worth decrypting
                 const plain = s.open(header, body) orelse continue; // forged or damaged: drop silently
+                s.in_window.accept(seq);
                 switch (ct) {
                     content_handshake => s.onHandshakeRecord(plain, 1, now_us, sink),
                     content_app => if (s.state == .established) sink.data(sink.ctx, plain),
@@ -580,12 +693,8 @@ pub const Server = struct {
         var digest: [32]u8 = undefined;
         Sha256.hash(der, &digest, .{});
         if (!crypto.timing_safe.eql([32]u8, digest, s.peer_fingerprint)) return error.Certificate;
-        const parsed = (crypto.Certificate{ .buffer = der, .index = 0 }).parse() catch return error.Certificate;
-        switch (parsed.pub_key_algo) {
-            .X9_62_id_ecPublicKey => |curve| if (curve != .X9_62_prime256v1) return error.Unsupported,
-            else => return error.Unsupported,
-        }
-        s.peer_key = Ecdsa.PublicKey.fromSec1(parsed.pubKey()) catch return error.Certificate;
+        const key = try certP256Key(der);
+        s.peer_key = Ecdsa.PublicKey.fromSec1(key) catch return error.Certificate;
     }
 
     fn onClientKeyExchange(s: *Server, body: []const u8) MsgError!void {
@@ -935,11 +1044,193 @@ test "dtls: records round trip" {
     @memcpy(rx[0..ts.sent_len[0]], ts.sent[0][0..ts.sent_len[0]]);
     b.handle(rx[0..ts.sent_len[0]], 0, .{ .ctx = &ts, .send = TestSink.send, .data = Got.data });
     try std.testing.expectEqualStrings("SCTP packet", Got.buf[0..Got.len]);
-    // A flipped bit is dropped silently.
+    // A flipped bit is dropped silently (in a new record: the first one again would be a replay).
     Got.len = 0;
-    @memcpy(rx[0..ts.sent_len[0]], ts.sent[0][0..ts.sent_len[0]]);
+    a.sendData("SCTP packet", ts.sink());
+    @memcpy(rx[0..ts.sent_len[1]], ts.sent[1][0..ts.sent_len[1]]);
     rx[header_len + 9] ^= 1;
-    b.handle(rx[0..ts.sent_len[0]], 0, .{ .ctx = &ts, .send = TestSink.send, .data = Got.data });
+    b.handle(rx[0..ts.sent_len[1]], 0, .{ .ctx = &ts, .send = TestSink.send, .data = Got.data });
     try std.testing.expectEqual(@as(usize, 0), Got.len);
+    // Undamaged, that record still gets through: the forged copy did not count as seen.
+    @memcpy(rx[0..ts.sent_len[1]], ts.sent[1][0..ts.sent_len[1]]);
+    b.handle(rx[0..ts.sent_len[1]], 0, .{ .ctx = &ts, .send = TestSink.send, .data = Got.data });
+    try std.testing.expectEqualStrings("SCTP packet", Got.buf[0..Got.len]);
     try std.testing.expectEqual(State.established, b.state);
+}
+
+test "dtls: replayed and too old records are dropped" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const id = try Identity.generate(io);
+    const a = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(a);
+    a.init(io, &id, @splat(0));
+    a.state = .established;
+    a.have_keys = true;
+    a.server_key = @splat(1);
+    a.server_iv = @splat(2);
+    const b = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(b);
+    b.init(io, &id, @splat(0));
+    b.state = .established;
+    b.have_keys = true;
+    b.client_key = @splat(1);
+    b.client_iv = @splat(2);
+    // Records 0…71 from a, each with one byte of data, delivered to b in any order.
+    const rec_len = overhead + 1;
+    const Records = struct {
+        var d: [72][rec_len]u8 = undefined;
+        var n: usize = 0;
+        var got: usize = 0;
+        fn send(ctx: *anyopaque, rec: []const u8) void {
+            _ = ctx;
+            @memcpy(&d[n], rec);
+            n += 1;
+        }
+        fn data(ctx: *anyopaque, p: []u8) void {
+            _ = ctx;
+            _ = p;
+            got += 1;
+        }
+        fn sink() Sink {
+            return .{ .ctx = &n, .send = send, .data = data };
+        }
+        fn deliver(s: *Server, i: usize, forged: bool) usize {
+            var rx = d[i];
+            if (forged) rx[rec_len - 1] ^= 1;
+            s.handle(&rx, 0, sink());
+            return got;
+        }
+    };
+    for (0..72) |_| a.sendData("x", Records.sink());
+    try std.testing.expectEqual(@as(usize, 72), Records.n);
+    const expectGot = std.testing.expectEqual;
+    try expectGot(@as(usize, 1), Records.deliver(b, 69, false));
+    try expectGot(@as(usize, 1), Records.deliver(b, 69, false)); // a repeat
+    try expectGot(@as(usize, 1), Records.deliver(b, 71, true)); // forged: the window stays at 69
+    try expectGot(@as(usize, 2), Records.deliver(b, 6, false)); // 63 behind: still in the window
+    try expectGot(@as(usize, 2), Records.deliver(b, 5, false)); // 64 behind: too old
+    try expectGot(@as(usize, 2), Records.deliver(b, 6, false)); // a repeat
+    try expectGot(@as(usize, 3), Records.deliver(b, 71, false));
+    try expectGot(@as(usize, 4), Records.deliver(b, 8, false)); // 63 behind 71
+    try expectGot(@as(usize, 4), Records.deliver(b, 7, false)); // 64 behind 71
+    try expectGot(@as(usize, 5), Records.deliver(b, 70, false)); // in the window, not seen yet
+    try std.testing.expectEqual(State.established, b.state);
+}
+
+test "dtls: the browser's key is read only from a well-formed certificate" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const id = try Identity.generate(threaded.io());
+    // Our own certificate, and one from OpenSSL 3 (v3, with extensions): the same key std finds.
+    try std.testing.expectEqualSlices(u8, &id.key.public_key.toUncompressedSec1(), try certP256Key(id.cert()));
+    var der: [378]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&der, "308201763082011da00302010202146f2e33a6f58a49dc2b317e3ca753d305633cf6b1300a06082a8648ce3d04030230" ++
+        "11310f300d06035504030c06576562525443301e170d3236313130393130323831315a170d3236313230393130323831" ++
+        "315a3011310f300d06035504030c065765625254433059301306072a8648ce3d020106082a8648ce3d03010703420004" ++
+        "948ff167af10a44113de7aa8b6ad7838189572db7252dc0166ccfa418e07e466cbc35804a5683fb6ff699ee5ed5a41a0" ++
+        "be0fabceed7d138f90da427efbece0d9a3533051301d0603551d0e0416041487075175992ef3ab58ecd47707025a0f06" ++
+        "57e20b301f0603551d2304183016801487075175992ef3ab58ecd47707025a0f0657e20b300f0603551d130101ff0405" ++
+        "30030101ff300a06082a8648ce3d04030203470030440220179c6bcdb8759d001c0e5b7e4fe787c52801f18e903d7dc7" ++
+        "7ae141c840a551bc022043bc63529bd50864b8e6b7e9f43318ebfc4c1096a28d9892a87a6b10f778cb6b");
+    const parsed = try (crypto.Certificate{ .buffer = &der, .index = 0 }).parse();
+    try std.testing.expectEqualSlices(u8, parsed.pubKey(), try certP256Key(&der));
+
+    // A length past the end (it overflowed std's parser), DER that is well-formed but no
+    // certificate (std reads past its end), an indefinite length, a five-byte length, a child
+    // longer than its parent, a multi-byte tag.
+    const bad = [_][]const u8{
+        &.{ 0x30, 0x84, 0xff, 0xff, 0xff, 0xff, 0x30, 0x03 },
+        &.{ 0x30, 0x00 },
+        &.{ 0x30, 0x03, 0x03, 0x01, 0x00 },
+        &.{ 0x30, 0x80, 0x00, 0x00 },
+        &.{ 0x30, 0x85, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00 },
+        &.{ 0x30, 0x02, 0x30, 0x05 },
+        &.{ 0x3f, 0x01, 0x00 },
+    };
+    for (bad) |b| try std.testing.expectError(error.Decode, certP256Key(b));
+    // A trailing byte.
+    var long: [512]u8 = undefined;
+    @memcpy(long[0..id.cert().len], id.cert());
+    long[id.cert().len] = 0;
+    try std.testing.expectError(error.Decode, certP256Key(long[0 .. id.cert().len + 1]));
+    // Damage inside a field the key reader skips: the second time runs past its SEQUENCE.
+    var damaged: [512]u8 = undefined;
+    @memcpy(damaged[0..id.cert().len], id.cert());
+    const not_after = std.mem.find(u8, damaged[0..id.cert().len], "\x17\x0d491231").?;
+    damaged[not_after + 1] = 0x0e;
+    try std.testing.expectError(error.Decode, certP256Key(damaged[0..id.cert().len]));
+    // Twenty SEQUENCEs one inside another.
+    var deep: [40]u8 = undefined;
+    for (0..20) |i| {
+        deep[2 * i] = der_sequence;
+        deep[2 * i + 1] = @intCast(38 - 2 * i);
+    }
+    try std.testing.expectError(error.Decode, certP256Key(&deep));
+
+    // The smallest certificate shape (v1, no version field): a key in the BIT STRING is found,
+    // an empty BIT STRING is refused (std's parser would slice it backwards).
+    const Shape = struct {
+        fn cert(out: *[160]u8, key_bits: []const u8) []u8 {
+            var spki_body: [96]u8 = undefined;
+            const alg = spki_prefix[2..23];
+            @memcpy(spki_body[0..alg.len], alg);
+            @memcpy(spki_body[alg.len..][0..key_bits.len], key_bits);
+            var spki_buf: [100]u8 = undefined;
+            const spki = derWrap(&spki_buf, der_sequence, spki_body[0 .. alg.len + key_bits.len]);
+            const fields = [_]u8{ 0x02, 0x01, 0x01, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00 };
+            var tbs_body: [120]u8 = undefined;
+            @memcpy(tbs_body[0..fields.len], &fields);
+            @memcpy(tbs_body[fields.len..][0..spki.len], spki);
+            var tbs_buf: [128]u8 = undefined;
+            const tbs = derWrap(&tbs_buf, der_sequence, tbs_body[0 .. fields.len + spki.len]);
+            return derWrap(out, der_sequence, tbs);
+        }
+    };
+    var shaped: [160]u8 = undefined;
+    var bits: [3 + 65]u8 = undefined;
+    bits[0] = 0x03;
+    bits[1] = 0x42;
+    bits[2] = 0;
+    @memcpy(bits[3..], &id.key.public_key.toUncompressedSec1());
+    try std.testing.expectEqualSlices(u8, bits[3..], try certP256Key(Shape.cert(&shaped, &bits)));
+    try std.testing.expectError(error.Decode, certP256Key(Shape.cert(&shaped, &.{ 0x03, 0x00 })));
+
+    // Another curve where prime256v1 should be: refused, not misread.
+    var other: [512]u8 = undefined;
+    @memcpy(other[0..id.cert().len], id.cert());
+    const curve = std.mem.find(u8, other[0..id.cert().len], spki_prefix[13..23]).?;
+    other[curve + 9] = 0x22;
+    try std.testing.expectError(error.Unsupported, certP256Key(other[0..id.cert().len]));
+}
+
+test "dtls: a malformed browser certificate fails the handshake" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const id = try Identity.generate(io);
+    const s = try std.testing.allocator.create(Server);
+    defer std.testing.allocator.destroy(s);
+    // The fingerprint in the offer matches: only the DER is wrong.
+    const der = [_]u8{ 0x30, 0x84, 0xff, 0xff, 0xff, 0xff, 0x30, 0x03 };
+    var fp: [32]u8 = undefined;
+    Sha256.hash(&der, &fp, .{});
+    s.init(io, &id, fp);
+    s.state = .wait_flight5; // as after the ClientHello
+    s.next_recv_seq = 1;
+    const body_len = 6 + der.len;
+    var dgram: [header_len + hs_header_len + body_len]u8 = undefined;
+    dgram[0] = content_handshake;
+    std.mem.writeInt(u16, dgram[1..3], version, .big);
+    @memset(dgram[3..11], 0);
+    std.mem.writeInt(u16, dgram[11..13], hs_header_len + body_len, .big);
+    writeHsHeader(dgram[13..25], hs_certificate, 1, body_len);
+    std.mem.writeInt(u24, dgram[25..28], der.len + 3, .big);
+    std.mem.writeInt(u24, dgram[28..31], der.len, .big);
+    @memcpy(dgram[31..], &der);
+    var ts: TestSink = .{};
+    s.handle(&dgram, 0, ts.sink());
+    try std.testing.expectEqual(State.failed, s.state);
+    try std.testing.expectEqualStrings("a handshake message is malformed", s.reason);
 }

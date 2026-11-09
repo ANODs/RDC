@@ -31,6 +31,11 @@ pub const version = update.current_version;
 pub const max_viewers = 4;
 /// WebRTC sessions at once, admitted or still connecting.
 const max_rtc = max_viewers + 4;
+/// The longest --remote-url: the link adds the code and the key, and the Windows window holds 255 characters.
+pub const max_remote_url_len = 200;
+const max_remote_link_len = max_remote_url_len + "#123456789-".len + signal.salt_text_len;
+/// An offer refused for its clock gets an answer at most this often: it may be a replay.
+const clock_reply_every_us: u64 = 5_000_000;
 const queue_cap = 16;
 const max_frames_queued = 6;
 const max_ws_payload = 16 * 1024;
@@ -67,6 +72,11 @@ pub fn log(comptime fmt: []const u8, args: anytype) void {
 pub fn nowUs(io: Io) u64 {
     const t = Io.Clock.awake.now(io);
     return @intCast(@divTrunc(t.nanoseconds, 1000));
+}
+
+/// Wall-clock milliseconds since 1970, as Date.now() in the browser.
+fn realMs(io: Io) i64 {
+    return @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
 }
 
 /// This OS's key code for a HID code from the network.
@@ -374,10 +384,14 @@ pub const Host = struct {
     identity: dtls.Identity = undefined,
     signal: ?*signal.Signal = null,
     rtc: [max_rtc]?*RtcConn = @splat(null),
-    /// Offer ids already taken: the same offer arrives through every broker.
-    seen_offers: [16][32]u8 = undefined,
-    seen_count: usize = 0,
-    seen_next: usize = 0,
+    /// Offers already taken (the same offer arrives through every broker, and may be replayed)
+    /// and when the last sessions started.
+    guard: signal.Guard = .{},
+    last_clock_reply_us: u64 = 0,
+    /// Whether the link from anywhere is shown; only the housekeeping thread uses it.
+    remote_shown: bool = false,
+    /// Keeps the "from anywhere" part of the window in step when two threads refresh it.
+    remote_ui_mutex: Io.Mutex = .init,
 
     fn lock(h: *Host) void {
         h.mutex.lockUncancelable(h.io);
@@ -418,12 +432,12 @@ pub const Host = struct {
         return salt;
     }
 
-    /// https://anods.github.io/RDC/#<code>-<key>; empty when connections from anywhere are off.
-    fn remoteLink(h: *Host, buf: []u8) []const u8 {
-        if (h.signal == null) return "";
+    /// https://anods.github.io/RDC/#<code>-<key>; under the lock.
+    fn remoteLinkLocked(h: *Host, buf: *[max_remote_link_len]u8) []const u8 {
         var key: [signal.salt_text_len]u8 = undefined;
         _ = std.base64.url_safe_no_pad.Encoder.encode(&key, &h.salt);
-        return std.fmt.bufPrint(buf, "{s}#{s}-{s}", .{ h.opts.remote_url, &h.code.digits, &key }) catch "";
+        // `run` refuses a --remote-url that would not fit.
+        return std.fmt.bufPrint(buf, "{s}#{s}-{s}", .{ h.opts.remote_url, &h.code.digits, &key }) catch unreachable;
     }
 
     fn lanIp(h: *Host) ?[4]u8 {
@@ -914,50 +928,68 @@ pub const Host = struct {
     }
 
     /// A message from a browser through a broker (on a broker thread): an offer or a late candidate.
+    /// Its timestamp must be within a minute of our clock: a recorded message sent again is refused.
     fn onSignal(ctx: *anyopaque, text: []const u8) void {
         const h: *Host = @ptrCast(@alignCast(ctx));
-        const SignalMsg = struct { t: []const u8 = "", id: []const u8 = "", sdp: []const u8 = "", c: []const u8 = "" };
+        const SignalMsg = struct { t: []const u8 = "", id: []const u8 = "", ts: i64 = 0, sdp: []const u8 = "", c: []const u8 = "" };
         const parsed = std.json.parseFromSlice(SignalMsg, h.gpa, text, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
         const m = parsed.value;
-        if (m.id.len == 0 or m.id.len > 32) return;
+        if (m.id.len == 0 or m.id.len > signal.max_id_len) return;
         for (m.id) |c| if (!std.ascii.isAlphanumeric(c)) return;
-        if (std.mem.eql(u8, m.t, "offer")) {
-            h.onOffer(m.id, m.sdp);
-        } else if (std.mem.eql(u8, m.t, "cand")) {
-            h.lock();
-            defer h.unlock();
-            for (h.rtc) |maybe| {
-                const c = maybe orelse continue;
-                if (std.mem.eql(u8, c.id(), m.id)) c.session.addCandidate(m.c);
-            }
+        const is_offer = std.mem.eql(u8, m.t, "offer");
+        // Our own answers come back too: everything but offers and candidates is ignored.
+        if (!is_offer and !std.mem.eql(u8, m.t, "cand")) return;
+        const skew = signal.skewMs(m.ts, realMs(h.io));
+        if (!signal.fresh(skew)) {
+            if (is_offer) h.onStaleOffer(m.id, m.ts, skew);
+            return;
         }
-        // Our own answers come back too: everything else is ignored.
+        if (is_offer) return h.onOffer(m.id, m.ts, m.sdp);
+        h.lock();
+        defer h.unlock();
+        for (h.rtc) |maybe| {
+            const c = maybe orelse continue;
+            if (std.mem.eql(u8, c.id(), m.id)) c.session.addCandidate(m.c);
+        }
     }
 
-    fn onOffer(h: *Host, id: []const u8, offer: []const u8) void {
+    /// An offer whose clock is more than a minute off ours: a replay, or a device set to the wrong
+    /// time. A replay of an offer we took stays unanswered; otherwise the browser hears why, now and then.
+    fn onStaleOffer(h: *Host, id: []const u8, ts: i64, skew_ms: i64) void {
+        const now = nowUs(h.io);
+        h.lock();
+        const reply = !h.guard.seen(id) and now -| h.last_clock_reply_us >= clock_reply_every_us;
+        if (reply) h.last_clock_reply_us = now;
+        h.unlock();
+        if (!reply) return;
+        if (ts == 0) return h.signalError(id, ts, "This page is out of date — reload it");
+        const minutes = (@abs(skew_ms) + 30_000) / 60_000;
+        const side: []const u8 = if (skew_ms > 0) "behind" else "ahead of";
+        log("a browser's offer was refused: its clock is {d} min {s} this computer's", .{ minutes, side });
+        var buf: [160]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "The clock on this device is {d} min {s} the computer's — turn on automatic date and time on both", .{ minutes, side }) catch return;
+        h.signalError(id, ts, msg);
+    }
+
+    fn onOffer(h: *Host, id: []const u8, ts: i64, offer: []const u8) void {
         // The reply to a refused offer goes out after the lock: publishing is network I/O.
-        const refusal = h.startSession(id, offer) orelse return;
-        h.signalError(id, refusal);
+        const refusal = h.startSession(id, ts, offer) orelse return;
+        h.signalError(id, ts, refusal);
     }
 
     /// null — started or a repeat; otherwise why the offer was refused.
-    fn startSession(h: *Host, id: []const u8, offer: []const u8) ?[]const u8 {
+    fn startSession(h: *Host, id: []const u8, ts: i64, offer: []const u8) ?[]const u8 {
+        const now = nowUs(h.io);
         h.lock();
         defer h.unlock();
-        for (h.seen_offers[0..h.seen_count]) |*seen| {
-            if (std.mem.eql(u8, std.mem.sliceTo(seen, 0), id)) return null;
-        }
-        h.seen_offers[h.seen_next] = @splat(0);
-        @memcpy(h.seen_offers[h.seen_next][0..id.len], id);
-        h.seen_next = (h.seen_next + 1) % h.seen_offers.len;
-        h.seen_count = @min(h.seen_count + 1, h.seen_offers.len);
-
+        if (!h.guard.remember(id)) return null; // through the other broker, or replayed
         const slot = for (h.rtc, 0..) |c, i| {
             if (c == null) break i;
         } else return "The computer has too many connections — try again in a minute";
+        if (!h.guard.allowStart(now)) return "Too many connection attempts — try again in a few seconds";
         const conn = h.gpa.create(RtcConn) catch return null;
-        conn.* = .{ .host = h, .session = undefined, .id_buf = @splat(0), .id_len = id.len };
+        conn.* = .{ .host = h, .session = undefined, .id_buf = @splat(0), .id_len = id.len, .offer_ts = ts };
         @memcpy(conn.id_buf[0..id.len], id);
         // The session thread may call back at once; its callbacks wait for this lock.
         conn.session = webrtc.Session.start(h.gpa, h.io, &h.identity, offer, h.lanIp(), .{
@@ -974,10 +1006,11 @@ pub const Host = struct {
         return null;
     }
 
-    fn signalError(h: *Host, id: []const u8, msg: []const u8) void {
+    /// `ts` — the offer's own timestamp: every reply carries it back.
+    fn signalError(h: *Host, id: []const u8, ts: i64, msg: []const u8) void {
         const s = h.signal orelse return;
-        var buf: [256]u8 = undefined;
-        const json = std.fmt.bufPrint(&buf, "{{\"t\":\"err\",\"id\":\"{s}\",\"msg\":\"{s}\"}}", .{ id, msg }) catch return;
+        var buf: [320]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"t\":\"err\",\"id\":\"{s}\",\"ts\":{d},\"msg\":\"{s}\"}}", .{ id, ts, msg }) catch return;
         s.send(json);
     }
 
@@ -986,7 +1019,7 @@ pub const Host = struct {
         const c: *RtcConn = @ptrCast(@alignCast(ctx));
         var buf: [4096]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
-        w.print("{{\"t\":\"answer\",\"id\":\"{s}\",\"sdp\":\"", .{c.id()}) catch return;
+        w.print("{{\"t\":\"answer\",\"id\":\"{s}\",\"ts\":{d},\"sdp\":\"", .{ c.id(), c.offer_ts }) catch return;
         for (sdp_text) |ch| switch (ch) {
             '\r' => w.writeAll("\\r") catch return,
             '\n' => w.writeAll("\\n") catch return,
@@ -1025,21 +1058,51 @@ pub const Host = struct {
         if (!h.opts.ui) return;
         var code_buf: [12]u8 = undefined;
         var link_buf: [160]u8 = undefined;
-        var remote_buf: [200]u8 = undefined;
         h.lock();
         const shown = h.code.display(code_buf[0..11]);
         const digits = h.code.digits;
-        const remote = h.remoteLink(remote_buf[0 .. remote_buf.len - 1]);
         h.unlock();
         code_buf[shown.len] = 0;
-        remote_buf[remote.len] = 0;
         const link = std.fmt.bufPrint(link_buf[0 .. link_buf.len - 1], "http://{s}:{d}/#{s}", .{ h.ip[0..h.ip_len], h.port, &digits }) catch return;
         link_buf[link.len] = 0;
         plat.rdc_app_set_info(code_buf[0..shown.len :0].ptr, link_buf[0..link.len :0].ptr);
-        plat.rdc_app_set_remote_link(remote_buf[0..remote.len :0].ptr);
+        h.refreshRemote();
         const p: c_int = @intFromBool(prompt);
         plat.rdc_app_set_permissions(plat.rdc_screen_access(p), plat.rdc_input_access(p));
         h.updateStatus();
+    }
+
+    /// The "from anywhere" part of the window: the link only while a broker is connected, since
+    /// before that no browser can find this computer.
+    fn refreshRemote(h: *Host) void {
+        if (!h.opts.ui) return;
+        h.remote_ui_mutex.lockUncancelable(h.io);
+        defer h.remote_ui_mutex.unlock(h.io);
+        const s = h.signal orelse return plat.rdc_app_set_remote("Connections from anywhere are off", "");
+        if (s.connected() == 0) return plat.rdc_app_set_remote("From anywhere — connecting to the public servers…", "");
+        var buf: [max_remote_link_len + 1]u8 = undefined;
+        h.lock();
+        const link = h.remoteLinkLocked(buf[0..max_remote_link_len]);
+        h.unlock();
+        buf[link.len] = 0;
+        plat.rdc_app_set_remote("From anywhere — a phone on mobile data, another network", buf[0..link.len :0].ptr);
+    }
+
+    /// Called every second: the link from anywhere appears once a broker is connected and goes
+    /// away while none is.
+    fn watchRemote(h: *Host) void {
+        const s = h.signal orelse return;
+        const up = s.connected() > 0;
+        if (up == h.remote_shown) return;
+        h.remote_shown = up;
+        if (h.opts.ui) return h.refreshRemote();
+        if (!up) return;
+        // The link holds the key: into the log only when there is no window to copy it from.
+        var buf: [max_remote_link_len]u8 = undefined;
+        h.lock();
+        const link = h.remoteLinkLocked(&buf);
+        h.unlock();
+        log("from anywhere: {s}", .{link});
     }
 
     fn updateStatus(h: *Host) void {
@@ -1104,6 +1167,7 @@ pub const Host = struct {
                 plat.rdc_app_set_permissions(plat.rdc_screen_access(0), plat.rdc_input_access(0));
             }
             if (h.signal) |s| s.keepalive();
+            h.watchRemote();
             h.updater.tick(h.viewerCount());
         }
     }
@@ -1114,8 +1178,10 @@ const RtcConn = struct {
     host: *Host,
     session: *webrtc.Session,
     viewer: ?*Viewer = null,
-    id_buf: [32]u8,
+    id_buf: [signal.max_id_len]u8,
     id_len: usize,
+    /// The offer's timestamp: the replies carry it back, and the browser checks it on its own clock.
+    offer_ts: i64,
 
     fn id(c: *const RtcConn) []const u8 {
         return c.id_buf[0..c.id_len];
@@ -1161,15 +1227,16 @@ fn onAction(ctx: ?*anyopaque, action: c_int) callconv(.c) void {
 }
 
 pub fn run(gpa: std.mem.Allocator, io: Io, opts: Options) !void {
+    if (opts.remote and opts.remote_url.len > max_remote_url_len) {
+        log("--remote-url is too long: {d} characters, at most {d}", .{ opts.remote_url.len, max_remote_url_len });
+        return error.RemoteUrlTooLong;
+    }
     const h = try Host.create(gpa, io, opts);
     try h.listen();
     if (opts.remote) h.startRemote();
     var code_buf: [11]u8 = undefined;
     log("RDC {s} ({s}): code {s}, link http://{s}:{d}/#{s}", .{ version, os_name, h.code.display(&code_buf), h.ip[0..h.ip_len], h.port, &h.code.digits });
-    var remote_buf: [200]u8 = undefined;
-    const remote = h.remoteLink(&remote_buf);
-    // The link holds the key: into the log only when there is no window to copy it from.
-    if (remote.len > 0 and !opts.ui) log("from anywhere: {s}", .{remote});
+    // The link from anywhere appears once a broker is connected (Host.watchRemote).
     const server = try std.Thread.spawn(.{}, Host.serve, .{h});
     const keeper = try std.Thread.spawn(.{}, Host.housekeeping, .{h});
     keeper.detach();

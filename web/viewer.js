@@ -182,13 +182,16 @@ function wsLink(h) {
 // The page finds the host through public MQTT brokers: both sides derive the topic and an
 // AES-GCM key from the code and the key in the link (HKDF), so a broker sees only noise.
 // Then a WebRTC data channel connects them directly (keep in sync with src/net/signal.zig
-// and src/net/webrtc.zig).
+// and src/net/webrtc.zig). Anyone can record a sealed message and send it again, so every
+// message carries a timestamp: the host refuses ours when it is more than a minute off its
+// clock, and its replies carry our offer's timestamp back, which we check on our own clock.
 
 const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
 const ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
 const NO_BROKER = 'Could not reach the public servers that find the computer — check the internet connection';
 const NO_ANSWER = 'The computer does not answer. Is RDC running there? The link changes with every new code.';
 const NO_PATH = 'Could not connect directly: the networks on both sides do not allow it (RDC has no relay). Try another network, for example Wi-Fi instead of mobile data.';
+const MAX_AGE_MS = 60000; // keep in sync with max_skew_ms in src/net/signal.zig
 
 const te = new TextEncoder();
 const td = new TextDecoder();
@@ -402,7 +405,7 @@ function rtcLink(code, key, h) {
     let offered = false;
     let sig = null;
     pc.addEventListener('icecandidate', (e) => {
-      if (offered && e.candidate && e.candidate.candidate) sig.send({ t: 'cand', id, c: e.candidate.candidate });
+      if (offered && e.candidate && e.candidate.candidate) sig.send({ t: 'cand', id, ts: Date.now(), c: e.candidate.candidate });
     });
     await pc.setLocalDescription(await pc.createOffer());
     await gathered(pc, 2000);
@@ -411,6 +414,8 @@ function rtcLink(code, key, h) {
     let answered = false;
     off = sig.on(async (m) => {
       if (m.id !== id || ended) return;
+      // The host's replies carry our offer's timestamp: an older one is a recording played back.
+      if (typeof m.ts !== 'number' || Math.abs(Date.now() - m.ts) > MAX_AGE_MS) return;
       if (m.t === 'err') return fail(m.msg || NO_ANSWER, true);
       if (m.t !== 'answer' || answered) return;
       answered = true;
@@ -420,7 +425,7 @@ function rtcLink(code, key, h) {
       timer = setTimeout(() => fail(NO_PATH, true), 15000);
     });
     offered = true; // candidates found from now on follow the offer
-    await sig.send({ t: 'offer', id, sdp: pc.localDescription.sdp });
+    await sig.send({ t: 'offer', id, ts: Date.now(), sdp: pc.localDescription.sdp });
     timer = setTimeout(() => fail(NO_ANSWER, true), 10000);
   })().catch((e) => fail(String((e && e.message) || e), true));
 

@@ -938,7 +938,7 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     linkButtons.spacing = 8;
 
     // The link from anywhere: GitHub Pages finds this computer through public brokers and connects over WebRTC.
-    self.remoteCaption = make_label(@"From anywhere — a phone on mobile data, another network", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    self.remoteCaption = make_label(@"", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
     self.remoteLabel = make_label(@"", 13, NSFontWeightRegular, NSColor.linkColor);
     self.remoteLabel.selectable = YES;
     self.remoteLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
@@ -1129,15 +1129,17 @@ void rdc_app_set_info(const char *code, const char *link) {
     });
 }
 
-void rdc_app_set_remote_link(const char *link) {
-    NSString *l = [NSString stringWithUTF8String:link];
+void rdc_app_set_remote(const char *caption, const char *link) {
+    NSString *c = [NSString stringWithUTF8String:caption] ?: @"";
+    NSString *l = [NSString stringWithUTF8String:link] ?: @"";
     dispatch_async(dispatch_get_main_queue(), ^{
         g_app.remoteLink = l;
         g_app.remoteLabel.stringValue = l;
-        BOOL off = l.length == 0;
-        g_app.remoteCaption.hidden = off;
-        g_app.remoteLabel.hidden = off;
-        g_app.remoteButtons.hidden = off;
+        g_app.remoteCaption.stringValue = c;
+        g_app.remoteCaption.hidden = c.length == 0;
+        BOOL none = l.length == 0;
+        g_app.remoteLabel.hidden = none;
+        g_app.remoteButtons.hidden = none;
     });
 }
 

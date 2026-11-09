@@ -1249,6 +1249,7 @@ static int g_dpi = 96;
 // Window state: written from any thread, shown on the window thread.
 static SRWLOCK g_ui_lock = SRWLOCK_INIT;
 static wchar_t g_ui_code[32] = L"— — —", g_ui_link[256] = L"", g_ui_remote[256] = L"", g_ui_status[512] = L"Starting…";
+static wchar_t g_ui_remote_caption[128] = L"";
 static wchar_t g_ui_version[32] = L"", g_ui_upd[512] = L"";
 static int g_ui_auto = 1, g_ui_can_install, g_ui_busy;
 
@@ -1263,11 +1264,12 @@ static void set_text(HWND w, const wchar_t *text) {
 static void refresh_ui(void) {
     HWND hwnd = g_hwnd;
     if (!hwnd) return;
-    wchar_t code[32], link[256], remote[256], status[512], ver[32], upd[512], title[64];
+    wchar_t code[32], link[256], remote[256], remote_caption[128], status[512], ver[32], upd[512], title[64];
     AcquireSRWLockShared(&g_ui_lock);
     wcscpy(code, g_ui_code);
     wcscpy(link, g_ui_link);
     wcscpy(remote, g_ui_remote);
+    wcscpy(remote_caption, g_ui_remote_caption);
     wcscpy(status, g_ui_status);
     wcscpy(ver, g_ui_version);
     wcscpy(upd, g_ui_upd);
@@ -1277,8 +1279,7 @@ static void refresh_ui(void) {
     set_text(g_link, link);
     set_text(g_remote, remote);
     int has_remote = remote[0] != 0;
-    set_text(g_lbl_remote, has_remote ? L"From anywhere — a phone on mobile data, another network"
-                                      : L"Connections from anywhere are off");
+    set_text(g_lbl_remote, remote_caption);
     ShowWindow(g_remote, has_remote ? SW_SHOW : SW_HIDE);
     ShowWindow(g_copy_remote, has_remote ? SW_SHOW : SW_HIDE);
     ShowWindow(g_open_remote, has_remote ? SW_SHOW : SW_HIDE);
@@ -1521,8 +1522,9 @@ void rdc_app_set_info(const char *code, const char *link) {
     post_refresh();
 }
 
-void rdc_app_set_remote_link(const char *link) {
+void rdc_app_set_remote(const char *caption, const char *link) {
     AcquireSRWLockExclusive(&g_ui_lock);
+    to_wide(caption, g_ui_remote_caption, 128);
     to_wide(link, g_ui_remote, 256);
     ReleaseSRWLockExclusive(&g_ui_lock);
     post_refresh();

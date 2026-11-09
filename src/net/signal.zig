@@ -6,6 +6,8 @@
 //! with the topic as associated data, so a broker sees only a random topic and noise.
 //! The host keeps plain MQTT 3.1.1 connections (TCP 1883) to every broker in `brokers`;
 //! the browser reaches the same brokers over WebSocket (`web/viewer.js`).
+//! Anyone can record sealed messages on a public broker and send them again, so every
+//! message carries a timestamp and the host remembers recent offers (`Guard`).
 const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
@@ -28,6 +30,7 @@ pub const max_message = 32 * 1024;
 const keepalive_s = 60;
 const ping_every_us: u64 = 25_000_000;
 const dead_after_us: u64 = 80_000_000;
+const connack_timeout_us: u64 = 15_000_000;
 
 pub const Keys = struct {
     topic_buf: [4 + 32]u8,
@@ -71,20 +74,102 @@ pub fn open(out: []u8, k: *const Keys, msg: []const u8) ?[]u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Replays. A recorded message stays sealed, but sent again it would act again: an old offer
+// would start another session. Every message carries its sender's clock (ms since 1970, like
+// Date.now()); the host refuses messages too far from its own clock, remembers the offers it
+// has seen and starts only a few sessions at a time.
+
+/// A message whose timestamp is further than this from our clock is refused.
+pub const max_skew_ms: i64 = 60_000;
+/// Offer ids are 1–32 letters and digits.
+pub const max_id_len = 32;
+pub const max_new_sessions = 4;
+pub const new_session_window_us: u64 = 10_000_000;
+
+/// How far the sender's clock is behind ours, in ms (negative — ahead).
+pub fn skewMs(ts_ms: i64, now_ms: i64) i64 {
+    return now_ms -| ts_ms;
+}
+
+pub fn fresh(skew_ms: i64) bool {
+    return skew_ms >= -max_skew_ms and skew_ms <= max_skew_ms;
+}
+
+/// The offers seen lately and when the last sessions started.
+pub const Guard = struct {
+    ids: [256][max_id_len]u8 = undefined,
+    id_count: usize = 0,
+    id_next: usize = 0,
+    starts: [max_new_sessions]u64 = undefined,
+    start_count: usize = 0,
+    start_next: usize = 0,
+
+    pub fn seen(g: *const Guard, id: []const u8) bool {
+        for (g.ids[0..g.id_count]) |*known| {
+            if (std.mem.eql(u8, std.mem.sliceTo(known, 0), id)) return true;
+        }
+        return false;
+    }
+
+    /// false — seen before; otherwise remembered from now on, in place of the oldest.
+    pub fn remember(g: *Guard, id: []const u8) bool {
+        std.debug.assert(id.len > 0 and id.len <= max_id_len);
+        if (g.seen(id)) return false;
+        g.ids[g.id_next] = @splat(0);
+        @memcpy(g.ids[g.id_next][0..id.len], id);
+        g.id_next = (g.id_next + 1) % g.ids.len;
+        g.id_count = @min(g.id_count + 1, g.ids.len);
+        return true;
+    }
+
+    /// Whether a session may start now; if so, it is counted.
+    pub fn allowStart(g: *Guard, now_us: u64) bool {
+        if (g.start_count == max_new_sessions and now_us -| g.starts[g.start_next] < new_session_window_us) return false;
+        g.starts[g.start_next] = now_us;
+        g.start_next = (g.start_next + 1) % max_new_sessions;
+        g.start_count = @min(g.start_count + 1, max_new_sessions);
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Broker connections.
 
 pub const Handler = *const fn (ctx: *anyopaque, plaintext: []const u8) void;
 pub const LogFn = *const fn (msg: []const u8) void;
 
+/// One broker. `Signal.mutex` guards what keepalive and `connected` look at, `write_mutex`
+/// guards writing. Whoever holds `Signal.mutex` never waits for a `write_mutex`, and neither do
+/// `setKeys` and `keepalive`: a broker that stops reading holds up only `send`.
 const Conn = struct {
-    stream: ?net.Stream = null,
-    write_mutex: Io.Mutex = .init,
-    topic: [36]u8 = undefined,
+    /// From connect until the socket closes: keepalive shuts the socket down through this.
+    sock: ?net.Stream = null,
+    connected_at_us: u64 = 0,
+    connacked: bool = false,
+    /// A SUBSCRIBE went out on this connection.
     subscribed: bool = false,
-    packet_id: u16 = 1,
-    last_rx_us: std.atomic.Value(u64) = .init(0),
     last_ping_us: u64 = 0,
+    last_rx_us: std.atomic.Value(u64) = .init(0),
+
+    write_mutex: Io.Mutex = .init,
+    /// Where writers write, under `write_mutex`: from CONNACK until just before the socket closes.
+    stream: ?net.Stream = null,
+    /// The topic subscribed on this connection, under `write_mutex`.
+    topic: [36]u8 = undefined,
+    packet_id: u16 = 1,
+    /// The keys changed while a writer held the connection: keepalive moves the subscription.
+    resubscribe_due: std.atomic.Value(bool) = .init(false),
 };
+
+const Verdict = enum { wait, ping, close };
+
+/// What keepalive does with a connection at time `t`: closes one that got no CONNACK in time
+/// or went quiet, pings one that has been idle for a while.
+fn verdict(c: *const Conn, t: u64) Verdict {
+    if (!c.connacked) return if (t -| c.connected_at_us > connack_timeout_us) .close else .wait;
+    if (t -| c.last_rx_us.load(.monotonic) > dead_after_us) return .close;
+    return if (t -| c.last_ping_us >= ping_every_us) .ping else .wait;
+}
 
 pub const Signal = struct {
     gpa: std.mem.Allocator,
@@ -121,7 +206,7 @@ pub const Signal = struct {
         defer s.mutex.unlock(s.io);
         var n: usize = 0;
         for (&s.conns) |*c| {
-            if (c.stream != null and c.subscribed) n += 1;
+            if (c.sock != null and c.subscribed) n += 1;
         }
         return n;
     }
@@ -129,25 +214,50 @@ pub const Signal = struct {
     /// A new code: leave the old topic and listen on the new one.
     pub fn setKeys(s: *Signal, keys: Keys) void {
         s.mutex.lockUncancelable(s.io);
-        defer s.mutex.unlock(s.io);
         s.keys = keys;
-        for (&s.conns) |*c| {
-            const stream = c.stream orelse continue;
-            var buf: [64]u8 = undefined;
-            c.write_mutex.lockUncancelable(s.io);
-            defer c.write_mutex.unlock(s.io);
-            if (c.subscribed) {
-                c.packet_id +%= 1;
-                writeAll(s.io, stream, mqtt.unsubscribe(&buf, c.packet_id, &c.topic));
-            }
-            c.packet_id +%= 1;
-            @memcpy(&c.topic, keys.topic());
-            writeAll(s.io, stream, mqtt.subscribe(&buf, c.packet_id, &c.topic));
-            c.subscribed = true;
-        }
+        s.mutex.unlock(s.io);
+        for (&s.conns) |*c| s.resubscribe(c);
     }
 
-    /// Seals a message and publishes it on every connected broker.
+    /// Moves the subscription of `c` to the current topic: now if no writer holds the connection,
+    /// otherwise on the next keepalive.
+    fn resubscribe(s: *Signal, c: *Conn) void {
+        if (!c.write_mutex.tryLock()) return c.resubscribe_due.store(true, .release);
+        defer c.write_mutex.unlock(s.io);
+        // Cleared before the keys are read: a change after this sets it again.
+        c.resubscribe_due.store(false, .release);
+        const stream = c.stream orelse return; // not connected yet: it subscribes to the new topic on CONNACK
+        s.mutex.lockUncancelable(s.io);
+        const topic = s.keys.topic_buf;
+        s.mutex.unlock(s.io);
+        if (std.mem.eql(u8, &c.topic, &topic)) return;
+        var buf: [64]u8 = undefined;
+        c.packet_id +%= 1;
+        writeAll(s.io, stream, mqtt.unsubscribe(&buf, c.packet_id, &c.topic));
+        c.topic = topic;
+        c.packet_id +%= 1;
+        writeAll(s.io, stream, mqtt.subscribe(&buf, c.packet_id, &c.topic));
+    }
+
+    /// After CONNACK: writers may use the stream, and it listens on the current topic.
+    fn subscribe(s: *Signal, c: *Conn, stream: net.Stream) void {
+        c.write_mutex.lockUncancelable(s.io);
+        defer c.write_mutex.unlock(s.io);
+        c.resubscribe_due.store(false, .release);
+        s.mutex.lockUncancelable(s.io);
+        c.connacked = true;
+        c.subscribed = true;
+        c.last_ping_us = s.now();
+        c.topic = s.keys.topic_buf;
+        s.mutex.unlock(s.io);
+        c.stream = stream;
+        var buf: [64]u8 = undefined;
+        c.packet_id +%= 1;
+        writeAll(s.io, stream, mqtt.subscribe(&buf, c.packet_id, &c.topic));
+    }
+
+    /// Seals a message and publishes it on every connected broker. While writing, only that
+    /// connection's own lock is held.
     pub fn send(s: *Signal, plaintext: []const u8) void {
         if (plaintext.len > max_message) return;
         var nonce: [12]u8 = undefined;
@@ -161,33 +271,38 @@ pub const Signal = struct {
         const packet = s.gpa.alloc(u8, mqtt.publishSize(keys.topic(), sealed.len)) catch return;
         defer s.gpa.free(packet);
         const p = mqtt.publish(packet, keys.topic(), sealed);
-        s.mutex.lockUncancelable(s.io);
-        defer s.mutex.unlock(s.io);
         for (&s.conns) |*c| {
-            const stream = c.stream orelse continue;
-            if (!c.subscribed) continue;
             c.write_mutex.lockUncancelable(s.io);
             defer c.write_mutex.unlock(s.io);
-            writeAll(s.io, stream, p);
+            if (c.stream) |stream| writeAll(s.io, stream, p);
         }
     }
 
-    /// Called about once a second: pings the brokers and drops connections that went quiet.
+    /// Called about once a second: pings the brokers and drops connections that got no CONNACK
+    /// in time or went quiet. Never waits for a writer.
     pub fn keepalive(s: *Signal) void {
         const t = s.now();
+        var ping: [brokers.len]bool = @splat(false);
         s.mutex.lockUncancelable(s.io);
-        defer s.mutex.unlock(s.io);
-        for (&s.conns) |*c| {
-            const stream = c.stream orelse continue;
-            if (t -| c.last_rx_us.load(.monotonic) > dead_after_us) {
-                stream.shutdown(s.io, .both) catch {}; // wakes the reader thread, which reconnects
-                continue;
+        for (&s.conns, &ping) |*c, *due| {
+            const sock = c.sock orelse continue;
+            switch (verdict(c, t)) {
+                .wait => {},
+                .close => sock.shutdown(s.io, .both) catch {}, // wakes the reader thread, which reconnects
+                .ping => {
+                    c.last_ping_us = t;
+                    due.* = true;
+                },
             }
-            if (t -| c.last_ping_us < ping_every_us) continue;
-            c.last_ping_us = t;
-            c.write_mutex.lockUncancelable(s.io);
+        }
+        s.mutex.unlock(s.io);
+        // Only while no writer holds the connection: a writer stuck on a broker that stopped
+        // reading keeps its lock, and the quiet timer above deals with that broker.
+        for (&s.conns, ping) |*c, due| {
+            if (c.resubscribe_due.load(.acquire)) s.resubscribe(c);
+            if (!due or !c.write_mutex.tryLock()) continue;
             defer c.write_mutex.unlock(s.io);
-            writeAll(s.io, stream, &mqtt.pingreq);
+            if (c.stream) |stream| writeAll(s.io, stream, &mqtt.pingreq);
         }
     }
 
@@ -208,8 +323,24 @@ pub const Signal = struct {
         const host_name = try net.HostName.init(b.host);
         // No connect timeout: Io.Threaded in Zig 0.17.1 panics on one ("TODO implement netConnectIpPosix with timeout").
         const stream = try host_name.connect(io, b.port, .{ .mode = .stream });
-        defer stream.close(io);
         const c = &s.conns[i];
+        // From here keepalive can shut the socket down: a broker that never answers is dropped.
+        s.mutex.lockUncancelable(io);
+        c.sock = stream;
+        c.connected_at_us = s.now();
+        s.mutex.unlock(io);
+        defer {
+            s.mutex.lockUncancelable(io);
+            c.sock = null;
+            c.connacked = false;
+            c.subscribed = false;
+            s.mutex.unlock(io);
+            stream.shutdown(io, .both) catch {}; // a writer stuck on this socket gives up
+            c.write_mutex.lockUncancelable(io);
+            c.stream = null;
+            c.write_mutex.unlock(io);
+            stream.close(io);
+        }
 
         var id_bytes: [6]u8 = undefined;
         io.random(&id_bytes);
@@ -225,12 +356,6 @@ pub const Signal = struct {
         const plain = try s.gpa.alloc(u8, max_message);
         defer s.gpa.free(plain);
 
-        defer {
-            s.mutex.lockUncancelable(io);
-            c.stream = null;
-            c.subscribed = false;
-            s.mutex.unlock(io);
-        }
         var connacked = false;
         while (true) {
             const p = (mqtt.parse(r.buffered(), max_message + 512) catch {
@@ -246,19 +371,10 @@ pub const Signal = struct {
             };
             c.last_rx_us.store(s.now(), .monotonic);
             switch (p.kind) {
-                mqtt.connack_type => {
+                mqtt.connack_type => if (!connacked) {
                     if (p.body.len < 2 or p.body[1] != 0) return error.Refused;
                     connacked = true;
-                    s.mutex.lockUncancelable(io);
-                    c.stream = stream;
-                    c.last_ping_us = s.now();
-                    @memcpy(&c.topic, s.keys.topic());
-                    c.write_mutex.lockUncancelable(io);
-                    c.packet_id +%= 1;
-                    writeAll(io, stream, mqtt.subscribe(&out, c.packet_id, &c.topic));
-                    c.subscribed = true;
-                    c.write_mutex.unlock(io);
-                    s.mutex.unlock(io);
+                    s.subscribe(c, stream);
                     s.log("signaling: listening on {s}", .{b.host});
                 },
                 mqtt.publish_type => if (mqtt.parsePublish(p)) |msg| {
@@ -310,4 +426,50 @@ test "signal: key derivation and sealing match WebCrypto" {
 
     var text: [salt_text_len]u8 = undefined;
     try std.testing.expectEqualStrings("AAECAwQFBgcICQoLDA0ODw", std.base64.url_safe_no_pad.Encoder.encode(&text, &salt));
+}
+
+test "signal: stale messages, repeated offers and bursts of sessions are refused" {
+    const now: i64 = 1_762_700_000_000;
+    try std.testing.expect(fresh(skewMs(now - 60_000, now)));
+    try std.testing.expect(!fresh(skewMs(now - 60_001, now)));
+    try std.testing.expect(fresh(skewMs(now + 60_000, now))); // a clock a minute ahead
+    try std.testing.expect(!fresh(skewMs(now + 60_001, now)));
+    try std.testing.expect(!fresh(skewMs(0, now))); // no timestamp at all
+    try std.testing.expect(!fresh(skewMs(std.math.minInt(i64), now)));
+    try std.testing.expect(!fresh(skewMs(std.math.maxInt(i64), -now)));
+
+    var g: Guard = .{};
+    try std.testing.expect(g.remember("a1"));
+    try std.testing.expect(!g.remember("a1")); // the same offer through the other broker, or replayed
+    try std.testing.expect(g.seen("a1"));
+    try std.testing.expect(!g.seen("a")); // a prefix is another id
+    const longest = "0123456789abcdef0123456789abcdef";
+    try std.testing.expect(g.remember(longest));
+    try std.testing.expect(!g.remember(longest));
+    // 256 newer offers push the oldest out.
+    var buf: [8]u8 = undefined;
+    for (0..255) |i| try std.testing.expect(g.remember(try std.fmt.bufPrint(&buf, "b{d}", .{i})));
+    try std.testing.expect(!g.seen("a1"));
+    try std.testing.expect(g.seen(longest));
+    try std.testing.expect(g.seen("b0"));
+
+    // At most four sessions in any ten seconds.
+    for (1..5) |i| try std.testing.expect(g.allowStart(i * 1_000_000));
+    try std.testing.expect(!g.allowStart(5_000_000));
+    try std.testing.expect(!g.allowStart(10_999_999));
+    try std.testing.expect(g.allowStart(11_000_000)); // ten seconds after the first
+    try std.testing.expect(!g.allowStart(11_500_000)); // the second was 9.5 seconds ago
+    try std.testing.expect(g.allowStart(12_000_000));
+}
+
+test "signal: keepalive drops a broker that sends no CONNACK or goes quiet" {
+    var c: Conn = .{ .connected_at_us = 1_000_000 };
+    try std.testing.expectEqual(Verdict.wait, verdict(&c, 1_000_000 + connack_timeout_us));
+    try std.testing.expectEqual(Verdict.close, verdict(&c, 1_000_001 + connack_timeout_us));
+    c.connacked = true;
+    c.last_rx_us.store(2_000_000, .monotonic);
+    c.last_ping_us = 2_000_000;
+    try std.testing.expectEqual(Verdict.wait, verdict(&c, 2_000_000 + ping_every_us - 1));
+    try std.testing.expectEqual(Verdict.ping, verdict(&c, 2_000_000 + ping_every_us));
+    try std.testing.expectEqual(Verdict.close, verdict(&c, 2_000_001 + dead_after_us));
 }

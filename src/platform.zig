@@ -55,7 +55,7 @@ pub extern fn rdc_settings_update(version: [*:0]const u8, auto_update: c_int, st
 
 pub extern fn rdc_app_run(on_ready: ?CtxCallback, on_action: ?ActionCallback, ctx: ?*anyopaque) void;
 pub extern fn rdc_app_set_info(code: [*:0]const u8, link: [*:0]const u8) void;
-pub extern fn rdc_app_set_remote_link(link: [*:0]const u8) void;
+pub extern fn rdc_app_set_remote(caption: [*:0]const u8, link: [*:0]const u8) void;
 pub extern fn rdc_app_set_status(text: [*:0]const u8) void;
 pub extern fn rdc_app_set_permissions(screen_ok: c_int, input_ok: c_int) void;
 pub extern fn rdc_app_set_ai(active: c_int) void;

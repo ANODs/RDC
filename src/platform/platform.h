@@ -83,8 +83,9 @@ void rdc_settings_update(const char *version, int auto_update, const char *statu
 // App window. rdc_app_run blocks the main thread until exit.
 void rdc_app_run(rdc_ctx_cb on_ready, rdc_action_cb on_action, void *ctx);
 void rdc_app_set_info(const char *code, const char *link);
-// The link that works from any network (GitHub Pages + WebRTC); "" — connections from anywhere are off.
-void rdc_app_set_remote_link(const char *link);
+// The link that works from any network (GitHub Pages + WebRTC) and the caption above it;
+// link "" — no link to show (connections from anywhere are off, or no broker is connected yet).
+void rdc_app_set_remote(const char *caption, const char *link);
 void rdc_app_set_status(const char *text);
 void rdc_app_set_permissions(int screen_ok, int input_ok);
 // An AI agent is connected: the window shows a Stop button that sends RDC_ACTION_STOP_AI.

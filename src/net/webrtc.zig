@@ -76,8 +76,10 @@ pub const Session = struct {
     valid: [8]net.IpAddress = undefined,
     valid_count: usize = 0,
     selected: ?net.IpAddress = null,
+    /// The last checks sent, so their answers can be recognized; the first `check_count` are filled.
     checks: [32]Check = undefined,
     check_next: usize = 0,
+    check_count: usize = 0,
     next_check_us: u64 = 0,
     stun_pending: [8]Check = undefined,
     stun_pending_count: usize = 0,
@@ -143,7 +145,7 @@ pub const Session = struct {
         s.remote_ufrag_len = offer.ufrag.len;
         @memcpy(s.remote_pwd_buf[0..offer.pwd.len], offer.pwd);
         s.remote_pwd_len = offer.pwd.len;
-        for (offer.candidates[0..offer.candidate_count]) |c| s.addRemoteLocked(c);
+        for (offer.candidates[0..offer.candidate_count]) |c| _ = s.addRemoteLocked(c);
         s.started_us = s.now();
         s.last_rx_us = s.started_us;
 
@@ -236,23 +238,25 @@ pub const Session = struct {
         if (cur == 0 or at < cur) s.close_at_us.store(at, .monotonic);
     }
 
-    /// A candidate the browser found after its offer (trickle ICE).
+    /// A candidate the browser found after its offer (trickle ICE). Only a new address is checked
+    /// right away: a candidate that comes again (through the other broker, or replayed) changes nothing.
     pub fn addCandidate(s: *Session, line: []const u8) void {
         const addr = sdp.parseCandidate(line) orelse return;
         s.mutex.lockUncancelable(s.io);
         defer s.mutex.unlock(s.io);
-        s.addRemoteLocked(addr);
-        s.next_check_us = 0; // check it right away
+        if (s.addRemoteLocked(addr)) s.next_check_us = 0;
     }
 
-    fn addRemoteLocked(s: *Session, addr_in: net.IpAddress) void {
+    /// false — not usable, already known, or no room.
+    fn addRemoteLocked(s: *Session, addr_in: net.IpAddress) bool {
         const addr = normalize(addr_in);
-        if (addr == .ip6 and !s.dual) return;
-        if (!routable(addr)) return;
-        for (s.remote[0..s.remote_count]) |*c| if (c.eql(&addr)) return;
-        if (s.remote_count == s.remote.len) return;
+        if (addr == .ip6 and !s.dual) return false;
+        if (!routable(addr)) return false;
+        for (s.remote[0..s.remote_count]) |*c| if (c.eql(&addr)) return false;
+        if (s.remote_count == s.remote.len) return false;
         s.remote[s.remote_count] = addr;
         s.remote_count += 1;
+        return true;
     }
 
     // ------------------------------------------------------------------ the session thread
@@ -436,6 +440,7 @@ pub const Session = struct {
         m.addFingerprint();
         s.checks[s.check_next] = .{ .tid = tid, .to = to };
         s.check_next = (s.check_next + 1) % s.checks.len;
+        s.check_count = @min(s.check_count + 1, s.checks.len);
         s.sendTo(to, m.bytes());
     }
 
@@ -489,13 +494,13 @@ pub const Session = struct {
                 s.markValid(from);
                 if (!known) {
                     // A new path (peer-reflexive): check it back right away.
-                    s.addRemoteLocked(from);
+                    _ = s.addRemoteLocked(from);
                     if (!s.tls.established()) s.sendCheck(from);
                 }
                 if (m.use_candidate or s.selected == null) s.select(from);
             },
             stun.binding_success => {
-                for (s.checks) |c| {
+                for (s.checks[0..s.check_count]) |c| {
                     if (!std.mem.eql(u8, &c.tid, &m.tid)) continue;
                     if (!m.checkIntegrity(s.remotePwd())) return;
                     s.markValid(c.to);
@@ -650,4 +655,73 @@ test "webrtc: address normalization" {
     try std.testing.expect(!routable(try net.IpAddress.parse("::", 9)));
     try std.testing.expect(!routable(try net.IpAddress.parse("239.1.2.3", 9)));
     try std.testing.expect(!routable(try net.IpAddress.parse("0.0.0.0", 9)));
+}
+
+/// A session without a socket or a thread: enough for the ICE bookkeeping.
+fn testSession(io: Io) !*Session {
+    const s = try std.testing.allocator.create(Session);
+    s.* = .{
+        .gpa = std.testing.allocator,
+        .io = io,
+        .cb = undefined,
+        .sock = undefined,
+        .dual = true,
+        .lan_ip = null,
+        .local_ufrag = @splat('u'),
+        .local_pwd = @splat('p'),
+        .max_message = 64 * 1024,
+        .tie_breaker = 1,
+        .tls = undefined,
+        .assoc = undefined,
+    };
+    const pwd = "the-browsers-ice-password";
+    @memcpy(s.remote_pwd_buf[0..pwd.len], pwd);
+    s.remote_pwd_len = pwd.len;
+    return s;
+}
+
+test "webrtc: a STUN answer counts only for a check that was sent" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const s = try testSession(threaded.io());
+    defer std.testing.allocator.destroy(s);
+    const browser = try net.IpAddress.parse("203.0.113.5", 5000);
+    const Answer = struct {
+        fn send(sess: *Session, from: net.IpAddress, tid: [12]u8) void {
+            var b: [256]u8 = undefined;
+            var m = stun.Builder.init(&b, stun.binding_success, tid);
+            m.addXorAddress(from);
+            m.addIntegrity(sess.remotePwd());
+            m.addFingerprint();
+            sess.onStun(from, m.bytes());
+        }
+    };
+    // No check sent yet: an answer with the bytes an unfilled slot holds in safe builds matches nothing.
+    Answer.send(s, browser, @splat(0xaa));
+    Answer.send(s, browser, @splat(0));
+    try std.testing.expectEqual(@as(usize, 0), s.valid_count);
+    try std.testing.expectEqual(@as(?net.IpAddress, null), s.selected);
+    // The answer to a check that went out makes its address valid and selected.
+    s.checks[0] = .{ .tid = @splat(7), .to = browser };
+    s.check_count = 1;
+    Answer.send(s, browser, @splat(7));
+    try std.testing.expectEqual(@as(usize, 1), s.valid_count);
+    try std.testing.expect(s.selected.?.eql(&browser));
+}
+
+test "webrtc: a candidate that comes again does not start another round of checks" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const s = try testSession(threaded.io());
+    defer std.testing.allocator.destroy(s);
+    const line = "candidate:1 1 udp 2122260223 203.0.113.5 5000 typ host";
+    s.next_check_us = 123;
+    s.addCandidate(line);
+    try std.testing.expectEqual(@as(usize, 1), s.remote_count);
+    try std.testing.expectEqual(@as(u64, 0), s.next_check_us); // a new address: checked at once
+    s.next_check_us = 123;
+    s.addCandidate(line);
+    s.addCandidate("a=candidate:9 1 UDP 1 203.0.113.5 5000 typ srflx raddr 0.0.0.0 rport 0");
+    try std.testing.expectEqual(@as(usize, 1), s.remote_count);
+    try std.testing.expectEqual(@as(u64, 123), s.next_check_us);
 }
