@@ -1,4 +1,4 @@
-// Платформенный слой macOS для RDC. Компилируется Zig'ом с -fobjc-arc.
+// macOS platform layer for RDC. Compiled by Zig with -fobjc-arc.
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
@@ -6,6 +6,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <ImageIO/ImageIO.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -15,15 +16,16 @@
 #include <stdatomic.h>
 #include <stdarg.h>
 #include <time.h>
-#include "shim.h"
+#include <unistd.h>
+#include "platform.h"
 
 // ---------------------------------------------------------------------------
-// Лог
+// Log
 
 static FILE *g_log_file;
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void rdc_mac_init(void) {
+void rdc_init(void) {
     signal(SIGPIPE, SIG_IGN);
     @autoreleasepool {
         NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/RDC"];
@@ -32,7 +34,7 @@ void rdc_mac_init(void) {
     }
 }
 
-void rdc_mac_log(const char *msg) {
+void rdc_log(const char *msg) {
     time_t t = time(NULL);
     struct tm tm;
     localtime_r(&t, &tm);
@@ -53,28 +55,28 @@ static void rlog(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
-    rdc_mac_log(buf);
+    rdc_log(buf);
 }
 
 static uint64_t now_us(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000; }
 
-uint64_t rdc_mac_now_us(void) { return now_us(); }
+uint64_t rdc_now_us(void) { return now_us(); }
 
 // ---------------------------------------------------------------------------
-// Разрешения
+// Permissions
 
-int rdc_mac_screen_access(int prompt) {
+int rdc_screen_access(int prompt) {
     if (CGPreflightScreenCaptureAccess()) return 1;
     if (prompt) return CGRequestScreenCaptureAccess() ? 1 : 0;
     return 0;
 }
 
-int rdc_mac_input_access(int prompt) {
+int rdc_input_access(int prompt) {
     NSDictionary *opts = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt : prompt ? @YES : @NO};
     return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts) ? 1 : 0;
 }
 
-void rdc_mac_open_privacy(int which) {
+void rdc_open_privacy(int which) {
     NSString *url = which == 0
         ? @"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
         : @"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
@@ -84,7 +86,7 @@ void rdc_mac_open_privacy(int which) {
 }
 
 // ---------------------------------------------------------------------------
-// Захват и кодирование. Всё состояние ниже меняется только на g_queue.
+// Capture and encoding. All state below is changed only on g_queue.
 
 @interface RDCStreamOutput : NSObject <SCStreamOutput, SCStreamDelegate>
 @end
@@ -99,17 +101,17 @@ static int g_w, g_h, g_fps = 60;
 static int g_bitrate = 10000000;
 static rdc_frame_cb g_cb;
 static void *g_cb_ctx;
-static CVPixelBufferRef g_last;      // последний полный кадр — для новых зрителей
+static CVPixelBufferRef g_last;      // last complete frame — for new viewers
 static atomic_int g_force_key;
 static uint64_t g_last_jpeg_us;
 static int g_jpeg_pending;
-static const uint64_t kJpegIntervalUs = 40000;  // JPEG не чаще 25 кадров/с
+static const uint64_t kJpegIntervalUs = 40000;  // JPEG at most 25 fps
 
 static void vt_output(void *refcon, void *frame_refcon, OSStatus status, VTEncodeInfoFlags flags,
                       CMSampleBufferRef sb) {
     @autoreleasepool {
         if (status != noErr) {
-            rlog("кодирование: ошибка %d", (int)status);
+            rlog("encoding: error %d", (int)status);
             return;
         }
         if (!sb || (flags & kVTEncodeInfo_FrameDropped)) return;
@@ -140,7 +142,7 @@ static void vt_output(void *refcon, void *frame_refcon, OSStatus status, VTEncod
                 key = 0;
         }
 
-        // AVCC (длина NAL в 4 байтах) → Annex B (00 00 00 01). На ключевых кадрах — SPS и PPS впереди.
+        // AVCC (4-byte NAL length) → Annex B (00 00 00 01). Keyframes get SPS and PPS up front.
         static const uint8_t start_code[4] = {0, 0, 0, 1};
         NSMutableData *out = [NSMutableData dataWithCapacity:total + 256];
         int nal_len_size = 4;
@@ -175,7 +177,7 @@ static void vt_output(void *refcon, void *frame_refcon, OSStatus status, VTEncod
 
 static void set_prop(VTCompressionSessionRef s, CFStringRef key, CFTypeRef value, const char *name) {
     OSStatus st = VTSessionSetProperty(s, key, value);
-    if (st != noErr) rlog("VideoToolbox: свойство %s не принято (%d)", name, (int)st);
+    if (st != noErr) rlog("VideoToolbox: property %s rejected (%d)", name, (int)st);
 }
 
 static VTCompressionSessionRef make_session(int codec) {
@@ -187,11 +189,11 @@ static VTCompressionSessionRef make_session(int codec) {
     OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, g_w, g_h, type, (__bridge CFDictionaryRef)spec,
                                              NULL, NULL, vt_output, NULL, &s);
     if (st != noErr && spec) {
-        rlog("VideoToolbox: режим низкой задержки недоступен (%d), обычный", (int)st);
+        rlog("VideoToolbox: low-latency mode unavailable (%d), using normal", (int)st);
         st = VTCompressionSessionCreate(kCFAllocatorDefault, g_w, g_h, type, NULL, NULL, NULL, vt_output, NULL, &s);
     }
     if (st != noErr || !s) {
-        rlog("VideoToolbox: не создать кодировщик %d (%d)", codec, (int)st);
+        rlog("VideoToolbox: cannot create encoder %d (%d)", codec, (int)st);
         return NULL;
     }
     set_prop(s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, "RealTime");
@@ -216,7 +218,7 @@ static void destroy_session(VTCompressionSessionRef *s) {
     *s = NULL;
 }
 
-// На g_queue.
+// On g_queue.
 static void sync_sessions(void) {
     if (g_w <= 0) return;
     if (g_want_h264 && !g_h264) g_h264 = make_session(RDC_CODEC_H264);
@@ -227,7 +229,7 @@ static void sync_sessions(void) {
 
 static void encode_jpeg(CVPixelBufferRef pb, uint64_t now);
 
-// На g_queue.
+// On g_queue.
 static void encode_frame(CVPixelBufferRef pb, int force) {
     uint64_t now = now_us();
     CMTime pts = CMTimeMake((int64_t)now, 1000000);
@@ -236,13 +238,13 @@ static void encode_frame(CVPixelBufferRef pb, int force) {
         NSDictionary *props = key ? @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame : @YES} : nil;
         OSStatus st = VTCompressionSessionEncodeFrame(g_h264, pb, pts, kCMTimeInvalid, (__bridge CFDictionaryRef)props,
                                                       (void *)(uintptr_t)RDC_CODEC_H264, NULL);
-        if (st != noErr) rlog("H.264: кадр не принят (%d)", (int)st);
+        if (st != noErr) rlog("H.264: frame rejected (%d)", (int)st);
     }
     if (g_jpeg) {
         if (key || now - g_last_jpeg_us >= kJpegIntervalUs) {
             encode_jpeg(pb, now);
         } else if (!g_jpeg_pending) {
-            // Последний кадр серии всё равно должен уйти: дошлём его, когда истечёт интервал.
+            // The last frame of a burst must still go out: send it once the interval expires.
             g_jpeg_pending = 1;
             uint64_t wait = kJpegIntervalUs - (now - g_last_jpeg_us);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)wait * 1000), g_queue, ^{
@@ -257,7 +259,7 @@ static void encode_jpeg(CVPixelBufferRef pb, uint64_t now) {
     g_last_jpeg_us = now;
     OSStatus st = VTCompressionSessionEncodeFrame(g_jpeg, pb, CMTimeMake((int64_t)now, 1000000), kCMTimeInvalid, NULL,
                                                   (void *)(uintptr_t)RDC_CODEC_JPEG, NULL);
-    if (st != noErr) rlog("JPEG: кадр не принят (%d)", (int)st);
+    if (st != noErr) rlog("JPEG: frame rejected (%d)", (int)st);
 }
 
 @implementation RDCStreamOutput
@@ -267,7 +269,7 @@ static void encode_jpeg(CVPixelBufferRef pb, uint64_t now) {
     if (!atts || CFArrayGetCount(atts) == 0) return;
     NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(atts, 0);
     NSNumber *status = info[SCStreamFrameInfoStatus];
-    if (!status || status.integerValue != SCFrameStatusComplete) return;  // экран не менялся
+    if (!status || status.integerValue != SCFrameStatusComplete) return;  // screen unchanged
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
     if (!pb) return;
     if (g_last) CVPixelBufferRelease(g_last);
@@ -276,11 +278,11 @@ static void encode_jpeg(CVPixelBufferRef pb, uint64_t now) {
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
-    rlog("захват остановлен: %s", error.localizedDescription.UTF8String);
+    rlog("capture stopped: %s", error.localizedDescription.UTF8String);
 }
 @end
 
-int rdc_mac_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx) {
+int rdc_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx) {
     if (!g_queue) g_queue = dispatch_queue_create("rdc.capture", DISPATCH_QUEUE_SERIAL);
     if (g_stream) return 0;
     g_cb = cb;
@@ -291,7 +293,7 @@ int rdc_mac_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx) {
 
     [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *error) {
         if (error || content.displays.count == 0) {
-            rlog("нет доступа к экрану: %s", error ? error.localizedDescription.UTF8String : "дисплеев нет");
+            rlog("no screen access: %s", error ? error.localizedDescription.UTF8String : "no displays");
             result = -1;
             dispatch_semaphore_signal(done);
             return;
@@ -330,7 +332,7 @@ int rdc_mac_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx) {
         g_stream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:g_output];
         NSError *add_error = nil;
         if (![g_stream addStreamOutput:g_output type:SCStreamOutputTypeScreen sampleHandlerQueue:g_queue error:&add_error]) {
-            rlog("захват: %s", add_error.localizedDescription.UTF8String);
+            rlog("capture: %s", add_error.localizedDescription.UTF8String);
             g_stream = nil;
             result = -2;
             dispatch_semaphore_signal(done);
@@ -338,11 +340,11 @@ int rdc_mac_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx) {
         }
         [g_stream startCaptureWithCompletionHandler:^(NSError *start_error) {
             if (start_error) {
-                rlog("захват не запустился: %s", start_error.localizedDescription.UTF8String);
+                rlog("capture failed to start: %s", start_error.localizedDescription.UTF8String);
                 g_stream = nil;
                 result = -3;
             } else {
-                rlog("захват: %dx%d, до %d кадров/с", w, h, g_fps);
+                rlog("capture: %dx%d, up to %d fps", w, h, g_fps);
                 result = 0;
             }
             dispatch_semaphore_signal(done);
@@ -353,7 +355,7 @@ int rdc_mac_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx) {
     return result;
 }
 
-void rdc_mac_capture_stop(void) {
+void rdc_capture_stop(void) {
     SCStream *s = g_stream;
     g_stream = nil;
     if (s) {
@@ -370,10 +372,10 @@ void rdc_mac_capture_stop(void) {
         g_w = g_h = 0;
     });
     g_output = nil;
-    rlog("захват остановлен");
+    rlog("capture stopped");
 }
 
-void rdc_mac_set_codecs(int h264, int jpeg) {
+void rdc_set_codecs(int h264, int jpeg) {
     if (!g_queue) g_queue = dispatch_queue_create("rdc.capture", DISPATCH_QUEUE_SERIAL);
     dispatch_async(g_queue, ^{
         g_want_h264 = h264 != 0;
@@ -382,7 +384,7 @@ void rdc_mac_set_codecs(int h264, int jpeg) {
     });
 }
 
-void rdc_mac_request_keyframe(void) {
+void rdc_request_keyframe(void) {
     if (!g_queue) return;
     dispatch_async(g_queue, ^{
         if (g_last)
@@ -392,7 +394,7 @@ void rdc_mac_request_keyframe(void) {
     });
 }
 
-void rdc_mac_set_bitrate(int bits_per_second) {
+void rdc_set_bitrate(int bits_per_second) {
     if (!g_queue || bits_per_second <= 0) return;
     dispatch_async(g_queue, ^{
         g_bitrate = bits_per_second;
@@ -401,12 +403,12 @@ void rdc_mac_set_bitrate(int bits_per_second) {
 }
 
 // ---------------------------------------------------------------------------
-// Ввод. Все события идут через одну последовательную очередь — порядок сохраняется.
+// Input. All events go through one serial queue — order is preserved.
 
 static dispatch_queue_t g_input_queue;
 static CGEventSourceRef g_src;
 static CGEventFlags g_flags;
-static int g_buttons;           // биты: 1 левая, 2 правая, 4 средняя
+static int g_buttons;           // bits: 1 left, 2 right, 4 middle
 static uint8_t g_keys_down[128];
 static uint64_t g_last_click_us;
 static int g_last_click_button = -1;
@@ -448,7 +450,7 @@ static CGEventFlags modifier_flag(int keycode) {
 
 static CGEventFlags extra_flags(int keycode) {
     switch (keycode) {
-    case 0x7B: case 0x7C: case 0x7D: case 0x7E:  // стрелки
+    case 0x7B: case 0x7C: case 0x7D: case 0x7E:  // arrows
         return kCGEventFlagMaskNumericPad | kCGEventFlagMaskSecondaryFn;
     case 0x73: case 0x74: case 0x75: case 0x77: case 0x79: case 0x72:  // Home, PgUp, Del, End, PgDn, Help
     case 0x7A: case 0x78: case 0x63: case 0x76: case 0x60: case 0x61:  // F1–F6
@@ -469,11 +471,11 @@ static void mouse_move_now(CGPoint p) {
     post(e);
 }
 
-void rdc_mac_mouse_move(double nx, double ny) {
+void rdc_mouse_move(double nx, double ny) {
     dispatch_async(input_queue(), ^{ mouse_move_now(to_point(nx, ny)); });
 }
 
-void rdc_mac_mouse_button(int button, int down, double nx, double ny) {
+void rdc_mouse_button(int button, int down, double nx, double ny) {
     dispatch_async(input_queue(), ^{
         CGPoint p = to_point(nx, ny);
         CGEventType type;
@@ -507,7 +509,7 @@ void rdc_mac_mouse_button(int button, int down, double nx, double ny) {
     });
 }
 
-void rdc_mac_scroll(double dx, double dy) {
+void rdc_scroll(double dx, double dy) {
     dispatch_async(input_queue(), ^{
         int32_t vy = (int32_t)lround(-dy), vx = (int32_t)lround(-dx);
         if (vx == 0 && vy == 0) return;
@@ -534,11 +536,106 @@ static void key_now(int keycode, int down) {
     post(e);
 }
 
-void rdc_mac_key(int mac_keycode, int down) {
+void rdc_key(int mac_keycode, int down) {
     dispatch_async(input_queue(), ^{ key_now(mac_keycode, down); });
 }
 
-void rdc_mac_release_all(void) {
+// Text goes in as Unicode strings on key events, one character (a surrogate pair stays whole)
+// per event: apps that read only the first character of an event still get everything.
+void rdc_text(const char *utf8, size_t len) {
+    NSString *s = [[NSString alloc] initWithBytes:utf8 length:len encoding:NSUTF8StringEncoding];
+    if (s.length == 0) return;
+    dispatch_async(input_queue(), ^{
+        NSUInteger n = s.length;
+        for (NSUInteger i = 0; i < n;) {
+            unichar chars[2];
+            NSUInteger take = 1;
+            chars[0] = [s characterAtIndex:i];
+            if (CFStringIsSurrogateHighCharacter(chars[0]) && i + 1 < n) {
+                chars[1] = [s characterAtIndex:i + 1];
+                take = 2;
+            }
+            CGEventRef down = CGEventCreateKeyboardEvent(g_src, 0, true);
+            CGEventRef up = CGEventCreateKeyboardEvent(g_src, 0, false);
+            if (down) {
+                CGEventSetFlags(down, 0);
+                CGEventKeyboardSetUnicodeString(down, take, chars);
+            }
+            if (up) {
+                CGEventSetFlags(up, 0);
+                CGEventKeyboardSetUnicodeString(up, take, chars);
+            }
+            post(down);
+            post(up);
+            i += take;
+            if (i % 64 == 0) usleep(4000);  // let slow apps keep up with long text
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Screenshots for AI agents: JPEG in, cropped and shrunk JPEG out (ImageIO).
+
+void *rdc_jpeg_scale(const void *jpeg, size_t len, int crop_x, int crop_y, int crop_w, int crop_h,
+                     int max_w, int max_h, int quality, size_t *out_len, int *out_w, int *out_h) {
+    @autoreleasepool {
+        CFDataRef data = CFDataCreateWithBytesNoCopy(NULL, jpeg, (CFIndex)len, kCFAllocatorNull);
+        if (!data) return NULL;
+        CGImageSourceRef src = CGImageSourceCreateWithData(data, NULL);
+        CFRelease(data);
+        if (!src) return NULL;
+        CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+        CFRelease(src);
+        if (!img) return NULL;
+        CGRect rect = CGRectMake(0, 0, CGImageGetWidth(img), CGImageGetHeight(img));
+        if (crop_w > 0 && crop_h > 0) rect = CGRectIntersection(rect, CGRectMake(crop_x, crop_y, crop_w, crop_h));
+        rect = CGRectIntegral(rect);
+        CGImageRef part = CGRectIsEmpty(rect) ? NULL : CGImageCreateWithImageInRect(img, rect);
+        CGImageRelease(img);
+        if (!part) return NULL;
+        double scale = 1;
+        if (max_w > 0 && rect.size.width * scale > max_w) scale = max_w / rect.size.width;
+        if (max_h > 0 && rect.size.height * scale > max_h) scale = max_h / rect.size.height;
+        size_t w = (size_t)MAX(1, lround(rect.size.width * scale));
+        size_t h = (size_t)MAX(1, lround(rect.size.height * scale));
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, 0, cs, kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+        CGColorSpaceRelease(cs);
+        if (!ctx) {
+            CGImageRelease(part);
+            return NULL;
+        }
+        CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), part);
+        CGImageRelease(part);
+        CGImageRef scaled = CGBitmapContextCreateImage(ctx);
+        CGContextRelease(ctx);
+        if (!scaled) return NULL;
+        void *result = NULL;
+        CFMutableDataRef out = CFDataCreateMutable(NULL, 0);
+        CGImageDestinationRef dst = out ? CGImageDestinationCreateWithData(out, CFSTR("public.jpeg"), 1, NULL) : NULL;
+        if (dst) {
+            NSDictionary *props = @{(__bridge NSString *)kCGImageDestinationLossyCompressionQuality : @(quality / 100.0)};
+            CGImageDestinationAddImage(dst, scaled, (__bridge CFDictionaryRef)props);
+            if (CGImageDestinationFinalize(dst)) {
+                size_t n = (size_t)CFDataGetLength(out);
+                result = malloc(n);
+                if (result) {
+                    memcpy(result, CFDataGetBytePtr(out), n);
+                    *out_len = n;
+                    *out_w = (int)w;
+                    *out_h = (int)h;
+                }
+            }
+            CFRelease(dst);
+        }
+        if (out) CFRelease(out);
+        CGImageRelease(scaled);
+        return result;
+    }
+}
+
+void rdc_release_all(void) {
     dispatch_async(input_queue(), ^{
         for (int k = 0; k < 128; k++)
             if (g_keys_down[k] && !modifier_flag(k)) key_now(k, 0);
@@ -555,7 +652,7 @@ void rdc_mac_release_all(void) {
     });
 }
 
-void rdc_mac_cursor_pos(double *nx, double *ny) {
+void rdc_cursor_pos(double *nx, double *ny) {
     CGEventRef e = CGEventCreate(NULL);
     CGPoint p = e ? CGEventGetLocation(e) : CGPointZero;
     if (e) CFRelease(e);
@@ -567,9 +664,9 @@ void rdc_mac_cursor_pos(double *nx, double *ny) {
 }
 
 // ---------------------------------------------------------------------------
-// Сеть и система
+// Network and system
 
-void *rdc_mac_read_file(const char *path, size_t *len) {
+void *rdc_read_file(const char *path, size_t *len) {
     @autoreleasepool {
         NSData *d = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path]];
         if (!d) return NULL;
@@ -581,7 +678,7 @@ void *rdc_mac_read_file(const char *path, size_t *len) {
     }
 }
 
-int rdc_mac_lan_ipv4(char *buf, int buflen) {
+int rdc_lan_ipv4(char *buf, int buflen) {
     struct ifaddrs *list = NULL;
     if (getifaddrs(&list) != 0) return -1;
     int found = -1;
@@ -604,9 +701,9 @@ int rdc_mac_lan_ipv4(char *buf, int buflen) {
 }
 
 // ---------------------------------------------------------------------------
-// Обновления
+// Updates
 
-void *rdc_mac_http_get(const char *url, size_t max_len, size_t *len, int *status) {
+void *rdc_http_get(const char *url, size_t max_len, size_t *len, int *status) {
     @autoreleasepool {
         *status = -1;
         *len = 0;
@@ -632,7 +729,7 @@ void *rdc_mac_http_get(const char *url, size_t max_len, size_t *len, int *status
                                                         code = ((NSHTTPURLResponse *)r).statusCode;
                                                         body = d;
                                                     } else if (e) {
-                                                        rlog("сеть: %s", e.localizedDescription.UTF8String);
+                                                        rlog("network: %s", e.localizedDescription.UTF8String);
                                                     }
                                                     dispatch_semaphore_signal(done);
                                                 }];
@@ -651,7 +748,7 @@ void *rdc_mac_http_get(const char *url, size_t max_len, size_t *len, int *status
     }
 }
 
-int rdc_mac_write_temp(const char *name, const void *data, size_t len, char *path_out, int path_len) {
+int rdc_write_temp(const char *name, const void *data, size_t len, char *path_out, int path_len) {
     @autoreleasepool {
         NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"rdc-download"];
         [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -674,13 +771,13 @@ static int run_tool(NSString *path, NSArray<NSString *> *args) {
     return t.terminationStatus;
 }
 
-int rdc_mac_bundle_path(char *buf, int buflen) {
+int rdc_install_path(char *buf, int buflen) {
     NSString *bundle = NSBundle.mainBundle.bundlePath;
     if (![bundle.pathExtension isEqualToString:@"app"]) return -1;
     return [bundle getCString:buf maxLength:(NSUInteger)buflen encoding:NSUTF8StringEncoding] ? 0 : -1;
 }
 
-void rdc_mac_cleanup_old_bundles(void) {
+void rdc_cleanup_old_install(void) {
     @autoreleasepool {
         NSString *bundle = NSBundle.mainBundle.bundlePath;
         if (![bundle.pathExtension isEqualToString:@"app"]) return;
@@ -694,7 +791,7 @@ void rdc_mac_cleanup_old_bundles(void) {
     }
 }
 
-int rdc_mac_install_update(const char *zip_path, const char *version) {
+int rdc_install_update(const char *zip_path, const char *version) {
     @autoreleasepool {
         NSFileManager *fm = NSFileManager.defaultManager;
         NSString *bundle = NSBundle.mainBundle.bundlePath;
@@ -708,27 +805,27 @@ int rdc_mac_install_update(const char *zip_path, const char *version) {
         NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[fresh stringByAppendingPathComponent:@"Contents/Info.plist"]];
         if (![info[@"CFBundleIdentifier"] isEqual:@"com.anods.rdc"] ||
             ![info[@"CFBundleShortVersionString"] isEqual:[NSString stringWithUTF8String:version]]) {
-            rlog("обновление: в архиве не RDC %s", version);
+            rlog("update: archive does not contain RDC %s", version);
             return -4;
         }
         if (run_tool(@"/usr/bin/codesign", @[ @"--verify", @"--strict", fresh ]) != 0) {
-            rlog("обновление: подпись бандла не цела");
+            rlog("update: bundle signature is invalid");
             return -5;
         }
 
         NSString *old = [bundle stringByAppendingFormat:@".old-%d", getpid()];
         NSError *err = nil;
         if (![fm moveItemAtPath:bundle toPath:old error:&err]) {
-            rlog("обновление: не убрать старую версию: %s", err.localizedDescription.UTF8String);
+            rlog("update: cannot move old version aside: %s", err.localizedDescription.UTF8String);
             return -6;
         }
         if (![fm moveItemAtPath:fresh toPath:bundle error:&err]) {
             [fm moveItemAtPath:old toPath:bundle error:nil];
-            rlog("обновление: не поставить новую версию: %s", err.localizedDescription.UTF8String);
+            rlog("update: cannot put new version in place: %s", err.localizedDescription.UTF8String);
             return -7;
         }
 
-        // Новая версия стартует через секунду, когда этот процесс уже вышел и освободил порт.
+        // The new version starts a second later, once this process has exited and freed the port.
         NSMutableArray *args = [NSMutableArray arrayWithObjects:@"-c", @"sleep 1; exec /usr/bin/open -n \"$0\" --args \"$@\"", bundle, nil];
         NSArray<NSString *> *mine = NSProcessInfo.processInfo.arguments;
         for (NSUInteger i = 1; i < mine.count; i++)
@@ -736,30 +833,30 @@ int rdc_mac_install_update(const char *zip_path, const char *version) {
         NSTask *relaunch = [NSTask new];
         relaunch.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
         relaunch.arguments = args;
-        if (![relaunch launchAndReturnError:&err]) rlog("обновление: не перезапустить: %s", err.localizedDescription.UTF8String);
-        rlog("обновление %s установлено, перезапуск", version);
+        if (![relaunch launchAndReturnError:&err]) rlog("update: cannot relaunch: %s", err.localizedDescription.UTF8String);
+        rlog("update %s installed, restarting", version);
         exit(0);
     }
 }
 
-int rdc_mac_pref_bool(const char *key, int def) {
+int rdc_pref_bool(const char *key, int def) {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     NSString *k = [NSString stringWithUTF8String:key];
     return [d objectForKey:k] ? ([d boolForKey:k] ? 1 : 0) : def;
 }
 
-void rdc_mac_set_pref_bool(const char *key, int value) {
+void rdc_set_pref_bool(const char *key, int value) {
     [NSUserDefaults.standardUserDefaults setBool:value != 0 forKey:[NSString stringWithUTF8String:key]];
 }
 
-int rdc_mac_computer_name(char *buf, int buflen) {
+int rdc_computer_name(char *buf, int buflen) {
     NSString *name = [NSHost currentHost].localizedName ?: NSProcessInfo.processInfo.hostName;
     if (!name) return -1;
     return [name getCString:buf maxLength:(NSUInteger)buflen encoding:NSUTF8StringEncoding] ? 0 : -1;
 }
 
 // ---------------------------------------------------------------------------
-// Окно приложения
+// App window
 
 @interface RDCAppDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic, strong) NSWindow *window;
@@ -770,6 +867,8 @@ int rdc_mac_computer_name(char *buf, int buflen) {
 @property(nonatomic, strong) NSButton *screenButton;
 @property(nonatomic, strong) NSButton *inputButton;
 @property(nonatomic, strong) NSButton *settingsButton;
+@property(nonatomic, strong) NSButton *kickButton;
+@property(nonatomic) BOOL aiActive;
 @property(nonatomic, copy) NSString *link;
 @property(nonatomic, strong) NSWindow *settingsWindow;
 @property(nonatomic, strong) NSTextField *setVersion;
@@ -780,7 +879,7 @@ int rdc_mac_computer_name(char *buf, int buflen) {
 - (void)refreshSettings;
 @end
 
-// Состояние окна «Настройки» (пишется из любого потока, рисуется на главном).
+// Settings window state (written from any thread, drawn on the main one).
 static NSString *g_set_version = @"";
 static NSString *g_set_status = @"";
 static int g_set_auto = 1, g_set_can_install = 0, g_set_busy = 0;
@@ -804,12 +903,12 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     NSMenuItem *appItem = [NSMenuItem new];
     [bar addItem:appItem];
     NSMenu *appMenu = [NSMenu new];
-    NSMenuItem *prefs = [appMenu addItemWithTitle:@"Настройки…" action:@selector(showSettings:) keyEquivalent:@","];
+    NSMenuItem *prefs = [appMenu addItemWithTitle:@"Settings…" action:@selector(showSettings:) keyEquivalent:@","];
     prefs.target = self;
     [appMenu addItem:[NSMenuItem separatorItem]];
-    [appMenu addItemWithTitle:@"Скрыть RDC" action:@selector(hide:) keyEquivalent:@"h"];
+    [appMenu addItemWithTitle:@"Hide RDC" action:@selector(hide:) keyEquivalent:@"h"];
     [appMenu addItem:[NSMenuItem separatorItem]];
-    [appMenu addItemWithTitle:@"Выйти из RDC" action:@selector(terminate:) keyEquivalent:@"q"];
+    [appMenu addItemWithTitle:@"Quit RDC" action:@selector(terminate:) keyEquivalent:@"q"];
     appItem.submenu = appMenu;
     NSApp.mainMenu = bar;
 
@@ -820,34 +919,34 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
                                                   defer:NO];
     self.window.title = @"RDC";
 
-    NSTextField *caption = make_label(@"Код для подключения", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    NSTextField *caption = make_label(@"Connection code", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
     self.codeLabel = make_label(@"— — —", 40, NSFontWeightSemibold, NSColor.labelColor);
     self.codeLabel.font = [NSFont monospacedDigitSystemFontOfSize:40 weight:NSFontWeightSemibold];
     self.codeLabel.selectable = YES;
-    NSTextField *linkCaption = make_label(@"Ссылка для браузера", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    NSTextField *linkCaption = make_label(@"Browser link", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
     self.linkLabel = make_label(@"", 14, NSFontWeightRegular, NSColor.linkColor);
     self.linkLabel.selectable = YES;
     self.linkLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
 
-    NSButton *copy = [NSButton buttonWithTitle:@"Скопировать ссылку" target:self action:@selector(copyLink:)];
-    NSButton *open = [NSButton buttonWithTitle:@"Открыть в браузере" target:self action:@selector(openLink:)];
+    NSButton *copy = [NSButton buttonWithTitle:@"Copy link" target:self action:@selector(copyLink:)];
+    NSButton *open = [NSButton buttonWithTitle:@"Open in browser" target:self action:@selector(openLink:)];
     NSStackView *linkButtons = [NSStackView stackViewWithViews:@[ copy, open ]];
     linkButtons.spacing = 8;
 
-    self.statusLabel = make_label(@"Запуск…", 13, NSFontWeightMedium, NSColor.labelColor);
+    self.statusLabel = make_label(@"Starting…", 13, NSFontWeightMedium, NSColor.labelColor);
     self.permLabel = make_label(@"", 12, NSFontWeightRegular, NSColor.systemOrangeColor);
     self.permLabel.hidden = YES;
-    self.screenButton = [NSButton buttonWithTitle:@"Разрешить запись экрана" target:self action:@selector(askScreen:)];
-    self.inputButton = [NSButton buttonWithTitle:@"Разрешить управление" target:self action:@selector(askInput:)];
+    self.screenButton = [NSButton buttonWithTitle:@"Allow screen recording" target:self action:@selector(askScreen:)];
+    self.inputButton = [NSButton buttonWithTitle:@"Allow control" target:self action:@selector(askInput:)];
     self.screenButton.hidden = YES;
     self.inputButton.hidden = YES;
     NSStackView *permButtons = [NSStackView stackViewWithViews:@[ self.screenButton, self.inputButton ]];
     permButtons.spacing = 8;
 
-    NSButton *kick = [NSButton buttonWithTitle:@"Отключить всех" target:self action:@selector(disconnectAll:)];
-    NSButton *renew = [NSButton buttonWithTitle:@"Новый код" target:self action:@selector(newCode:)];
-    self.settingsButton = [NSButton buttonWithTitle:@"Настройки…" target:self action:@selector(showSettings:)];
-    NSStackView *sessionButtons = [NSStackView stackViewWithViews:@[ renew, kick, self.settingsButton ]];
+    self.kickButton = [NSButton buttonWithTitle:@"Disconnect all" target:self action:@selector(disconnectAll:)];
+    NSButton *renew = [NSButton buttonWithTitle:@"New code" target:self action:@selector(newCode:)];
+    self.settingsButton = [NSButton buttonWithTitle:@"Settings…" target:self action:@selector(showSettings:)];
+    NSStackView *sessionButtons = [NSStackView stackViewWithViews:@[ renew, self.kickButton, self.settingsButton ]];
     sessionButtons.spacing = 8;
 
     NSStackView *stack = [NSStackView stackViewWithViews:@[
@@ -886,15 +985,15 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
 }
 
 - (void)askScreen:(id)sender {
-    if (!rdc_mac_screen_access(1)) rdc_mac_open_privacy(0);
+    if (!rdc_screen_access(1)) rdc_open_privacy(0);
 }
 
 - (void)askInput:(id)sender {
-    if (!rdc_mac_input_access(1)) rdc_mac_open_privacy(1);
+    if (!rdc_input_access(1)) rdc_open_privacy(1);
 }
 
 - (void)disconnectAll:(id)sender {
-    if (g_on_action) g_on_action(g_app_ctx, RDC_ACTION_DISCONNECT_ALL);
+    if (g_on_action) g_on_action(g_app_ctx, self.aiActive ? RDC_ACTION_STOP_AI : RDC_ACTION_DISCONNECT_ALL);
 }
 
 - (void)newCode:(id)sender {
@@ -907,18 +1006,18 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
                                                   styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                                                     backing:NSBackingStoreBuffered
                                                       defer:NO];
-        w.title = @"Настройки RDC";
+        w.title = @"RDC Settings";
         w.releasedWhenClosed = NO;
         self.setVersion = make_label(@"", 15, NSFontWeightSemibold, NSColor.labelColor);
-        self.setAuto = [NSButton checkboxWithTitle:@"Обновлять автоматически" target:self action:@selector(toggleAuto:)];
-        NSTextField *hint = make_label(@"Новые версии скачиваются из релизов GitHub (ANODs/RDC), проверяются подписью\n"
-                                       @"и ставятся, когда к компьютеру никто не подключён.",
+        self.setAuto = [NSButton checkboxWithTitle:@"Update automatically" target:self action:@selector(toggleAuto:)];
+        NSTextField *hint = make_label(@"New versions are downloaded from GitHub releases (ANODs/RDC),\n"
+                                       @"verified by signature and installed when no one is connected.",
                                        11, NSFontWeightRegular, NSColor.secondaryLabelColor);
         hint.maximumNumberOfLines = 3;
         self.setStatus = make_label(@"", 13, NSFontWeightRegular, NSColor.labelColor);
         self.setStatus.maximumNumberOfLines = 3;
-        self.setCheck = [NSButton buttonWithTitle:@"Проверить обновления" target:self action:@selector(checkUpdate:)];
-        self.setInstall = [NSButton buttonWithTitle:@"Обновить и перезапустить" target:self action:@selector(installUpdate:)];
+        self.setCheck = [NSButton buttonWithTitle:@"Check for updates" target:self action:@selector(checkUpdate:)];
+        self.setInstall = [NSButton buttonWithTitle:@"Update and restart" target:self action:@selector(installUpdate:)];
         self.setInstall.keyEquivalent = @"\r";
         NSStackView *buttons = [NSStackView stackViewWithViews:@[ self.setCheck, self.setInstall ]];
         buttons.spacing = 8;
@@ -940,7 +1039,7 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
 
 - (void)refreshSettings {
     NSString *version = g_set_version.length ? g_set_version : @"—";
-    self.settingsButton.title = g_set_can_install ? @"Есть обновление…" : @"Настройки…";
+    self.settingsButton.title = g_set_can_install ? @"Update available…" : @"Settings…";
     if (!self.settingsWindow) return;
     self.setVersion.stringValue = [NSString stringWithFormat:@"RDC %@", version];
     self.setAuto.state = g_set_auto ? NSControlStateValueOn : NSControlStateValueOff;
@@ -963,7 +1062,7 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
 }
 @end
 
-void rdc_mac_settings_update(const char *version, int auto_update, const char *status, int can_install, int busy) {
+void rdc_settings_update(const char *version, int auto_update, const char *status, int can_install, int busy) {
     NSString *v = [NSString stringWithUTF8String:version];
     NSString *s = [NSString stringWithUTF8String:status];
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -976,7 +1075,7 @@ void rdc_mac_settings_update(const char *version, int auto_update, const char *s
     });
 }
 
-void rdc_mac_app_run(rdc_ctx_cb on_ready, rdc_action_cb on_action, void *ctx) {
+void rdc_app_run(rdc_ctx_cb on_ready, rdc_action_cb on_action, void *ctx) {
     @autoreleasepool {
         g_on_ready = on_ready;
         g_on_action = on_action;
@@ -989,7 +1088,7 @@ void rdc_mac_app_run(rdc_ctx_cb on_ready, rdc_action_cb on_action, void *ctx) {
     }
 }
 
-void rdc_mac_app_set_info(const char *code, const char *link) {
+void rdc_app_set_info(const char *code, const char *link) {
     NSString *c = [NSString stringWithUTF8String:code];
     NSString *l = [NSString stringWithUTF8String:link];
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -999,19 +1098,32 @@ void rdc_mac_app_set_info(const char *code, const char *link) {
     });
 }
 
-void rdc_mac_app_set_status(const char *text) {
+void rdc_app_set_status(const char *text) {
     NSString *t = [NSString stringWithUTF8String:text];
     dispatch_async(dispatch_get_main_queue(), ^{ g_app.statusLabel.stringValue = t; });
 }
 
-void rdc_mac_app_set_permissions(int screen_ok, int input_ok) {
+void rdc_app_set_permissions(int screen_ok, int input_ok) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSMutableArray *missing = [NSMutableArray array];
-        if (!screen_ok) [missing addObject:@"«Запись экрана» — без неё зрители не видят экран"];
-        if (!input_ok) [missing addObject:@"«Универсальный доступ» — без него нет управления"];
+        if (!screen_ok) [missing addObject:@"Screen Recording — without it viewers can't see the screen"];
+        if (!input_ok) [missing addObject:@"Accessibility — without it there is no remote control"];
         g_app.permLabel.stringValue = [missing componentsJoinedByString:@"\n"];
         g_app.permLabel.hidden = missing.count == 0;
         g_app.screenButton.hidden = screen_ok != 0;
         g_app.inputButton.hidden = input_ok != 0;
     });
 }
+
+void rdc_app_set_ai(int active) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_app.aiActive == (active != 0)) return;
+        g_app.aiActive = active != 0;
+        g_app.kickButton.title = active ? @"Stop AI agent" : @"Disconnect all";
+        g_app.kickButton.bezelColor = active ? NSColor.systemRedColor : nil;
+        if (active) [NSApp requestUserAttention:NSInformationalRequest];
+    });
+}
+
+// VideoToolbox on macOS encodes both H.264 and JPEG.
+int rdc_codec_caps(void) { return 3; }

@@ -1,6 +1,6 @@
-//! Манифест обновлений: latest.json в релизе на GitHub + подпись latest.json.sig.
-//! RDC доверяет только манифесту, чья подпись Ed25519 сходится с вшитым ключом,
-//! и только архиву, чей размер и SHA-256 совпали с манифестом.
+//! Update manifest: latest.json in the GitHub release + its signature latest.json.sig.
+//! RDC trusts only a manifest whose Ed25519 signature matches the built-in key,
+//! and only an archive whose size and SHA-256 match the manifest.
 const std = @import("std");
 const builtin = @import("builtin");
 const update_key = @import("update_key.zig");
@@ -24,7 +24,7 @@ pub const Manifest = struct {
     assets: []const Asset = &.{},
 };
 
-/// Платформа этой сборки в терминах манифеста: macos-arm64, windows-x86_64…
+/// This build's platform in manifest terms: macos-arm64, windows-x86_64…
 pub const platform = std.fmt.comptimePrint("{s}-{s}", .{
     switch (builtin.os.tag) {
         .macos => "macos",
@@ -41,7 +41,7 @@ pub const platform = std.fmt.comptimePrint("{s}-{s}", .{
 
 pub const Error = error{ BadSignature, BadManifest, NoAssetForPlatform, AssetMismatch };
 
-/// Проверяет подпись манифеста (текст подписи — base64 от 64 байт).
+/// Verifies the manifest signature (the signature text is base64 of 64 bytes).
 pub fn verify(manifest_bytes: []const u8, sig_text: []const u8) Error!void {
     return verifyWith(manifest_bytes, sig_text, update_key.public_key_hex);
 }
@@ -59,7 +59,7 @@ pub fn verifyWith(manifest_bytes: []const u8, sig_text: []const u8, public_hex: 
     Ed25519.Signature.fromBytes(sig_bytes).verify(manifest_bytes, pk) catch return error.BadSignature;
 }
 
-/// Разбор уже проверенного манифеста. Строки ссылаются на память arena.
+/// Parses an already verified manifest. Strings point into the arena.
 pub fn parse(arena: std.mem.Allocator, manifest_bytes: []const u8) Error!Manifest {
     return std.json.parseFromSliceLeaky(Manifest, arena, manifest_bytes, .{ .ignore_unknown_fields = true }) catch error.BadManifest;
 }
@@ -75,7 +75,7 @@ pub fn assetFor(m: Manifest, plat: []const u8) Error!Asset {
     return error.NoAssetForPlatform;
 }
 
-/// Скачанный архив — тот самый, что в манифесте.
+/// Checks that the downloaded archive is the one in the manifest.
 pub fn checkAsset(a: Asset, data: []const u8) Error!void {
     if (data.len != a.size) return error.AssetMismatch;
     var digest: [Sha256.digest_length]u8 = undefined;
@@ -85,7 +85,7 @@ pub fn checkAsset(a: Asset, data: []const u8) Error!void {
 }
 
 // ---------------------------------------------------------------------------
-// Версии X.Y.Z (ведущая «v» допускается)
+// Versions X.Y.Z (a leading "v" is allowed)
 
 pub const Version = struct {
     major: u32,
@@ -115,7 +115,7 @@ pub const Version = struct {
     }
 };
 
-test "версии" {
+test "versions" {
     const v = Version.parse("v0.2.10").?;
     try std.testing.expectEqual(@as(u32, 10), v.patch);
     try std.testing.expect(Version.parse("0.3.0").?.newerThan(Version.parse("0.2.9").?));
@@ -125,10 +125,10 @@ test "версии" {
     try std.testing.expectEqual(@as(?Version, null), Version.parse("1.2.3.4"));
 }
 
-test "манифест: подпись, разбор, архив" {
+test "manifest: signature, parsing, archive" {
     const kp = Ed25519.KeyPair.generateDeterministic(@splat(7)) catch unreachable;
     const public_hex = std.fmt.bytesToHex(kp.public_key.toBytes(), .lower);
-    const data = "архив";
+    const data = "archive";
     var digest: [32]u8 = undefined;
     Sha256.hash(data, &digest, .{});
     var buf: [512]u8 = undefined;
@@ -149,6 +149,6 @@ test "манифест: подпись, разбор, архив" {
     try std.testing.expectEqualStrings("0.3.0", m.version);
     const a = try assetFor(m, "macos-arm64");
     try checkAsset(a, data);
-    try std.testing.expectError(error.AssetMismatch, checkAsset(a, "чужой"));
+    try std.testing.expectError(error.AssetMismatch, checkAsset(a, "foreign"));
     try std.testing.expectError(error.NoAssetForPlatform, assetFor(m, "windows-x86_64"));
 }

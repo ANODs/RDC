@@ -1,0 +1,25 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "rdc",
+  "version": "0.3.0",
+  "description": "See and control other computers that run RDC: connect by link or code, then work from screenshots with the mouse and keyboard.",
+  "author": { "name": "Timoshkin Timofey", "url": "https://github.com/ANODs" },
+  "homepage": "https://github.com/ANODs/RDC",
+  "repository": "https://github.com/ANODs/RDC",
+  "license": "Apache-2.0",
+  "keywords": ["remote-desktop", "computer-use", "screenshot", "mouse", "keyboard", "mcp"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "RDC — Remote Desktop Control",
+        "shortDescription": "Let the agent see and control another computer that runs RDC.",
+        "longDescription": "RDC is a lightweight open-source remote desktop. Run it on the computer to control; it shows a link and a 9-digit code. Give the link to the agent: it connects, takes screenshots and uses the mouse and keyboard there. The person at that computer sees that an AI agent is connected and can stop it at any time.",
+        "developerName": "Timoshkin Timofey",
+        "category": "Productivity",
+        "capabilities": ["See the screen of another computer", "Click, type and press keys there", "Up to four computers at once"],
+        "websiteURL": "https://github.com/ANODs/RDC",
+        "defaultPrompt": "Connect to my other computer with this RDC link and tell me what is on the screen: "
+      }
+    }
+  }
+}

@@ -1,0 +1,37 @@
+name: Pages
+
+# Publishes the browser viewer (web/) at https://anods.github.io/RDC/ after every push to main.
+# One-time setup on GitHub: Settings → Pages → Build and deployment → Source: GitHub Actions.
+# Until RDC speaks WebRTC the page can only reach a host that is on the same network and
+# serves plain HTTP, so for now it is a preview of the viewer, not a way in from outside.
+
+on:
+  push:
+    branches: [main]
+    paths: ['web/**', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy web/
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+      - id: deployment
+        uses: actions/deploy-pages@v4

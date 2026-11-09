@@ -1,384 +1,401 @@
-# RDC — план
+# RDC — Plan
 
-RDC (Remote Desktop Control) — лёгкий и быстрый удалённый рабочий стол на Zig. Один бинарник умеет и показывать свой экран, и подключаться к чужому; к нему — небольшой сервер для ID и реле.
+RDC (Remote Desktop Control) is a lightweight, fast remote desktop written in Zig. A single binary both shares its own screen and connects to other computers; a small server handles IDs and relaying.
 
-Версия плана — 9 ноября 2026.
+Plan version: 9 November 2026.
 
-## Схема
+## Diagram
 
 ```mermaid
 flowchart TB
-  subgraph host["Хост"]
-    cap["Захват экрана<br/>SCK · DDA · PipeWire"] --> ana["Анализ изменений<br/>тайлы, хэши, курсор"]
-    ana --> enc["Аппаратный энкодер<br/>VT · NVENC · AMF · VAAPI"]
-    enc --> th["Транспорт<br/>пакеты, FEC, Noise, UDP"]
+  subgraph host["Host"]
+    cap["Screen capture<br/>SCK · DDA · PipeWire"] --> ana["Change analysis<br/>tiles, hashes, cursor"]
+    ana --> enc["Hardware encoder<br/>VT · NVENC · AMF · VAAPI"]
+    enc --> th["Transport<br/>packets, FEC, Noise, UDP"]
   end
-  subgraph viewer["Зритель"]
-    tv["Транспорт<br/>сборка кадра, FEC, NACK"] --> dec["Аппаратный декодер<br/>VT · MF · VAAPI"]
-    dec --> cmp["Компоновщик<br/>видео + тайлы + курсор"]
-    cmp --> scr["Экран<br/>Metal · D3D11 · GLES"]
+  subgraph viewer["Viewer"]
+    tv["Transport<br/>frame assembly, FEC, NACK"] --> dec["Hardware decoder<br/>VT · MF · VAAPI"]
+    dec --> cmp["Compositor<br/>video + tiles + cursor"]
+    cmp --> scr["Display<br/>Metal · D3D11 · GLES"]
   end
-  th -- "видео, звук" --> tv
-  tv -- "ввод, буфер обмена" --> th
-  srv["rdc-server<br/>ID, присутствие, пробивка NAT"] -.- th
+  th -- "video, audio" --> tv
+  tv -- "input, clipboard" --> th
+  srv["rdc-server<br/>ID, presence, NAT traversal"] -.- th
   srv -.- tv
-  relay["Реле<br/>запасной путь, только шифр"] -.- th
+  relay["Relay<br/>fallback path, ciphertext only"] -.- th
   relay -.- tv
 ```
 
-Сплошные стрелки — прямой путь по UDP, пунктир — сигналинг и запасной путь через реле.
+Solid arrows are the direct UDP path; dotted lines are signaling and the fallback path through the relay.
 
-## 1. Цели в цифрах
+## 1. Goals in numbers
 
-| Что | Цель |
+| What | Target |
 |---|---|
-| Размер | Windows и Linux ≤ 3 МБ, macOS (arm64 + x86_64) ≤ 6 МБ, сервер ≤ 2 МБ |
-| Память | хост ≤ 40 МБ, зритель ≤ 80 МБ при 1440p |
-| Задержка в LAN | от захвата до показа ≤ 16 мс p50, ≤ 25 мс p95 при 60 Гц |
-| Неподвижный экран | 0 кадров, трафик только keepalive |
-| Набор кода в IDE | ≤ 100 кбит/с |
-| CPU хоста | ≤ 5 % одного ядра на 1440p60 с аппаратным энкодером |
-| Подключение | первый кадр ≤ 0,5 с |
-| Запуск | окно ≤ 100 мс; без установщика, рантаймов и DLL рядом |
+| Size | Windows and Linux ≤ 3 MB, macOS (arm64 + x86_64) ≤ 6 MB, server ≤ 2 MB |
+| Memory | host ≤ 40 MB, viewer ≤ 80 MB at 1440p |
+| LAN latency | capture to display ≤ 16 ms p50, ≤ 25 ms p95 at 60 Hz |
+| Static screen | 0 frames, keepalive traffic only |
+| Typing code in an IDE | ≤ 100 kbps |
+| Host CPU | ≤ 5% of one core at 1440p60 with a hardware encoder |
+| Connection | first frame in ≤ 0.5 s |
+| Startup | window in ≤ 100 ms; no installer, runtimes or DLLs next to the binary |
 
-## 2. Платформы
+## 2. Platforms
 
-| ОС | Захват | Кодирование и декодирование | Рендер | Ввод на хосте | Роль |
+| OS | Capture | Encoding and decoding | Rendering | Host input | Role |
 |---|---|---|---|---|---|
-| macOS 14.4+ | ScreenCaptureKit | VideoToolbox | Metal | CGEvent | хост и зритель |
-| Windows 10/11 | DXGI Desktop Duplication | NVENC, AMF, QSV; запасной — Media Foundation | Direct3D 11 | SendInput, SendSAS | хост и зритель |
-| Linux (X11, Wayland) | XShm + XDamage; портал + PipeWire | VAAPI, NVENC | OpenGL ES 3 | XTest; libei; uinput | хост и зритель |
-| Android | MediaProjection | MediaCodec | OpenGL ES 3 | AccessibilityService | зритель и хост |
-| iOS / iPadOS | ReplayKit | VideoToolbox | Metal | — | зритель и показ своего экрана |
+| macOS 14.4+ | ScreenCaptureKit | VideoToolbox | Metal | CGEvent | host and viewer |
+| Windows 10/11 | DXGI Desktop Duplication | NVENC, AMF, QSV; fallback: Media Foundation | Direct3D 11 | SendInput, SendSAS | host and viewer |
+| Linux (X11, Wayland) | XShm + XDamage; portal + PipeWire | VAAPI, NVENC | OpenGL ES 3 | XTest; libei; uinput | host and viewer |
+| Android | MediaProjection | MediaCodec | OpenGL ES 3 | AccessibilityService | viewer and host |
+| iOS / iPadOS | ReplayKit | VideoToolbox | Metal | — | viewer and screen sharing |
 
-Звук берём из ScreenCaptureKit, WASAPI loopback, PipeWire и AudioPlaybackCapture. Процессоры — arm64 и x86_64 на всех ОС, включая Windows on ARM. Трёх рендеров хватает на всё: Metal, D3D11 и GLES 3. Последний почти без изменений работает и как WebGL 2 в веб-зрителе.
+Audio comes from ScreenCaptureKit, WASAPI loopback, PipeWire and AudioPlaybackCapture. CPUs: arm64 and x86_64 on every OS, including Windows on ARM. Three renderers cover everything: Metal, D3D11 and GLES 3. The last one also runs almost unchanged as WebGL 2 in the web viewer.
 
-## 3. Решения, на которых всё держится
+## 3. Core decisions
 
-1. Кадр не покидает видеопамять до энкодера: IOSurface → VideoToolbox, текстура D3D11 → NVENC/AMF/QSV, DMA-BUF → VAAPI.
-2. Свежесть важнее полноты. В очереди не больше одного кадра, устаревшие выбрасываются. После потерь энкодер ссылается на последний подтверждённый кадр (LTR в VideoToolbox, RFI в NVENC), а где этого нет — использует intra-refresh. Тяжёлых ключевых кадров нет.
-3. Нет изменений — нет работы. Захват идёт по dirty rects от ОС. Если окно зрителя свёрнуто, хост встаёт на паузу.
-4. Курсор зритель рисует сам, а форма приходит отдельно (кэш по хэшу). Поэтому мышь отзывается мгновенно при любом пинге.
-5. Свой транспорт на UDP с рукопожатием Noise, как в WireGuard. Шифрование сквозное: сервер и реле видят только шифротекст.
-6. В горячем пути нет аллокаций. Пулы и кольца создаются при старте сессии, дальше нет ни одного malloc. Явные аллокаторы Zig это гарантируют.
-7. Видеокодеки берём у ОС и драйверов, в бинарнике они не занимают ни байта. Свой код — только для экранного контента.
-8. Ядро написано на чистом Zig и не зависит от ОС. Платформы — тонкие бэкенды за общим контрактом; бэкенд выбирается при компиляции, без виртуальных вызовов. То же ядро собирается библиотекой `librdc` с C ABI для мобильных и веба.
-9. Надёжность заложена в протокол. Ни одно действие не теряется и не задваивается, а сбой любой части даёт паузу, а не обрыв (раздел 7).
-10. Скрытого режима нет. На хосте всегда видна рамка «идёт сессия», список подключённых и кнопка «отключить».
+1. A frame stays in video memory all the way to the encoder: IOSurface → VideoToolbox, D3D11 texture → NVENC/AMF/QSV, DMA-BUF → VAAPI.
+2. Freshness beats completeness. At most one frame is queued; stale frames are dropped. After losses the encoder references the last acknowledged frame (LTR in VideoToolbox, RFI in NVENC), and uses intra-refresh where that is unavailable. No heavy keyframes.
+3. No changes, no work. Capture follows dirty rects from the OS. If the viewer window is minimized, the host pauses.
+4. The viewer draws the cursor itself, and the cursor shape arrives separately (cached by hash). So the mouse responds instantly at any ping.
+5. A custom UDP transport with a Noise handshake, as in WireGuard. Encryption is end-to-end: the server and relays see only ciphertext.
+6. No allocations on the hot path. Pools and rings are created when a session starts; after that, not a single malloc. Zig's explicit allocators guarantee this.
+7. Video codecs come from the OS and drivers and take zero bytes in the binary. We write our own code only for screen content.
+8. The core is pure Zig and OS-independent. Platforms are thin backends behind a shared contract; the backend is chosen at compile time, with no virtual calls. The same core builds as the `librdc` library with a C ABI for mobile and web.
+9. Reliability is built into the protocol. No action is ever lost or duplicated, and a failure of any part means a pause, not a disconnect (section 7).
+10. There is no hidden mode. The host always shows a "session in progress" frame, the list of connected viewers and a Disconnect button.
 
-## 4. Устройство кода
+## 4. Code structure
 
-- `core/` — чистый Zig, собирается под любую цель вплоть до wasm и тестируется без ОС. Здесь протокол, крипто, транспорт, машины состояний сессий, тайловый кодек, раскладки HID и логика UI.
-- `platform/` — контракты (захват, энкодер, декодер, рендер, окно и ввод, звук, буфер обмена, ключи, служба) и бэкенды `macos`, `windows`, `linux`, `android`, `ios`. Соответствие бэкенда контракту проверяется при компиляции.
-- `app/` — десктопное приложение, `server/` — сервер, `mobile/` — оболочки на Swift и Kotlin, `tools/` — симулятор и замеры.
+- `core/` — pure Zig; builds for any target down to wasm and is tested without an OS. It holds the protocol, crypto, transport, session state machines, the tile codec, HID layouts and UI logic.
+- `platform/` — contracts (capture, encoder, decoder, renderer, window and input, audio, clipboard, key storage, service) and the `macos`, `windows`, `linux`, `android` and `ios` backends. Each backend's conformance to its contract is checked at compile time.
+- `app/` — the desktop app, `server/` — the server, `mobile/` — Swift and Kotlin shells, `tools/` — the simulator and benchmarks.
 
 ```
 rdc/
-├─ build.zig, build.zig.zon   все цели, C-зависимости
+├─ build.zig, build.zig.zon   all targets, C dependencies
 ├─ src/core/        ~15k   proto · crypto · net · media · session · input · ui
 ├─ src/platform/    ~16k   macos · windows · linux · android · ios
-├─ src/app/          ~3k   десктоп, CLI, IPC служба ↔ агент
-├─ src/lib.zig             C ABI ядра (librdc)
-├─ server/           ~3k   ID, присутствие, пробивка NAT, реле
-├─ mobile/                 оболочки Swift и Kotlin
-└─ tools/            ~4k   симулятор, синтетический экран, замер задержки
+├─ src/app/          ~3k   desktop, CLI, service ↔ agent process IPC
+├─ src/lib.zig             core C ABI (librdc)
+├─ server/           ~3k   ID, presence, NAT traversal, relay
+├─ mobile/                 Swift and Kotlin shells
+└─ tools/            ~4k   simulator, synthetic screen, latency measurement
 ```
 
-Всего около 40 тысяч строк на Zig.
+About 40,000 lines of Zig in total.
 
-Потоки:
-- На хосте цепочка такая: захват (колбэк ОС) → анализ → аппаратный энкодер → пакетизатор → пейсер. Приём и инжекция ввода идут в своих потоках.
-- У зрителя: приём → сборка кадра → декодер → рендер. Окно и ввод отправляют события обратно.
-- Между потоками — кольца SPSC без блокировок. Приоритет повышаем через QoS на macOS, MMCSS на Windows и rtkit на Linux.
-- Сетевой и файловый ввод-вывод идёт через `std.Io` (интерфейс появился в Zig 0.16). Конвейер реального времени работает на своих потоках.
+Threads:
+- On the host the chain is: capture (OS callback) → analysis → hardware encoder → packetizer → pacer. Receiving and injecting input run on their own threads.
+- On the viewer: receive → frame assembly → decoder → renderer. The window and input send events back.
+- Threads are connected by lock-free SPSC rings. Priority is raised with QoS on macOS, MMCSS on Windows and rtkit on Linux.
+- Network and file I/O go through `std.Io` (the interface introduced in Zig 0.16). The real-time pipeline runs on its own threads.
 
-## 5. Картинка: базовое видео + доводка без потерь
+## 5. Picture: base video + lossless refinement
 
-- **Базовый слой** — аппаратное видео без B-кадров, CBR с буфером около одного кадра. Кодек выбирается лучший из поддержанных обеими сторонами: AV1, затем HEVC, затем H.264. Хост кодирует в размере окна зрителя: ScreenCaptureKit масштабирует при захвате сам, на Windows это делает видеопроцессор D3D11. Есть и режим 1:1. Когда экран замер, хост отправляет один дополнительный кадр высокого качества.
-- **Доводка без потерь.** Если тайл 64×64 не менялся около 150 мс, хост в фоне отправляет его без потерь (палитра + RLE + zstd), и зритель накладывает его поверх видео. Текст становится пиксель-в-пиксель, цветная кайма от 4:2:0 пропадает — без поддержки 4:4:4 в железе. Каждый видеокадр несёт карту изменённых тайлов; они снова идут из видео до следующей доводки.
-- **Кэш тайлов по хэшу** — 64 МБ на каждой стороне. При прокрутке и переключении окон и вкладок вместо картинки уходит ссылка в 8 байт. Move rects от DXGI и поиск сдвига по хэшам строк превращаются в команду «скопируй прямоугольник».
-- **Курсор** — отдельный слой. Если приложение прячет курсор (игры, вращение вида в Blender), зритель сам переключает мышь в относительный режим.
-- **Без аппаратного энкодера** базой становится тайловый кодек: он работает на CPU и кодирует только изменённые тайлы.
-- **Режимы** «Авто», «Качество» и «Скорость». Когда полосы не хватает, первыми уступают качество и разрешение, а частота кадров держится.
+- **Base layer**: hardware video without B-frames, CBR with a buffer of about one frame. The codec is the best one both sides support: AV1, then HEVC, then H.264. The host encodes at the size of the viewer's window: ScreenCaptureKit scales during capture by itself, and on Windows the D3D11 video processor does it. A 1:1 mode is also available. When the screen goes still, the host sends one extra high-quality frame.
+- **Lossless refinement.** If a 64×64 tile has not changed for about 150 ms, the host sends it losslessly in the background (palette + RLE + zstd), and the viewer overlays it on the video. Text becomes pixel-perfect, and 4:2:0 color fringing disappears without 4:4:4 hardware support. Every video frame carries a map of changed tiles; those tiles come from the video again until the next refinement.
+- **Hash-based tile cache**: 64 MB on each side. When scrolling or switching windows and tabs, an 8-byte reference is sent instead of the image. DXGI move rects and shift detection by row hashes turn into a "copy rectangle" command.
+- **Cursor**: a separate layer. If an app hides the cursor (games, orbiting the view in Blender), the viewer switches the mouse to relative mode by itself.
+- **Without a hardware encoder**, the tile codec becomes the base layer: it runs on the CPU and encodes only changed tiles.
+- **Modes**: Auto, Quality and Speed. When bandwidth runs short, quality and resolution give way first, and the frame rate holds.
 
-## 6. Транспорт
+## 6. Transport
 
 ```
-UDP-датаграмма ≤ 1200 Б (позже PMTU до ~1450)
-тип 1 │ индекс сессии 4 │ счётчик 8 │ ChaCha20-Poly1305 { канал, номер, фрагмент, FEC, данные } │ тег 16
+UDP datagram ≤ 1200 B (later PMTU up to ~1450)
+type 1 │ session index 4 │ counter 8 │ ChaCha20-Poly1305 { channel, sequence, fragment, FEC, payload } │ tag 16
 ```
 
-Накладные расходы — 29 байт на пакет. Рукопожатие Noise IK занимает 1 RTT, потому что ключ хоста известен заранее. Есть окно защиты от повторов, ключи меняются по времени и объёму. Сессия не привязана к IP и порту, поэтому переживает смену сети.
+Overhead is 29 bytes per packet. The Noise IK handshake takes 1 RTT because the host key is known in advance. There is an anti-replay window, and keys rotate by time and volume. A session is not bound to an IP and port, so it survives network changes.
 
-| Канал | Доставка | Приоритет | Как устроен |
+| Channel | Delivery | Priority | How it works |
 |---|---|---|---|
-| Управление | надёжно, по порядку | высший | возможности сторон, права, пинги, сверка часов |
-| Ввод | надёжно, с избыточностью | высший | журнал действий (раздел 7) |
-| Видео | ненадёжно | высокий | фрагменты, адаптивный FEC Рида — Соломона, NACK — только если повтор успевает к сроку |
-| Курсор | последнее состояние | высокий | форма по хэшу, позиция |
-| Звук | ненадёжно | средний | Opus по 10 мс, дубли при потерях, маскировка, буфер 20–60 мс |
-| Доводка тайлов | надёжно, в фоне | низкий | только остаток полосы |
-| Файлы, буфер обмена | надёжно, в фоне | низкий | по запросу, докачка, проверка BLAKE3 |
+| Control | reliable, ordered | highest | peer capabilities, permissions, pings, clock sync |
+| Input | reliable, redundant | highest | input journal (section 7) |
+| Video | unreliable | high | fragments, adaptive Reed–Solomon FEC, NACK only if the retransmit makes the deadline |
+| Cursor | latest state | high | shape by hash, position |
+| Audio | unreliable | medium | Opus in 10 ms frames, duplicates under loss, concealment, 20–60 ms buffer |
+| Tile refinement | reliable, background | low | spare bandwidth only |
+| Files, clipboard | reliable, background | low | on demand, resumable, BLAKE3 check |
 
-**Контроль перегрузки:**
-- Получатель каждые ~25 мс сообщает время прихода пакетов.
-- Отправитель следит за трендом задержки (как GCC в WebRTC) и за потерями и вычисляет целевой битрейт. Энкодер подстраивается под него на лету.
-- Пейсер (1,5× от целевого битрейта) сглаживает всплески.
-- Свободную полосу прощупываем пакетами FEC: они несут полезную избыточность, а не мусор.
-- В LAN потолок — 100–300 Мбит/с.
+**Congestion control:**
+- Every ~25 ms the receiver reports packet arrival times.
+- The sender tracks the delay trend (like GCC in WebRTC) and losses, and computes a target bitrate. The encoder adapts to it on the fly.
+- A pacer (1.5× the target bitrate) smooths out bursts.
+- Spare bandwidth is probed with FEC packets: they carry useful redundancy, not junk.
+- On a LAN the ceiling is 100–300 Mbps.
 
-**Пути в порядке предпочтения:**
-1. LAN — обнаружение широковещанием, работает без интернета.
-2. Прямой UDP — через IPv6 или пробивку NAT.
-3. Реле по UDP.
-4. Реле по TCP/443 — WebSocket через HTTPS-прокси, для корпоративных сетей.
+**Paths in order of preference:**
+1. LAN: broadcast discovery, works without internet.
+2. Direct UDP: over IPv6 or NAT traversal (hole punching).
+3. Relay over UDP.
+4. Relay over TCP/443: WebSocket through an HTTPS proxy, for corporate networks.
 
-Сессия стартует по пути, который ответил первым, и посреди сессии переходит на лучший без разрыва.
+A session starts on whichever path answers first and moves to a better one mid-session without a break.
 
-## 7. Стабильность и буферизация действий
+## 7. Stability and input buffering
 
-| Что | Цель |
+| What | Target |
 |---|---|
-| Потерянные, задвоенные или переставленные действия | 0; это гарантирует протокол, проверка на каждом коммите |
-| Залипшие клавиши и кнопки мыши | 0 |
-| Замирания дольше 200 мс | ≤ 1 в час на обычной домашней сети |
-| Смена сети (Wi-Fi → LTE) | сессия продолжается через ≤ 1 с, без повторного входа |
-| Падение агента, сброс драйвера GPU, смена монитора | пауза ≤ 2 с, сессия не рвётся |
-| 72 часа без перерыва | память и число дескрипторов не растут, задержка не увеличивается |
+| Lost, duplicated or reordered actions | 0; guaranteed by the protocol, checked on every commit |
+| Stuck keys and mouse buttons | 0 |
+| Freezes longer than 200 ms | ≤ 1 per hour on a typical home network |
+| Network change (Wi-Fi → LTE) | the session continues within ≤ 1 s, no re-login |
+| Agent process crash, GPU driver reset, monitor change | pause ≤ 2 s, the session does not drop |
+| 72 hours non-stop | memory and handle count do not grow, latency does not increase |
 
-**Журнал действий:**
-- **Номер и время у каждого действия.** Клавиша, клик, прокрутка или текст получают номер и время. Пакет несёт все ещё не подтверждённые действия, поэтому потеря одного пакета ничего не задерживает. Хост применяет каждое действие ровно один раз и строго по порядку.
-- **Исходные интервалы.** Хост воспроизводит действия с теми же промежутками, что были у пользователя (небольшой адаптивный буфер ввода, единицы миллисекунд). Джиттер сети не превратит двойной клик в два одиночных, не оборвёт перетаскивание и не перемешает быструю печать.
-- **Сверка зажатых клавиш.** Вместе с keepalive зритель сообщает, какие клавиши и кнопки сейчас зажаты. Расхождение хост исправляет сам, а при обрыве отпускает всё.
-- **Короткий обрыв (до ~2 с).** Действия копятся в журнале и после восстановления уходят как были.
-- **Долгий обрыв.** Вслепую ничего не воспроизводится — экран за это время мог измениться. Зритель показывает «не отправлено: 12 действий» с кнопками «Отправить» и «Отменить».
-- **Движения мыши** не копятся: важна только последняя позиция.
+**Input journal:**
+- **Every action is numbered and timestamped.** A key press, click, scroll or text input gets a sequence number and a time. Each packet carries all actions not yet acknowledged, so losing one packet delays nothing. The host applies every action exactly once, strictly in order.
+- **Original timing.** The host replays actions with the same intervals the user had (a small adaptive input buffer, a few milliseconds). Network jitter will not turn a double click into two single clicks, break a drag or scramble fast typing.
+- **Held-key reconciliation.** With each keepalive the viewer reports which keys and buttons are currently held. The host fixes any mismatch itself and releases everything on disconnect.
+- **Short outage (up to ~2 s).** Actions accumulate in the journal and go out unchanged once the connection is back.
+- **Long outage.** Nothing is replayed blindly: the screen may have changed in the meantime. The viewer shows "Not sent: 12 actions" with Send and Discard buttons.
+- **Mouse movements** do not accumulate: only the latest position matters.
 
-**Сессия:**
-- **Переподключение по билету.** Обе стороны хранят состояние сессии 60 с. Зритель возвращается любым путём с одноразовым билетом, привязанным к ключам сессии, — без пароля и диалога. Хост досылает свежий кадр и продолжает ввод с последнего номера. Пока связи нет, на экране последний кадр с плашкой «Переподключение…», а не чёрное окно.
-- **Горячий запасной путь.** Пока работает P2P, путь через реле держится наготове. Если подтверждений нет 2–3 RTT, сессия переключается на реле за ≤ 0,5 с.
-- **Плавность или задержка.** Зритель меряет джиттер и, когда он большой, держит в буфере до одного кадра, чтобы движение шло ровно. Есть ползунок «Плавность ↔ Задержка», по умолчанию — «Авто».
+**Session:**
+- **Ticket-based reconnect.** Both sides keep session state for 60 s. The viewer comes back over any path with a one-time ticket bound to the session keys, with no password or dialog. The host sends a fresh frame and resumes input from the last sequence number. While the connection is down, the screen shows the last frame with a "Reconnecting…" banner, not a black window.
+- **Hot standby path.** While P2P works, the relay path is kept ready. If no acknowledgments arrive for 2–3 RTTs, the session switches to the relay within ≤ 0.5 s.
+- **Smoothness or latency.** The viewer measures jitter and, when it is high, buffers up to one frame so motion stays smooth. A "Smoothness ↔ Latency" slider defaults to Auto.
 
-**Хост сам себя чинит:**
-- **Служба и агент.** В установленном режиме сетевая сессия живёт в службе: на macOS это демон (так советует Apple), на Windows — служба, на Linux — systemd. Захват, кодирование и ввод работают в агенте, связь между ними — через общую память. Если агент упал, служба поднимает новый, и зритель видит секундную паузу, а не обрыв.
-- **Сторожа.** Каждая стадия конвейера шлёт пульс. Если стадия застряла, перезапускается только она.
-- **Откат на запасные средства.** При ошибке энкодера посреди сессии включается следующий: NVENC → Media Foundation → тайловый кодек. При потере устройства (UAC, блокировка, сброс драйвера GPU, смена разрешения, новый монитор) конвейер пересоздаётся за ≤ 300 мс.
-- **Ограниченные очереди.** У каждого канала своя политика переполнения: видео выбрасывает старое, ввод не выбрасывает никогда, передача файлов встаёт на паузу.
-- **Только монотонное время.** Скачки системных часов ничего не ломают, сессия засыпает и просыпается вместе с машиной.
+**Self-healing host:**
+- **Service and agent process.** When installed, the network session lives in a service: a daemon on macOS (as Apple recommends), a service on Windows, systemd on Linux. Capture, encoding and input run in the agent process, and the two communicate through shared memory. If the agent process crashes, the service starts a new one, and the viewer sees a one-second pause, not a disconnect.
+- **Watchdogs.** Every pipeline stage sends a heartbeat. If a stage gets stuck, only that stage is restarted.
+- **Fallbacks.** If an encoder fails mid-session, the next one takes over: NVENC → Media Foundation → tile codec. On device loss (UAC, lock screen, GPU driver reset, resolution change, new monitor) the pipeline is rebuilt within ≤ 300 ms.
+- **Bounded queues.** Each channel has its own overflow policy: video drops old data, input never drops anything, file transfer pauses.
+- **Monotonic time only.** System clock jumps break nothing; the session sleeps and wakes with the machine.
 
-**Как проверяем:**
-- **Детерминированный симулятор**, как в TigerBeetle — финансовой базе данных на Zig, которая так проверяет себя. Хост, зритель и сервер работают в одном процессе с виртуальным временем и виртуальной сетью.
-  - На каждом прогоне — тысячи сидов со случайными потерями, задвоениями, перестановками, обрывами путей, скачками часов и падениями агента.
-  - Инварианты: ни одно действие не потеряно, не задвоено и не переставлено; после сессии нет зажатых клавиш; кадры не идут назад; память не растёт.
-  - Упавший сид воспроизводится точь-в-точь.
-- **`zig build sim`** — тот же симулятор с синтетическим экраном: печать, прокрутка, видео, перетаскивание окон. На выходе p50/p95/p99 задержки, битрейт и замирания. По этим числам CI ловит регрессии.
-- **Фаззинг** всех парсеров встроенным фаззером Zig. Property-тесты для арифметики номеров с переполнением.
-- **Перед каждым релизом** — прогон 72 часа со случайным вводом и проверка помехами на живых машинах: dummynet на macOS, netem на Linux, clumsy на Windows.
-- **Бортовой самописец.** При каждом замирании или ошибке на диск пишутся последние 30 с статистики: кадры, задержки, пути, без содержимого экрана и нажатий. При падении сохраняются минидамп и стек. Разработчику они отправляются только с согласия пользователя.
-- **Правила кода в духе Tiger Style:** память выделяется при старте, циклы и очереди ограничены, инварианты проверяются через assert, рекурсии нет. Всё, что разбирает данные из сети, собирается в ReleaseSafe, поэтому проверки границ и переполнений остаются и в релизе.
-- **Совместимость версий.** Новая версия работает с предыдущей (N−1), это проверяет CI. Обновление ставится только без активных сессий, атомарно и с автооткатом, если новая версия дважды не запустилась.
+**How we test:**
+- **Deterministic simulator**, as in TigerBeetle, the financial database in Zig that tests itself this way. Host, viewer and server run in one process with virtual time and a virtual network.
+  - Every run covers thousands of seeds with random losses, duplicates, reordering, path failures, clock jumps and agent process crashes.
+  - Invariants: no action is lost, duplicated or reordered; no keys stay held after a session; frames never go backwards; memory does not grow.
+  - A failing seed reproduces exactly.
+- **`zig build sim`** runs the same simulator with a synthetic screen (typing, scrolling, video, window dragging) and outputs p50/p95/p99 latency, bitrate and freezes. CI catches regressions by these numbers.
+- **Fuzzing** of all parsers with Zig's built-in fuzzer. Property tests for wrapping sequence-number arithmetic.
+- **Before every release**, a 72-hour run with random input, plus network impairment tests on real machines: dummynet on macOS, netem on Linux, clumsy on Windows.
+- **Flight recorder.** On every freeze or error, the last 30 s of statistics are written to disk: frames, latencies, paths, with no screen content or keystrokes. On a crash, a minidump and stack trace are saved. They are sent to the developer only with the user's consent.
+- **Coding rules in the spirit of Tiger Style:** memory is allocated at startup, loops and queues are bounded, invariants are checked with assert, no recursion. Everything that parses network data is built in ReleaseSafe, so bounds and overflow checks stay in release builds.
+- **Version compatibility.** A new version works with the previous one (N−1), and CI checks this. An update installs only when no session is active, atomically, with automatic rollback if the new version fails to start twice.
 
-## 8. Сервер `rdc-server`
+## 8. Server: `rdc-server`
 
-- **Один бинарник.** Статический бинарник для Linux (musl) около 2 МБ, конфиг в формате ZON, ставится на любой VPS. Свой сервер можно поднять где угодно; устройства регистрируются на нём только с ключом организации.
-- **Присутствие.** Устройства держат UDP-привязку к серверу и шлют keepalive раз в 25 с. 10 000 устройств дают около 400 пакетов в секунду.
-- **Встреча сторон.**
-  1. Зритель спрашивает у сервера ID.
-  2. Сервер отправляет обеим сторонам кандидатов (локальные, публичные, IPv6 адреса) и общий момент старта.
-  3. Стороны стучатся друг к другу одновременно; для симметричного NAT используется предсказание портов.
-  4. Если за ~1 с пробиться не удалось, сессия к этому моменту уже идёт через реле.
-- **Реле** пересылает зашифрованные датаграммы по токенам сессии (HMAC, срок действия, лимит полосы) и расшифровать их не может. Датаграммы обрабатываются пачками через recvmmsg/sendmmsg, нагрузка делится по ядрам через SO_REUSEPORT.
-- **Реестр «ID ↔ ключ»** — журнал на дозапись со снапшотом, без СУБД. Лимиты по IP и ID, cookie-ответ под нагрузкой (как в WireGuard), метрики для Prometheus.
+- **One binary.** A static Linux (musl) binary of about 2 MB with a ZON config; it runs on any VPS. You can run your own server anywhere; devices register on it only with the organization key.
+- **Presence.** Devices keep a UDP binding to the server and send a keepalive every 25 s. 10,000 devices produce about 400 packets per second.
+- **Rendezvous.**
+  1. The viewer looks up the ID on the server.
+  2. The server sends both sides the candidates (local, public and IPv6 addresses) and a common start time.
+  3. Both sides knock on each other at the same moment; port prediction is used for symmetric NAT.
+  4. If hole punching has not succeeded within ~1 s, the session is already running through the relay by then.
+- **The relay** forwards encrypted datagrams by session token (HMAC, expiry, bandwidth limit) and cannot decrypt them. Datagrams are processed in batches via recvmmsg/sendmmsg, and the load is spread across cores with SO_REUSEPORT.
+- **ID ↔ key registry**: an append-only log with snapshots, no DBMS. Limits per IP and ID, cookie replies under load (as in WireGuard), Prometheus metrics.
 
-## 9. Безопасность
+## 9. Security
 
-- **Ключи устройства** — X25519 для Noise и Ed25519 для подписей. Они создаются при первом запуске и хранятся в Keychain, DPAPI, Secret Service или Android Keystore.
-- **ID** — 9 цифр: 8 случайных и контрольная по алгоритму Дамма. Она ловит любую ошибку в одной цифре и перестановку соседних цифр. ID выдаёт сервер и привязывает к ключу устройства; можно задать псевдоним.
-- **Закрепление ключа.** Ключ хоста запоминается при первом подключении. Если он сменился, зритель громко предупреждает. В диалоге показан отпечаток ключа, чтобы его можно было сверить голосом.
-- **Три режима доступа:**
-  - по запросу — хост нажимает «Принять» и отмечает права: управление, буфер обмена, файлы, звук, перезагрузка;
-  - без присмотра — по паролю: на хосте хранится только хэш Argon2id, по желанию добавляется TOTP, после ошибок пауза перед новой попыткой растёт;
-  - доверенные устройства — вход по ключу без пароля, как `authorized_keys` в SSH. Удобно для своих компьютеров.
-- **Защита от телефонных мошенников.** Когда подключается незнакомец, по умолчанию включён осторожный профиль без передачи файлов, а хоста прямо спрашивают: «Вы знаете этого человека?». Затемнять экран хоста могут только доверенные устройства. Все сессии пишутся в журнал.
-- **Рамка «идёт сессия»** не попадает в захват (`SCContentFilter` на macOS, `WDA_EXCLUDEFROMCAPTURE` на Windows).
-- **Вся криптография** — из `std.crypto`: X25519, ChaCha20-Poly1305, BLAKE2s и BLAKE3, Ed25519, Argon2id, HMAC. OpenSSL и libsodium не нужны.
+- **Device keys**: X25519 for Noise and Ed25519 for signatures. They are generated on first launch and stored in Keychain, DPAPI, Secret Service or Android Keystore.
+- **ID**: 9 digits, 8 random plus a Damm check digit. It catches any single-digit error and any swap of adjacent digits. The server issues the ID and binds it to the device key; an alias can be set.
+- **Key pinning.** The host key is remembered on first connection. If it changes, the viewer warns loudly. The dialog shows the key fingerprint so it can be verified by voice.
+- **Three access modes:**
+  - on request: the person at the host clicks Accept and picks the permissions (control, clipboard, files, audio, reboot);
+  - unattended: by password; the host stores only an Argon2id hash, TOTP can be added, and the delay before another attempt grows after failures;
+  - trusted devices: key-based login without a password, like `authorized_keys` in SSH. Handy for your own computers.
+- **Protection against phone scammers.** When a stranger connects, a cautious profile without file transfer is on by default, and the person at the host is asked directly: "Do you know this person?" Only trusted devices can black out the host screen. All sessions are logged.
+- **The "session in progress" frame** is excluded from capture (`SCContentFilter` on macOS, `WDA_EXCLUDEFROMCAPTURE` on Windows).
+- **All cryptography** comes from `std.crypto`: X25519, ChaCha20-Poly1305, BLAKE2s and BLAKE3, Ed25519, Argon2id, HMAC. No OpenSSL or libsodium needed.
 
-## 10. Ввод
+## 10. Input
 
-- **Клавиши** передаются физическими кодами USB HID, одинаковыми на всех ОС, а раскладку применяет хост.
-- **Режим «текст» (Unicode)** — для случая, когда раскладки разные: печатаешь по-русски на Mac — на ПК приходит русский текст.
-- **Профили модификаторов:** при управлении Windows с Mac Cmd работает как Ctrl, и наоборот.
-- **Системные сочетания.** Cmd+Tab, Alt+Tab и Win перехватываются, пока окно сессии в фокусе. Для Ctrl+Alt+Del есть кнопка.
-- **Мышь и планшет.** Мышь работает в абсолютном и относительном режиме, прокрутка трекпада — плавная, в пикселях. Планшет передаёт нажим (для скульптинга в Blender), касания приходят с телефона и iPad.
+- **Keys** are sent as physical USB HID codes, identical on every OS, and the host applies the layout.
+- **Text mode (Unicode)** for when the layouts differ: type in Russian on a Mac, and Russian text arrives on the PC.
+- **Modifier profiles:** when controlling Windows from a Mac, Cmd works as Ctrl, and vice versa.
+- **System shortcuts.** Cmd+Tab, Alt+Tab and Win are intercepted while the session window has focus. Ctrl+Alt+Del has a button.
+- **Mouse and tablet.** The mouse works in absolute and relative modes; trackpad scrolling is smooth, in pixels. A tablet sends pressure (for sculpting in Blender); touches come from phones and iPads.
 
-## 11. Интерфейс
+## 11. Interface
 
-- **Свой UI.** Лёгкий immediate-mode UI рисуется тем же рендером, что и видео. Текст растрирует ОС (CoreText, DirectWrite, системный FreeType), так что шрифтов в бинарнике нет. Все иконки — в одной SDF-текстуре.
-- **Экраны:**
-  - главный: мой ID, поле «Подключиться», недавние подключения с миниатюрами, адресная книга;
-  - входящий запрос;
-  - тонкая панель сессии: монитор, качество, только просмотр, Ctrl+Alt+Del, файлы, чат, запись, полный экран, отключение;
-  - настройки и значок в трее и строке меню.
-- **Оверлей статистики:** fps, битрейт, RTT, потери, текущий путь (LAN, P2P или реле), кодек и задержка каждого этапа.
-- **Языки и тема.** Русский и английский с первого дня, тема — по системе. На мобильных — родные оболочки на SwiftUI и Kotlin поверх `librdc`.
+- **Custom UI.** A lightweight immediate-mode UI is drawn by the same renderer as the video. The OS rasterizes text (CoreText, DirectWrite, system FreeType), so the binary carries no fonts. All icons are in one SDF texture.
+- **Screens:**
+  - main: my ID, a Connect field, recent connections with thumbnails, address book;
+  - incoming request;
+  - a slim session bar: monitor, quality, view only, Ctrl+Alt+Del, files, chat, recording, full screen, disconnect;
+  - settings and an icon in the tray and menu bar.
+- **Stats overlay:** fps, bitrate, RTT, loss, current path (LAN, P2P or relay), codec and the latency of each stage.
+- **Language and theme.** The UI is English only; the theme follows the system. On mobile: native SwiftUI and Kotlin shells on top of `librdc`.
 
-## 12. Особенности платформ
+## 12. Platform specifics
 
 **macOS**
-- Нужны права «Запись экрана» и «Универсальный доступ» (для ввода). В новых macOS есть ещё отдельная категория «Удалённый рабочий стол». Экран-помощник проверяет права и ведёт в нужный раздел настроек.
-- Экран входа поддерживаем так, как советует Apple:
-  - демон держит сеть;
-  - агент с `LimitLoadToSessionType = [Aqua, LoginWindow]` занимается захватом и вводом;
-  - оба регистрируются через SMAppService.
-- ScreenCaptureKit в сессии LoginWindow работает с macOS 14.4 — отсюда минимальная версия.
-- Для разработки нужен постоянный самоподписанный сертификат, иначе права TCC слетают при каждой пересборке. Для распространения — Developer ID, нотаризация и entitlement Persistent Content Capture (его выдают по заявке для VNC-подобных приложений).
-- Xcode не нужен: хватает SDK из Command Line Tools, а шейдеры Metal компилируются при запуске.
+- Requires the Screen Recording and Accessibility (for input) permissions. Newer macOS versions also have a separate Remote Desktop category. A helper screen checks the permissions and opens the right section of System Settings.
+- The login screen is supported the way Apple recommends:
+  - a daemon holds the network;
+  - an agent process with `LimitLoadToSessionType = [Aqua, LoginWindow]` handles capture and input;
+  - both are registered via SMAppService.
+- ScreenCaptureKit works in the LoginWindow session since macOS 14.4, hence the minimum version.
+- Development needs a persistent self-signed certificate, otherwise TCC permissions reset on every rebuild. Distribution needs a Developer ID, notarization and the Persistent Content Capture entitlement (granted on request for VNC-like apps).
+- No Xcode needed: the Command Line Tools SDK is enough, and Metal shaders are compiled at launch.
 
 **Windows**
-- `rdc.exe` работает в трёх ролях:
-  - обычный запуск — интерфейс;
-  - `--service` — служба LocalSystem: держит сетевую сессию и регистрацию, запускает агент в активной сессии, отправляет Ctrl+Alt+Del через SendSAS;
-  - `--agent` — агент с токеном SYSTEM в сессии пользователя: захват, кодирование, ввод, звук, переход на защищённый рабочий стол (UAC, экран блокировки).
-- Без установки приложение работает в портативном режиме; установка добавляет службу.
-- DLL драйверов для NVENC, AMF и QSV загружаются во время работы, поэтому при сборке зависимостей нет.
-- Декодирование — через Media Foundation в режиме низкой задержки, на текстурах D3D11. Шейдеры компилируются системным `d3dcompiler_47.dll`.
-- Бинарник подписывается Authenticode.
+- `rdc.exe` runs in three roles:
+  - normal launch: the UI;
+  - `--service`: a LocalSystem service that holds the network session and registration, starts the agent process in the active session and sends Ctrl+Alt+Del via SendSAS;
+  - `--agent`: the agent process with a SYSTEM token in the user's session; it handles capture, encoding, input, audio and switching to the secure desktop (UAC, lock screen).
+- Without installation the app runs in portable mode; installing adds the service.
+- Driver DLLs for NVENC, AMF and QSV are loaded at runtime, so there are no build-time dependencies.
+- Decoding goes through Media Foundation in low-latency mode, on D3D11 textures. Shaders are compiled by the system `d3dcompiler_47.dll`.
+- The binary is Authenticode-signed.
 
 **Linux**
-- На X11 — XShm, XDamage, XFixes и XTest.
-- На Wayland — портал ScreenCast + RemoteDesktop, ввод через libei (`ConnectToEIS`). Restore token сохраняется, чтобы не спрашивать разрешение каждый раз.
-- Служба без присмотра вводит события через uinput.
-- Все системные библиотеки (X11, Wayland, PipeWire, VAAPI, EGL, FreeType) подключаются через dlopen. Цель сборки — `x86_64-linux-gnu.2.28`: бинарник собирается на Mac и запускается на дистрибутивах примерно с 2018 года.
+- X11: XShm, XDamage, XFixes and XTest.
+- Wayland: the ScreenCast + RemoteDesktop portal, input via libei (`ConnectToEIS`). The restore token is saved so permission is not requested every time.
+- The unattended service injects events through uinput.
+- All system libraries (X11, Wayland, PipeWire, VAAPI, EGL, FreeType) are loaded with dlopen. The build target is `x86_64-linux-gnu.2.28`: the binary is built on a Mac and runs on distributions from about 2018 onward.
 
 **Android**
-- Захват — MediaProjection; согласие нужно на каждую сессию (правило Android 14+).
-- Ввод — через AccessibilityService, звук — через AudioPlaybackCapture.
-- Ядро собирается Zig с NDK.
+- Capture: MediaProjection; consent is required for every session (an Android 14+ rule).
+- Input via AccessibilityService, audio via AudioPlaybackCapture.
+- The core is built by Zig with the NDK.
 
 **iOS / iPadOS**
-- Устройство работает зрителем. Свой экран можно только показать, через ReplayKit; ядро укладывается в лимит памяти расширения (~50 МБ).
-- Для сборки нужен полный Xcode.
+- The device works as a viewer. It can only share its own screen, via ReplayKit; the core fits within the extension memory limit (~50 MB).
+- Building requires full Xcode.
 
-## 13. Сборка
+## 13. Build
 
-- **Версия Zig.** Zig 0.17.1 (вышел 2 ноября 2026), версия закреплена в `build.zig.zon`.
-- **Все десктопные сборки — с одного Mac одной командой:** macOS (universal), Windows x64 и arm64 (через mingw, без MSVC и VC++ Redistributable), Linux x64 и arm64 и сервер. iOS собирается с Xcode, Android — с NDK.
-- **Режимы оптимизации по частям:**
-  - горячие медиа-циклы — ReleaseFast; для x86 — в двух вариантах, x86-64-v2 и AVX2, с выбором по CPUID;
-  - сеть и сессия — ReleaseSafe;
-  - остальное — ReleaseSmall.
-- **SIMD через `@Vector`:** хэши тайлов, сравнение, палитры, цветопреобразование.
-- **Зависимости.** Из C-зависимостей только opus и zstd — Zig собирает их сам из исходников. Заголовки NVENC, AMF и VPL лежат в репозитории. Ни Qt, ни Flutter, ни Electron, ни protobuf, ни OpenSSL.
-- **Заголовки ОС** подключаются через translate-c в `build.zig`. Код на Objective-C — тонкие шимы `.m`, их компилирует тот же Zig.
-- **Самопроверка.** `rdc --selftest` на любой машине показывает, что умеют захват, энкодеры и декодеры, и задержку каждого этапа. В отладочных сборках есть профилировщик Tracy. CI собирает и тестирует на трёх ОС.
-- **Тестовые машины.** Linux — в виртуальной машине (UTM, arm64), Windows — на отдельном ПК, при желании по SSH.
+- **Zig version.** Zig 0.17.1 (released 2 November 2026), pinned in `build.zig.zon`.
+- **All desktop builds from one Mac with one command:** macOS (universal), Windows x64 and arm64 (via mingw, without MSVC or the VC++ Redistributable), Linux x64 and arm64, and the server. iOS is built with Xcode, Android with the NDK.
+- **Optimization modes by part:**
+  - hot media loops: ReleaseFast; on x86 in two variants, x86-64-v2 and AVX2, selected by CPUID;
+  - network and session: ReleaseSafe;
+  - everything else: ReleaseSmall.
+- **SIMD via `@Vector`:** tile hashes, comparison, palettes, color conversion.
+- **Dependencies.** The only C dependencies are opus and zstd, which Zig builds from source itself. NVENC, AMF and VPL headers live in the repository. No Qt, Flutter, Electron, protobuf or OpenSSL.
+- **OS headers** are imported through translate-c in `build.zig`. Objective-C code is thin `.m` shims compiled by the same Zig.
+- **Self-test.** `rdc --selftest` on any machine shows what capture, the encoders and the decoders can do, and the latency of each stage. Debug builds include the Tracy profiler. CI builds and tests on three OSes.
+- **Test machines.** Linux in a virtual machine (UTM, arm64), Windows on a separate PC, optionally over SSH.
 
-## 14. Этапы
+## 14. Stages
 
-Шаги маленькие и проверяемые. После каждого — короткий отчёт и выбор следующего.
+Steps are small and verifiable. Each one ends with a short report and a choice of the next one.
 
-0. **Фундамент**
-   - Репозиторий, Zig 0.17.1, `build.zig` со всеми целями, CI.
-   - Контракты платформы с пустыми бэкендами для трёх десктопных ОС.
-   - Ядро: время, пулы, кольца, лог, конфиг, сообщения с comptime-сериализацией, Noise IK.
-   - Детерминированный симулятор с внедрением сбоев.
+0. **Foundation**
+   - Repository, Zig 0.17.1, `build.zig` with all targets, CI.
+   - Platform contracts with stub backends for the three desktop OSes.
+   - Core: time, pools, rings, logging, config, messages with comptime serialization, Noise IK.
+   - Deterministic simulator with fault injection.
 
-   Готово, когда `zig build test` зелёный, а собранный на Mac `.exe` запускается на Windows и печатает отпечаток ключа.
+   Done when `zig build test` is green and an `.exe` built on the Mac runs on Windows and prints the key fingerprint.
 
-1. **Картинка на трёх ОС**
-   - macOS: ScreenCaptureKit → VideoToolbox → UDP → VideoToolbox → Metal, оверлей статистики, проверка по петле на одном Mac.
-   - Windows: DXGI → NVENC или Media Foundation → D3D11.
-   - Linux: X11 → VAAPI или тайловый кодек → GLES.
+1. **Picture on three OSes**
+   - macOS: ScreenCaptureKit → VideoToolbox → UDP → VideoToolbox → Metal, stats overlay, loopback test on one Mac.
+   - Windows: DXGI → NVENC or Media Foundation → D3D11.
+   - Linux: X11 → VAAPI or tile codec → GLES.
 
-   Готово, когда любая пара ОС показывает экран друг друга по IP в LAN в 1440p60 с задержкой ≤ 16 мс p50 по встроенному замеру, а в покое не идёт ни одного пакета.
+   Done when any pair of OSes shows each other's screens by IP on a LAN at 1440p60 with ≤ 16 ms p50 latency by the built-in measurement, and not a single packet is sent while idle.
 
-2. **Управление**
-   - Ввод по HID-кодам на всех ОС: журнал действий, воспроизведение с исходными интервалами, сверка зажатых клавиш.
-   - Режим «текст», профили модификаторов, системные сочетания, относительная мышь.
-   - Курсор отдельным слоем, буфер обмена, обнаружение в LAN.
+2. **Control**
+   - HID-code input on all OSes: input journal, replay with original timing, held-key reconciliation.
+   - Text mode, modifier profiles, system shortcuts, relative mouse.
+   - Cursor as a separate layer, clipboard, LAN discovery.
 
-   Готово, когда:
-   - с Mac удобно работать на Windows-ПК в Blender и Godot, и наоборот;
-   - в симуляторе с RTT 30 мс и 1 % потерь ощущение не меняется;
-   - на 10 000 сидов нет ни одного потерянного или задвоенного действия.
+   Done when:
+   - working in Blender and Godot on a Windows PC from a Mac is comfortable, and vice versa;
+   - with 30 ms RTT and 1% loss in the simulator, it feels the same;
+   - across 10,000 seeds, not a single action is lost or duplicated.
 
-3. **Интернет**
-   - `rdc-server` на VPS.
-   - Пробивка NAT, реле по UDP и TCP/443, переход с реле на прямой путь, запасной путь наготове, переподключение по билету.
-   - Контроль перегрузки, пейсер, адаптивный FEC, восстановление через LTR/RFI.
-   - Диалог входящего запроса с правами, закрепление ключей.
+3. **Internet**
+   - `rdc-server` on a VPS.
+   - NAT traversal, relay over UDP and TCP/443, upgrade from the relay to the direct path, hot standby path, ticket-based reconnect.
+   - Congestion control, pacer, adaptive FEC, recovery via LTR/RFI.
+   - Incoming request dialog with permissions, key pinning.
 
-   Готово, когда:
-   - Mac через мобильный интернет управляет домашним ПК, подключение занимает ≤ 1 с;
-   - если выключить Wi-Fi и раздать интернет с телефона, сессия продолжается через ≤ 1 с;
-   - в симуляторе (5 Мбит/с, 80 мс, 2 % потерь) нет замираний дольше 200 мс.
+   Done when:
+   - a Mac on mobile internet controls a home PC, and connecting takes ≤ 1 s;
+   - after switching from Wi-Fi to a phone hotspot, the session continues within ≤ 1 s;
+   - in the simulator (5 Mbps, 80 ms, 2% loss) there are no freezes longer than 200 ms.
 
-4. **Продукт**
-   - Весь UI: главный экран, адресная книга, панель сессии, настройки, трей, RU/EN.
-   - Доступ без присмотра, доверенные устройства, журнал, рамка сессии.
-   - Служба и агент на всех трёх ОС (UAC, блокировка, экран входа, Wayland-портал), сторожа, откат на запасные кодеки, самописец.
-   - Подпись, нотаризация, пакеты, самообновление с подписью Ed25519 и автооткатом.
+4. **Product**
+   - The whole UI: main screen, address book, session bar, settings, tray.
+   - Unattended access, trusted devices, session log, session frame.
+   - Service and agent process on all three OSes (UAC, lock screen, login screen, Wayland portal), watchdogs, codec fallbacks, flight recorder.
+   - Signing, notarization, packages, self-update with an Ed25519 signature and automatic rollback.
 
-   Готово, когда:
-   - человек без навыков ставит программу, диктует ID и принимает подключение;
-   - доступ без присмотра переживает перезагрузку и экран блокировки;
-   - за 72 часа память не растёт;
-   - убитый агент и сброс драйвера GPU дают паузу ≤ 2 с без обрыва.
+   Done when:
+   - a non-technical person installs the app, reads out the ID and accepts the connection;
+   - unattended access survives a reboot and the lock screen;
+   - memory does not grow over 72 hours;
+   - a killed agent process or a GPU driver reset causes a pause of ≤ 2 s without a disconnect.
 
-5. **Чёткость и возможности**
-   - Доводка без потерь, кэш тайлов, move rects; энкодеры AMF и QSV.
-   - Звук (Opus), файлы (drag-and-drop, докачка), несколько мониторов, чат.
-   - Запись сессии: на диск пишется уже сжатый поток, поэтому почти бесплатно.
+5. **Sharpness and features**
+   - Lossless refinement, tile cache, move rects; AMF and QSV encoders.
+   - Audio (Opus), files (drag-and-drop, resume), multiple monitors, chat.
+   - Session recording: the already compressed stream is written to disk, so it is almost free.
 
-   Готово, когда:
-   - текст в IDE становится пиксель-в-пиксель после ≤ 150 мс покоя;
-   - прокрутка длинного документа занимает ≤ 30 % битрейта по сравнению с режимом без кэша;
-   - файл 1 ГБ в LAN передаётся на скорости сети.
+   Done when:
+   - text in an IDE becomes pixel-perfect after ≤ 150 ms of idle;
+   - scrolling a long document takes ≤ 30% of the bitrate it takes without the cache;
+   - a 1 GB file transfers over a LAN at network speed.
 
-6. **Мобильные и веб**
-   - Android — зритель и хост.
-   - iOS/iPadOS — зритель и показ своего экрана.
-   - Веб-зритель: ядро в wasm, WebCodecs, WebSocket через реле.
+6. **Mobile and web**
+   - Android: viewer and host.
+   - iOS/iPadOS: viewer and screen sharing.
+   - Web viewer: core in wasm, WebCodecs, WebSocket through the relay.
 
-   Готово, когда с телефона можно управлять ПК, а экран Android-телефона можно показать и дать им управлять.
+   Done when a phone can control a PC, and an Android phone can share its screen and be controlled.
 
-7. **Дальше**
-   - Виртуальный монитор для ПК без экрана.
-   - Wayland без присмотра (через API GNOME и KDE).
-   - Туннели TCP-портов, Wake-on-LAN.
-   - Адресная книга со сквозным шифрованием, несколько серверов.
+7. **Later**
+   - Virtual monitor for PCs without a display.
+   - Unattended Wayland (via GNOME and KDE APIs).
+   - TCP port tunnels, Wake-on-LAN.
+   - End-to-end encrypted address book, multiple servers.
 
-## 15. Решения
+## 15. Decisions
 
-- Название — RDC (Remote Desktop Control).
-- Репозиторий публичный, на GitHub.
-- Лицензия — Apache-2.0.
-- Свой сервер на VPS и свой протокол.
-- Разработка начинается на macOS, контракты платформы сразу рассчитаны на все ОС.
-- Подключение — по ссылке, по коду и через Steam (тест на Spacewar, AppID 480); доступ из браузера.
-- Обновления — сами из релизов GitHub, манифест подписан Ed25519; релизы собирает GitHub Actions под все ОС.
+- Name: RDC (Remote Desktop Control).
+- The repository is public, on GitHub.
+- License: Apache-2.0.
+- No servers of our own: direct connections and free public infrastructure; our own protocol.
+- Main focus: RDC as a tool for AI agents that see and control other devices.
+- Agent mode as a plugin for Claude and for ChatGPT/Codex: the `rdc mcp` MCP server and a skill.
+- The Claude plugin ships the binary as an MCP bundle (`rdc-mcp.mcpb`, a release asset); the Codex plugin launches an installed RDC through `plugins/rdc/scripts/rdc-mcp`.
+- Screenshots for agents are JPEG, at most 1280×800, so the model sees them at 1:1 and reads exact coordinates.
+- Development starts on macOS; platform contracts are designed for all OSes from the start.
+- Connection by link, by code and through Steam (tested on Spacewar, AppID 480); access from a browser.
+- Updates install themselves from GitHub Releases, with an Ed25519-signed manifest; GitHub Actions builds releases for all OSes.
+- Everything in the repository is in English: code and comments, docs, UI, commit messages, release notes.
 
-## 16. Вехи
+## 16. Milestones
 
-Веха — то, что можно запустить и увидеть. Этапы из раздела 14 остаются полным объёмом работ, а вехи задают порядок показа.
+A milestone is something you can run and see. The stages in section 14 remain the full scope of work; milestones set the order in which results are shown.
 
-| Веха | Что видно | Готово, когда |
+| Milestone | What you see | Done when |
 |---|---|---|
-| M1 «Первый показ» | RDC.app на Mac показывает код и ссылку; по ним в браузере — экран Mac вживую, с мышью и клавиатурой | ссылка открывается на этом Mac, на ПК и на телефоне в той же сети; H.264 через WebCodecs, где браузер его даёт, иначе JPEG |
-| M2 «Свой клиент» | нативный зритель RDC на macOS | подключение по коду в LAN, транспорт UDP + Noise, задержка ≤ 16 мс p50 |
-| M3 «Windows» | RDC на ПК: хост и зритель | Mac управляет ПК, и наоборот |
-| M4 «Steam» | подключение через Steam: друзья, приглашения, реле Valve (SDR) | два компьютера с RDC соединяются по SteamID через Steam Networking Sockets на Spacewar (AppID 480); затем свой AppID и страница в Steam |
-| M5 «Отовсюду» | подключение по коду и ссылке из любой сети, браузер — через сервер | rdc-server на VPS: ID, пробивка NAT, реле; веб-зритель по HTTPS/WSS |
+| M1 "First demo" | RDC.app on a Mac shows a code and a link; with them, a browser shows the Mac's screen live, with mouse and keyboard | the link opens on this Mac, on a PC and on a phone on the same network; H.264 via WebCodecs where the browser supports it, JPEG otherwise |
+| M2 "Native client" | a native RDC viewer on macOS | connection by code on a LAN, UDP + Noise transport, latency ≤ 16 ms p50 |
+| M3 "Windows" | RDC on a PC: host and viewer | a Mac controls a PC, and vice versa |
+| M4 "Steam" | connecting through Steam: friends, invites, Valve relays (SDR) | two computers with RDC connect by SteamID through Steam Networking Sockets on Spacewar (AppID 480); then our own AppID and a Steam page |
+| M5 "Anywhere" | connection by code and link from any network, without servers of our own | NAT traversal, peer discovery and the fallback path go through free public infrastructure; the browser connects via WebRTC |
 
-Для M4 нужен Steamworks SDK: его скачивают с partner.steamgames.com в `third_party/steamworks/`, в репозиторий он не попадает.
+M4 needs the Steamworks SDK: it is downloaded from partner.steamgames.com into `third_party/steamworks/` and is not committed to the repository.
 
-## Ссылки
+## 17. Scenarios
 
-- [Zig: список релизов](https://ziglang.org/download/index.json)
-- [Вышел Zig 0.16: I/O как интерфейс](https://tproger.ru/news/vywel-zig-0-16-di-v-main-i-o-kak-interfejs-i-async-bez-raskra)
-- [Zig 0.17: переработанная система сборки](https://linuxiac.com/zig-0-17-programming-language-lands-with-reworked-build-system/)
-- [Apple DTS: захват экрана входа через агент в LoginWindow](https://developer.apple.com/forums/thread/814152)
-- [Entitlement Persistent Content Capture](https://developer.apple.com/forums/thread/761641)
-- [Разрешение «Remote Desktop» в новых macOS](https://developer.apple.com/forums/thread/841530)
+1. **At home, on the same network.** Works today. You open the link from the RDC window. The computer serves the page itself; GitHub Pages is not needed.
+2. **Away from home, from a phone.** Planned. RDC is running on the computer. You open https://anods.github.io/RDC/#123456789: the page comes from GitHub Pages, finds the computer through public relays and connects to it directly (WebRTC). Nothing needs to be installed on the phone.
+3. **An AI agent on your computer (Claude Code, Codex, Claude Desktop).** Works since 0.3.0. You install the RDC plugin (`plugins/rdc`: a Claude Code plugin, a portable Agent Plugin for Codex, and the `rdc-mcp.mcpb` bundle for Claude Desktop), and through `rdc mcp` the agent connects by link or code to any device running RDC. The agent gets `connect`, `screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `devices`, `disconnect`; every action answers with a fresh screenshot. GitHub Pages is not involved.
+4. **An AI agent in the cloud (claude.ai, ChatGPT in a browser).** Works since 0.3.0. `rdc mcp --http --tunnel` serves Streamable HTTP on this computer, opens a Cloudflare quick tunnel and logs a URL with a secret path; that URL is added as a connector. Without `cloudflared`, any tunnel to `127.0.0.1:7710` does.
+5. **Supervising an agent.** Works since 0.3.0. The RDC window shows "AI agent <name>" and its Disconnect button becomes **Stop AI agent**; a browser viewer on the same link shows a red banner with a Stop button. Stop disconnects the AI agents and keeps the people connected.
+
+GitHub Pages publishes the `web/` folder at https://anods.github.io/RDC/ (`.github/workflows/pages.yml`; enabled once in Settings → Pages → Source: GitHub Actions). The page can reach computers only once RDC has WebRTC.
+
+The MCP server (`src/agent/mcp.zig`) speaks both protocol eras: the `initialize` handshake of 2025-11-25 and earlier, and the per-request `_meta` of 2026-07-28 with `server/discover`. Over HTTP it validates the `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers and checks the `Origin` header when there is no token.
+
+## Links
+
+- [Zig: release list](https://ziglang.org/download/index.json)
+- [Zig 0.16 released: I/O as an interface](https://tproger.ru/news/vywel-zig-0-16-di-v-main-i-o-kak-interfejs-i-async-bez-raskra)
+- [Zig 0.17: reworked build system](https://linuxiac.com/zig-0-17-programming-language-lands-with-reworked-build-system/)
+- [Apple DTS: capturing the login screen with an agent in LoginWindow](https://developer.apple.com/forums/thread/814152)
+- [Persistent Content Capture entitlement](https://developer.apple.com/forums/thread/761641)
+- [The "Remote Desktop" permission in newer macOS](https://developer.apple.com/forums/thread/841530)
 - [xdg-desktop-portal: RemoteDesktop](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html)
 - [Steamworks: ISteamNetworkingSockets](https://partner.steamgames.com/doc/api/ISteamNetworkingSockets)

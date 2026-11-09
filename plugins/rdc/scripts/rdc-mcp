@@ -1,0 +1,38 @@
+#!/bin/sh
+# Starts the RDC MCP server (`rdc mcp`) for plugins that launch a local stdio server.
+# Finds an installed RDC; if there is none, downloads the release bundle once into the
+# plugin's data directory. All messages go to stderr: stdout belongs to the protocol.
+set -eu
+
+repo="ANODs/RDC"
+data="${PLUGIN_DATA:-${CLAUDE_PLUGIN_DATA:-${XDG_CACHE_HOME:-$HOME/.cache}/rdc-plugin}}"
+
+run() { exec "$1" "$@"; }
+
+if [ -n "${RDC_BIN:-}" ] && [ -x "$RDC_BIN" ]; then exec "$RDC_BIN" "$@"; fi
+if command -v rdc >/dev/null 2>&1; then exec rdc "$@"; fi
+for app in "/Applications/RDC.app" "$HOME/Applications/RDC.app"; do
+  if [ -x "$app/Contents/MacOS/rdc" ]; then exec "$app/Contents/MacOS/rdc" "$@"; fi
+done
+if [ -x "$data/server/rdc" ]; then exec "$data/server/rdc" "$@"; fi
+
+case "$(uname -s)" in
+  Darwin) ;;
+  *) echo "rdc-mcp: no RDC binary found. Install RDC from https://github.com/$repo/releases, or set RDC_BIN to the rdc executable." >&2; exit 1 ;;
+esac
+
+echo "rdc-mcp: RDC is not installed — downloading the MCP bundle from GitHub releases…" >&2
+mkdir -p "$data"
+url="https://github.com/$repo/releases/latest/download/rdc-mcp.mcpb"
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL "$url" -o "$data/rdc-mcp.mcpb"
+else
+  echo "rdc-mcp: curl is needed to download $url" >&2; exit 1
+fi
+if command -v unzip >/dev/null 2>&1; then
+  unzip -oq "$data/rdc-mcp.mcpb" "server/rdc" -d "$data"
+else
+  ditto -x -k "$data/rdc-mcp.mcpb" "$data"
+fi
+chmod +x "$data/server/rdc"
+exec "$data/server/rdc" "$@"

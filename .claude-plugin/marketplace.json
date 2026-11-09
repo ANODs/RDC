@@ -1,0 +1,14 @@
+{
+  "name": "rdc",
+  "owner": { "name": "Timoshkin Timofey", "url": "https://github.com/ANODs" },
+  "description": "RDC — remote desktop for people and AI agents.",
+  "plugins": [
+    {
+      "name": "rdc",
+      "source": "./plugins/rdc",
+      "description": "See and control other computers that run RDC: connect by link or code, then work from screenshots with the mouse and keyboard.",
+      "category": "productivity",
+      "tags": ["remote-desktop", "computer-use", "mcp"]
+    }
+  ]
+}

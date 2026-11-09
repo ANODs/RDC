@@ -1,19 +1,19 @@
-//! Инструмент релизов RDC: ключ подписи обновлений и подписанный манифест.
+//! RDC release tool: the update signing key and the signed manifest.
 //!
-//!   zig run tools/release.zig -- keygen <файл-секрета>
-//!   zig run tools/release.zig -- manifest <версия> <папка-вывода> <заметки.md|-> <платформа>=<архив> ...
+//!   zig run tools/release.zig -- keygen <secret-file>
+//!   zig run tools/release.zig -- manifest <version> <output-dir> <notes.md|-> <platform>=<archive> ...
 //!
-//! Секрет берётся из переменной RDC_UPDATE_KEY (hex, 128 знаков) или из файла
-//! ~/.config/rdc/update-signing.key. Открытый ключ вшит в RDC (src/core/update_key.zig):
-//! RDC ставит обновление, только если подпись latest.json сошлась с ним.
+//! The secret comes from the RDC_UPDATE_KEY variable (hex, 128 characters) or the file
+//! ~/.config/rdc/update-signing.key. The public key is built into RDC (src/core/update_key.zig):
+//! RDC installs an update only if the latest.json signature matches it.
 const std = @import("std");
 const Ed25519 = std.crypto.sign.Ed25519;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const usage =
-    \\использование:
-    \\  release keygen <файл-секрета>
-    \\  release manifest <версия> <папка-вывода> <заметки.md|-> <платформа>=<архив> ...
+    \\usage:
+    \\  release keygen <secret-file>
+    \\  release manifest <version> <output-dir> <notes.md|-> <platform>=<archive> ...
     \\
 ;
 
@@ -42,22 +42,22 @@ fn keygen(io: std.Io, path: []const u8) !void {
         .sub_path = path,
         .data = &(secret ++ [_]u8{'\n'}),
         .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) },
-    }) catch |err| return fail("не записать {s}: {t} (ключ уже есть?)\n", .{ path, err });
+    }) catch |err| return fail("cannot write {s}: {t} (key already exists?)\n", .{ path, err });
     const public = std.fmt.bytesToHex(kp.public_key.toBytes(), .lower);
-    std.debug.print("секрет: {s}\nоткрытый ключ: {s}\n", .{ path, &public });
+    std.debug.print("secret: {s}\npublic key: {s}\n", .{ path, &public });
 }
 
 fn loadKey(io: std.Io, arena: std.mem.Allocator, env: *std.process.Environ.Map) !Ed25519.KeyPair {
     var text: []const u8 = env.get("RDC_UPDATE_KEY") orelse "";
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
-        const home = env.get("HOME") orelse return fail("нет HOME и RDC_UPDATE_KEY\n", .{});
+        const home = env.get("HOME") orelse return fail("no HOME and no RDC_UPDATE_KEY\n", .{});
         const path = try std.fs.path.join(arena, &.{ home, ".config/rdc/update-signing.key" });
         text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024)) catch |err|
-            return fail("нет ключа подписи: {s} ({t}) и RDC_UPDATE_KEY пуст\n", .{ path, err });
+            return fail("no signing key: {s} ({t}) and RDC_UPDATE_KEY is empty\n", .{ path, err });
     }
     var bytes: [Ed25519.SecretKey.encoded_length]u8 = undefined;
-    const decoded = std.fmt.hexToBytes(&bytes, std.mem.trim(u8, text, " \t\r\n")) catch return fail("ключ подписи — не hex\n", .{});
-    if (decoded.len != bytes.len) return fail("ключ подписи — не 64 байта\n", .{});
+    const decoded = std.fmt.hexToBytes(&bytes, std.mem.trim(u8, text, " \t\r\n")) catch return fail("signing key is not hex\n", .{});
+    if (decoded.len != bytes.len) return fail("signing key is not 64 bytes\n", .{});
     return Ed25519.KeyPair.fromSecretKey(try Ed25519.SecretKey.fromBytes(bytes));
 }
 
@@ -96,10 +96,10 @@ fn manifest(
     try json.appendSlice(arena, ",\n  \"assets\": [");
 
     for (assets, 0..) |spec, i| {
-        const eq = std.mem.indexOfScalar(u8, spec, '=') orelse return fail("ожидалось платформа=архив: {s}\n", .{spec});
+        const eq = std.mem.indexOfScalar(u8, spec, '=') orelse return fail("expected platform=archive: {s}\n", .{spec});
         const platform = spec[0..eq];
         const path = spec[eq + 1 ..];
-        const data = cwd.readFileAlloc(io, path, arena, .limited(512 * 1024 * 1024)) catch |err| return fail("не прочитать {s}: {t}\n", .{ path, err });
+        const data = cwd.readFileAlloc(io, path, arena, .limited(512 * 1024 * 1024)) catch |err| return fail("cannot read {s}: {t}\n", .{ path, err });
         var digest: [Sha256.digest_length]u8 = undefined;
         Sha256.hash(data, &digest, .{});
         const name = std.fs.path.basename(path);
@@ -111,7 +111,7 @@ fn manifest(
         try json.appendSlice(arena, ", \"file\": ");
         try appendJsonString(&json, arena, name);
         try json.print(arena, ", \"size\": {d}, \"sha256\": \"{s}\"}}", .{ data.len, &std.fmt.bytesToHex(digest, .lower) });
-        std.debug.print("{s}: {s} ({d} Б)\n", .{ platform, name, data.len });
+        std.debug.print("{s}: {s} ({d} bytes)\n", .{ platform, name, data.len });
     }
     try json.appendSlice(arena, "\n  ]\n}\n");
 
@@ -122,5 +122,5 @@ fn manifest(
     try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ out_dir, "latest.json" }), .data = json.items });
     try cwd.writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ out_dir, "latest.json.sig" }), .data = try std.mem.concat(arena, u8, &.{ sig_text, "\n" }) });
     const public = std.fmt.bytesToHex(kp.public_key.toBytes(), .lower);
-    std.debug.print("latest.json подписан ключом {s}\n", .{&public});
+    std.debug.print("latest.json signed with key {s}\n", .{&public});
 }

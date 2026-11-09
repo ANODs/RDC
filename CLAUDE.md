@@ -1,29 +1,34 @@
 # RDC — Remote Desktop Control
 
-Кроссплатформенный удалённый рабочий стол на Zig: macOS, Windows, Linux, затем Android, iOS и веб. С пользователем говорить по-русски.
+A cross-platform remote desktop in Zig: macOS, Windows, Linux, then Android, iOS and the web. Talk to the user in Russian. Everything in the repository — code, comments, docs, UI, commit messages and release notes — is in English.
 
-## Где что
-- `docs/PLAN.md` — цели, архитектура, протокол, стабильность и этапы с критериями готовности.
-- Текущая веха — M1 «Первый показ» (`docs/PLAN.md`, раздел 16): хост на macOS, зритель в браузере.
+## Where things are
+- `docs/PLAN.md` — goals, architecture, protocol, stability, and stages with acceptance criteria; section 17 — the usage scenarios and which of them work.
+- Current milestone — M3 "Windows" (`docs/PLAN.md`, section 16): a host on the PC; the Mac and the PC control each other through a browser. The product's main focus is AI agents that control other devices.
+- `src/agent/` — the agent side: `client.zig` (a viewer connection to a host: frames in, input out), `keys.zig` (key names → HID codes), `tools.zig` (the MCP tools and their descriptions), `mcp.zig` (JSON-RPC over stdio and Streamable HTTP, both protocol eras). `plugins/rdc/` — one plugin directory for Claude Code (`.claude-plugin/plugin.json` → the `rdc-mcp.mcpb` release asset), for Codex and other Agent Plugins clients (`plugin.json`, `mcp.json` → `scripts/rdc-mcp`), with the shared skill `skills/rdc/SKILL.md`. Marketplaces: `.claude-plugin/marketplace.json`, `.agents/plugins/marketplace.json`. `mcpb/manifest.json` + `tools/make_mcpb.sh` build the bundle.
 
-## Сборка
-`ZIG=~/Applications/zig-0.17.1/zig`, команды из корня проекта:
-- `"$ZIG" build test` — тесты чистых модулей (`src/tests.zig`)
-- `"$ZIG" build app -Doptimize=ReleaseSafe` — `zig-out/RDC.app`; `run-app` — собрать и открыть
-- `zig-out/bin/rdc host --no-ui` — хост без окна, код и ссылка в журнале `~/Library/Logs/RDC/rdc.log`
-- `open -n zig-out/RDC.app --args --web-dir "$PWD/web"` — зритель берётся из `web/` без пересборки; `--update-url URL` — обновления из URL вместо GitHub (для проверки)
-- Подпись ad-hoc с требованием `identifier "com.anods.rdc"`: права macOS («Запись экрана», «Универсальный доступ») переживают пересборки и обновления. Если права «застряли» — `tccutil reset ScreenCapture com.anods.rdc` и `tccutil reset Accessibility com.anods.rdc` (запускает пользователь).
-- Установленный RDC — `~/Applications/RDC.app`, он обновляется сам; сборки из `zig-out` сами не обновляются.
+## Build
+`ZIG=~/Applications/zig-0.17.1/zig`; run commands from the project root:
+- `"$ZIG" build test` — tests of the pure modules (`src/tests.zig`)
+- `"$ZIG" build app -Doptimize=ReleaseSafe` — `zig-out/RDC.app`; `run-app` — build and open
+- `"$ZIG" build package -Dtarget=x86_64-windows -Doptimize=ReleaseSafe` — `zig-out/package/RDC.exe` (built on the Mac; the log on the PC is `%LOCALAPPDATA%\RDC\rdc.log`)
+- `zig-out/bin/rdc host --no-ui` — host without a window; the code and link are in the log `~/Library/Logs/RDC/rdc.log`
+- `open -n zig-out/RDC.app --args --web-dir "$PWD/web"` — the viewer is served from `web/` without rebuilding; `--update-url URL` — updates from URL instead of GitHub (for testing)
+- `zig-out/bin/rdc mcp` — the MCP server on stdio (JSON-RPC, one message per line; the log goes to stderr and the file); `rdc mcp --http [PORT] [--token T] [--public] [--tunnel]` — Streamable HTTP. A quick check: pipe `{"jsonrpc":"2.0","id":1,"method":"tools/list"}` into it, or POST it to `http://127.0.0.1:7710/mcp`.
+- `tools/make_mcpb.sh <version> <out.mcpb> --mac <rdc> --win <rdc.exe>` — the MCP bundle for Claude Desktop (CI does this in the release).
+- A host started from `zig-out/` has no Screen Recording permission (TCC knows the installed `~/Applications/RDC.app`); for a live test of screenshots connect to the installed RDC (its link is in `~/Library/Logs/RDC/rdc.log`).
+- Ad-hoc signing with the designated requirement `identifier "com.anods.rdc"`: macOS permissions (Screen Recording, Accessibility) survive rebuilds and updates. If the permissions get stuck — `tccutil reset ScreenCapture com.anods.rdc` and `tccutil reset Accessibility com.anods.rdc` (the user runs these).
+- The installed RDC is `~/Applications/RDC.app`; it updates itself. Builds from `zig-out` do not update themselves.
 
-## Релизы
-- Версия — только в `build.zig.zon`, заметки — `docs/releases/<версия>.md`.
-- GitHub Actions (`.github/workflows/release.yml`): по тегу `v<версия>` или кнопкой Run workflow — тесты на macOS, Linux и Windows, архивы по ОС (пока macOS; Windows и Linux — с вехой M3), подписанный `latest.json`, релиз. Нужен секрет `RDC_UPDATE_KEY`.
-- Локально: `"$ZIG" build release -Doptimize=ReleaseSafe` → `zig-out/release/` (архив, `latest.json`, `latest.json.sig`).
-- Ключ подписи обновлений — `~/.config/rdc/update-signing.key` (в git его нет), открытый — `src/core/update_key.zig`. Новый ключ: `zig run tools/release.zig -- keygen <файл>`.
+## Releases
+- The version lives only in `build.zig.zon`; release notes are in `docs/releases/<version>.md`.
+- GitHub Actions (`.github/workflows/release.yml`): on a `v<version>` tag or the Run workflow button — tests on macOS, Linux and Windows, the macOS archive, `RDC.exe`, `rdc-mcp.mcpb`, a signed `latest.json`, the release. Requires the `RDC_UPDATE_KEY` secret. `.github/workflows/pages.yml` publishes `web/` to GitHub Pages on every push to `main`.
+- Locally: `"$ZIG" build release -Doptimize=ReleaseSafe` → `zig-out/release/` (archive, `latest.json`, `latest.json.sig`).
+- The update signing key is `~/.config/rdc/update-signing.key` (not in git); the public key is in `src/core/update_key.zig`. New key: `zig run tools/release.zig -- keygen <file>`.
 
-## Как работаем
-- Цель — веха из раздела 16: идём к ней без остановок на подтверждение шагов и показываем работающий результат. Перед тем как что-то создавать, проверить, что этого ещё нет.
-- Решения пользователя фиксировать одной строкой, без рисков и оговорок.
-- Zig 0.17.1, версия закреплена в `build.zig.zon`; на Mac ставится в `~/Applications/zig-0.17.1/`. API `std` (с 0.16 — `std.Io`) и систему сборки 0.17 сверять по исходникам установленного Zig, а не по памяти; проверенные заметки — `docs/zig-0.17-api.md`.
-- Репозиторий публичный — `github.com/ANODs/RDC`, ветка `main`. Коммитить — по просьбе пользователя, перечисляя пути, без `git add -A`; пушит пользователь через GitHub Desktop.
-- Окончания строк — LF (`.gitattributes`).
+## How we work
+- The goal is the milestone from section 16: work toward it without stopping to confirm steps, and show a working result. Before creating anything, check that it does not exist yet.
+- Record user decisions in one line, without risks or caveats.
+- Zig 0.17.1, pinned in `build.zig.zon`; on the Mac it is installed in `~/Applications/zig-0.17.1/`. Check the `std` API (`std.Io` since 0.16) and the 0.17 build system against the installed Zig sources, not from memory; verified notes are in `docs/zig-0.17-api.md`.
+- The repository is public — `github.com/ANODs/RDC`, branch `main`. Commit only when the user asks, listing paths, without `git add -A`; the user pushes via GitHub Desktop.
+- Line endings — LF (`.gitattributes`).

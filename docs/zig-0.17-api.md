@@ -1,4 +1,4 @@
-<!-- Проверенные на Zig 0.17.1 (macOS arm64) заметки об API: каждый пример собран и запущен. -->
+<!-- API notes verified on Zig 0.17.1 (macOS arm64): every example was compiled and run. -->
 
 # Zig 0.17.1 API cheat-sheet (verified)
 

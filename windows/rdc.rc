@@ -1,0 +1,33 @@
+#pragma code_page(65001)
+// Version info for rdc.exe (Explorer → Properties → Details). The updater uses ProductVersion
+// to check that the right file was downloaded. The version numbers and string come from build.zig:
+// RDC_VERSION_NUM (comma-separated) and RDC_VERSION_STR.
+
+1 VERSIONINFO
+FILEVERSION RDC_VERSION_NUM
+PRODUCTVERSION RDC_VERSION_NUM
+FILEFLAGSMASK 0x3F
+FILEFLAGS 0x0
+FILEOS 0x40004
+FILETYPE 0x1
+FILESUBTYPE 0x0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "ANODs"
+            VALUE "FileDescription", "RDC - Remote Desktop Control"
+            VALUE "FileVersion", RDC_VERSION_STR
+            VALUE "InternalName", "rdc"
+            VALUE "LegalCopyright", "Copyright 2026 Timoshkin Timofey. Apache License 2.0."
+            VALUE "OriginalFilename", "RDC.exe"
+            VALUE "ProductName", "RDC"
+            VALUE "ProductVersion", RDC_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

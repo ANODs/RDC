@@ -1,8 +1,8 @@
-name: Релиз
+name: Release
 
-# Релиз собирается по тегу v<версия> или кнопкой «Run workflow» (тогда тег ставится сам).
-# Версия — в build.zig.zon, заметки — docs/releases/<версия>.md.
-# Секрет RDC_UPDATE_KEY — ключ подписи обновлений (~/.config/rdc/update-signing.key).
+# The release is built on a v<version> tag or via the "Run workflow" button (then the tag is created automatically).
+# The version is in build.zig.zon, the notes in docs/releases/<version>.md.
+# The RDC_UPDATE_KEY secret is the update signing key (~/.config/rdc/update-signing.key).
 
 on:
   push:
@@ -21,7 +21,7 @@ env:
 
 jobs:
   version:
-    name: Версия
+    name: Version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
@@ -30,15 +30,15 @@ jobs:
       - id: v
         run: |
           version=$(sed -n 's/^ *\.version = "\(.*\)",.*/\1/p' build.zig.zon)
-          test -n "$version" || { echo "::error::нет версии в build.zig.zon"; exit 1; }
+          test -n "$version" || { echo "::error::no version in build.zig.zon"; exit 1; }
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::тег $GITHUB_REF_NAME, а в build.zig.zon версия $version"
+            echo "::error::tag $GITHUB_REF_NAME, but build.zig.zon has version $version"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   test:
-    name: Тесты (${{ matrix.os }})
+    name: Tests (${{ matrix.os }})
     needs: version
     strategy:
       fail-fast: false
@@ -52,10 +52,10 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build test
 
-  # Сборки по ОС: каждая кладёт свой архив RDC-<версия>-<платформа>.zip.
-  # Windows и Linux добавятся сюда, когда появятся их хосты (веха M3).
+  # Per-OS builds. macOS: the RDC-<version>-macos-arm64.zip archive; Windows: a single RDC.exe.
+  # Linux will be added once its host exists.
   macos:
-    name: Сборка macOS
+    name: Build macOS
     needs: [version, test]
     runs-on: macos-latest
     steps:
@@ -70,9 +70,26 @@ jobs:
           path: zig-out/package/*.zip
           if-no-files-found: error
 
+  # Windows is built on Linux: Zig ships mingw-w64, no MSVC needed.
+  windows:
+    name: Build Windows
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build package -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rdc-windows
+          path: zig-out/package/RDC.exe
+          if-no-files-found: error
+
   publish:
-    name: Публикация
-    needs: [version, macos]
+    name: Publish
+    needs: [version, macos, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -83,21 +100,31 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Манифест обновлений с подписью
+      - name: Signed update manifest
         env:
           RDC_UPDATE_KEY: ${{ secrets.RDC_UPDATE_KEY }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          test -n "$RDC_UPDATE_KEY" || { echo "::error::нет секрета RDC_UPDATE_KEY"; exit 1; }
+          test -n "$RDC_UPDATE_KEY" || { echo "::error::the RDC_UPDATE_KEY secret is missing"; exit 1; }
           assets=()
           for f in dist/RDC-"$VERSION"-*.zip; do
             p=$(basename "$f" .zip)
             assets+=("${p#RDC-$VERSION-}=$f")
           done
+          if [ -f dist/RDC.exe ]; then assets+=("windows-x86_64=dist/RDC.exe"); fi
           notes="docs/releases/$VERSION.md"
           [ -f "$notes" ] || notes=-
           zig run tools/release.zig -- manifest "$VERSION" release "$notes" "${assets[@]}"
-      - name: Релиз на GitHub
+      # rdc-mcp.mcpb: the MCP server for Claude Desktop and the Claude Code plugin — the manifest
+      # plus the rdc binaries for macOS and Windows taken from the builds above.
+      - name: MCP bundle
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mac_zip=$(ls dist/RDC-"$VERSION"-macos-*.zip | head -1)
+          unzip -q "$mac_zip" -d dist/mac
+          tools/make_mcpb.sh "$VERSION" release/rdc-mcp.mcpb --mac dist/mac/RDC.app/Contents/MacOS/rdc --win dist/RDC.exe
+      - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}

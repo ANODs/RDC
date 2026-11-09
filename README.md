@@ -2,7 +2,7 @@
 
 Lightweight, low-latency cross-platform remote desktop written in Zig.
 
-> Status: milestone M1. A Mac shares its screen to any browser on the local network via a link or a 9-digit code. Architecture, protocol and roadmap: [docs/PLAN.md](docs/PLAN.md) (in Russian).
+> Status: milestone M1. A Mac shares its screen to any browser on the local network via a link or a 9-digit code. Architecture, protocol and roadmap: [docs/PLAN.md](docs/PLAN.md).
 
 ## Features
 
@@ -11,7 +11,22 @@ Lightweight, low-latency cross-platform remote desktop written in Zig.
 - On-screen keyboard that matches the host OS (⌘/⌥/⌃ for macOS, Ctrl/Win/Alt for Windows), with OS-specific shortcuts. It can be moved, resized, docked and hidden.
 - H.264 via WebCodecs where the browser supports it, JPEG otherwise.
 - Automatic updates from GitHub Releases, verified with an Ed25519 signature.
+- An MCP server for AI agents (Claude, Codex, ChatGPT and any other MCP client): the agent sees the screen and controls the mouse and keyboard, and the person at the computer can stop it at any time.
 - Tiny: the whole app is a ~360 KB download.
+
+## AI agents
+
+RDC is also a tool for AI agents: `rdc mcp` is an [MCP](https://modelcontextprotocol.io) server with `connect`, `screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `devices` and `disconnect`. The agent connects with the link from the RDC window on the computer to control and works from screenshots; every action answers with a fresh one. The person at that computer sees "AI agent …" in the RDC window and in the browser viewer, with a **Stop** button.
+
+| Where the agent runs | How to install |
+|---|---|
+| Claude Code | `claude plugin marketplace add ANODs/RDC`, then `claude plugin install rdc@rdc` |
+| Claude Desktop | download `rdc-mcp.mcpb` from [Releases](https://github.com/ANODs/RDC/releases) and open it |
+| Codex (CLI or the ChatGPT desktop app) | `codex plugin marketplace add ANODs/RDC`, then install **RDC** from `/plugins` |
+| claude.ai, ChatGPT in a browser | run `rdc mcp --http --tunnel` on your computer and add the printed URL as a custom connector (needs [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)) |
+| Any other MCP client | `{"command": "<path to rdc>", "args": ["mcp"]}` |
+
+`rdc mcp` options: `--name NAME` (how the agent is shown on the controlled computer), `--http [PORT]` (Streamable HTTP on 127.0.0.1:7710 instead of stdio), `--public` (listen on every interface; a token is required or generated), `--token T` (the secret, as the path `/mcp/T` or `Authorization: Bearer T`; also `RDC_MCP_TOKEN`), `--tunnel` (a Cloudflare quick tunnel, prints the public URL).
 
 ## Download
 

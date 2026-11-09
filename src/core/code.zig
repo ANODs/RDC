@@ -1,5 +1,5 @@
-//! Код подключения: 9 цифр — 8 случайных и контрольная по алгоритму Дамма.
-//! Контрольная цифра ловит любую ошибку в одной цифре и перестановку соседних.
+//! Connection code: 9 digits — 8 random ones and a Damm check digit.
+//! The check digit catches any single-digit error and any swap of adjacent digits.
 const std = @import("std");
 
 pub const len = 9;
@@ -17,7 +17,7 @@ const damm = [10][10]u8{
     .{ 2, 5, 8, 1, 4, 3, 6, 7, 9, 0 },
 };
 
-/// Промежуточная цифра Дамма для ASCII-цифр. 0 — строка с контрольной цифрой верна.
+/// Damm interim digit for ASCII digits. 0 means a string with its check digit is valid.
 pub fn dammDigit(digits: []const u8) u8 {
     var interim: u8 = 0;
     for (digits) |d| interim = damm[interim][d - '0'];
@@ -27,7 +27,7 @@ pub fn dammDigit(digits: []const u8) u8 {
 pub const Code = struct {
     digits: [len]u8,
 
-    /// Код из случайного числа: младшие 8 десятичных цифр + контрольная.
+    /// Code from a random number: its low 8 decimal digits + the check digit.
     pub fn fromRandom(r: u64) Code {
         var c: Code = undefined;
         var v = r % 100_000_000;
@@ -41,7 +41,7 @@ pub const Code = struct {
         return c;
     }
 
-    /// «123 456 789».
+    /// "123 456 789".
     pub fn display(self: *const Code, buf: *[11]u8) []const u8 {
         @memcpy(buf[0..3], self.digits[0..3]);
         buf[3] = ' ';
@@ -51,7 +51,7 @@ pub const Code = struct {
         return buf;
     }
 
-    /// Сравнение с введённым кодом за постоянное время; пробелы и прочие не-цифры игнорируются.
+    /// Constant-time comparison with an entered code; spaces and other non-digits are ignored.
     pub fn matches(self: *const Code, input: []const u8) bool {
         var got: [len]u8 = undefined;
         var n: usize = 0;
@@ -68,12 +68,12 @@ pub const Code = struct {
     }
 };
 
-test "damm: пример из описания алгоритма" {
+test "damm: example from the algorithm description" {
     try std.testing.expectEqual(@as(u8, 4), dammDigit("572"));
     try std.testing.expectEqual(@as(u8, 0), dammDigit("5724"));
 }
 
-test "код: контрольная цифра и формат" {
+test "code: check digit and format" {
     const c = Code.fromRandom(12_345_678);
     try std.testing.expectEqualStrings("12345678", c.digits[0..8]);
     try std.testing.expectEqual(@as(u8, 0), dammDigit(&c.digits));
@@ -84,7 +84,7 @@ test "код: контрольная цифра и формат" {
     try std.testing.expect(c.matches(&c.digits));
 }
 
-test "код: опечатки не проходят" {
+test "code: typos are rejected" {
     const c = Code.fromRandom(98_765_432);
     var wrong = c.digits;
     wrong[3] = if (wrong[3] == '9') '0' else wrong[3] + 1;

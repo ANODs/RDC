@@ -1,0 +1,12 @@
+{
+  "name": "rdc",
+  "displayName": "RDC — Remote Desktop Control",
+  "version": "0.3.0",
+  "description": "See and control other computers that run RDC: connect by link or code, then work from screenshots with the mouse and keyboard.",
+  "author": { "name": "Timoshkin Timofey", "url": "https://github.com/ANODs" },
+  "homepage": "https://github.com/ANODs/RDC",
+  "repository": "https://github.com/ANODs/RDC",
+  "license": "Apache-2.0",
+  "keywords": ["remote-desktop", "computer-use", "screenshot", "mouse", "keyboard", "mcp"],
+  "mcpServers": "https://github.com/ANODs/RDC/releases/latest/download/rdc-mcp.mcpb"
+}

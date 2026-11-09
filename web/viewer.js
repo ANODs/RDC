@@ -1,5 +1,5 @@
 'use strict';
-// Веб-зритель RDC: WebSocket → H.264 (WebCodecs) или JPEG → canvas; мышь и клавиатура → хост.
+// RDC web viewer: WebSocket → H.264 (WebCodecs) or JPEG → canvas; mouse and keyboard → host.
 
 const $ = (id) => document.getElementById(id);
 const canH264 = typeof VideoDecoder === 'function' && typeof EncodedVideoChunk === 'function';
@@ -8,7 +8,7 @@ const localIsMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAg
 const MSG = { MOVE: 1, BUTTON: 2, WHEEL: 3, KEY: 4, RELEASE_ALL: 5, KEYFRAME: 16 };
 const FRAME = { H264: 1, JPEG: 2 };
 
-// KeyboardEvent.code → USB HID usage (страница 0x07). Хост сам переводит в коды своей ОС.
+// KeyboardEvent.code → USB HID usage (page 0x07). The host maps them to its own OS codes.
 const HID = (() => {
   const t = {};
   'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').forEach((c, i) => (t['Key' + c] = 0x04 + i));
@@ -49,7 +49,7 @@ let swapCtrl = false;
 const pressed = new Set();
 const stats = { frames: 0, bytes: 0, t0: performance.now(), rtt: 0 };
 
-// ---------------------------------------------------------------- подключение
+// ---------------------------------------------------------------- connection
 
 function formatCode(s) {
   const d = s.replace(/\D/g, '').slice(0, 9);
@@ -66,7 +66,7 @@ function showJoin(error) {
   $('code').focus();
 }
 
-// Контрольная цифра Дамма: последняя цифра кода ловит опечатки до подключения.
+// Damm check digit: the last digit of the code catches typos before connecting.
 const DAMM = [
   [0, 3, 1, 7, 5, 9, 8, 6, 4, 2], [7, 0, 9, 2, 1, 5, 4, 8, 6, 3], [4, 2, 0, 6, 8, 7, 1, 3, 5, 9],
   [1, 7, 5, 0, 9, 8, 3, 4, 2, 6], [6, 1, 2, 3, 0, 4, 5, 9, 7, 8], [3, 6, 7, 4, 2, 0, 9, 5, 8, 1],
@@ -77,9 +77,9 @@ const dammOk = (digits) => [...digits].reduce((i, d) => DAMM[i][+d], 0) === 0;
 
 function start(raw) {
   code = raw.replace(/\D/g, '');
-  if (code.length !== 9) return showJoin('Код — 9 цифр');
-  if (!dammOk(code)) return showJoin('В коде опечатка — проверьте цифры');
-  $('err').textContent = 'Подключаемся…';
+  if (code.length !== 9) return showJoin('The code must be 9 digits');
+  if (!dammOk(code)) return showJoin('Typo in the code — check the digits');
+  $('err').textContent = 'Connecting…';
   wantConnected = true;
   connect();
 }
@@ -117,8 +117,12 @@ function onControl(m) {
       $('stage').style.display = 'flex';
       $('veil').style.display = 'none';
       $('who').textContent = m.name || 'RDC';
-      swapCtrl = m.os === 'macos' && !localIsMac;
-      $('swap').style.display = m.os === 'macos' && !localIsMac ? '' : 'none';
+      // Ctrl and ⌘ swap places when the modifier layout differs: PC to Mac and Mac to PC.
+      swapCtrl = m.os === 'macos' ? !localIsMac : localIsMac;
+      $('swap').style.display = swapCtrl ? '' : 'none';
+      $('swap').textContent = m.os === 'macos' ? 'Ctrl → ⌘' : '⌘ → Ctrl';
+      $('swap').title = m.os === 'macos' ? 'Ctrl on this computer acts as ⌘ on the Mac'
+                                         : '⌘ on this Mac acts as Ctrl on the computer';
       $('swap').classList.toggle('on', swapCtrl);
       setSize(m.w, m.h);
       tp.lastLocal = 0;
@@ -143,12 +147,22 @@ function onControl(m) {
     case 'bye':
       if (ws) { ws.onclose = null; ws.close(); ws = null; }
       host = null;
-      showJoin(m.msg || 'Хост завершил сеанс');
+      showJoin(m.msg || 'The host ended the session');
       break;
+    case 'viewers': {
+      // An AI agent is connected: say so, and offer to stop it.
+      const ai = m.ai || [];
+      $('ai-who').textContent = ai.length === 1 ? `AI agent ${ai[0]} is controlling this computer`
+                                                 : `${ai.length} AI agents are controlling this computer`;
+      $('ai').style.display = ai.length ? 'flex' : 'none';
+      break;
+    }
   }
 }
 
-// ---------------------------------------------------------------- картинка
+$('ai-stop').onclick = () => { send(JSON.stringify({ t: 'stop_ai' })); $('ai').style.display = 'none'; };
+
+// ---------------------------------------------------------------- picture
 
 function setSize(w, h) {
   if (w && h && (canvas.width !== w || canvas.height !== h)) { canvas.width = w; canvas.height = h; }
@@ -170,7 +184,7 @@ function draw(img, w, h) {
   if (canvas.width !== w || canvas.height !== h) setSize(w, h);
   ctx2d.drawImage(img, 0, 0);
   stats.frames++;
-  if (!gotFrame) { gotFrame = true; $('veil').style.display = 'none'; $('veil').textContent = 'Переподключение…'; }
+  if (!gotFrame) { gotFrame = true; $('veil').style.display = 'none'; $('veil').textContent = 'Reconnecting…'; }
 }
 
 function onFrame(buf) {
@@ -215,14 +229,14 @@ function decodeH264(data, key, ts) {
   }
   if (!configured) {
     if (!key) return send(new Uint8Array([MSG.KEYFRAME]));
-    // 'prefer-hardware' в Chrome означает «только аппаратно» и отказывает там, где его нет;
-    // 'no-preference' сам берёт аппаратный декодер, когда он доступен.
+    // 'prefer-hardware' in Chrome means "hardware only" and fails where there is none;
+    // 'no-preference' picks the hardware decoder on its own when it is available.
     decoder.configure({ codec: avcCodec(data), optimizeForLatency: true, hardwareAcceleration: 'no-preference' });
     configured = true;
   }
   if (waitKey && !key) return;
   if (decoder.decodeQueueSize > 4) {
-    // Отстали: выбрасываем до следующего ключевого кадра, а не копим задержку.
+    // Falling behind: drop until the next keyframe instead of piling up latency.
     waitKey = true;
     return send(new Uint8Array([MSG.KEYFRAME]));
   }
@@ -242,7 +256,7 @@ async function drawJpeg(data) {
   if (jpegNext) { const next = jpegNext; jpegNext = null; drawJpeg(next); }
 }
 
-// ---------------------------------------------------------------- ввод
+// ---------------------------------------------------------------- input
 
 let movePending = null;
 let wheelX = 0, wheelY = 0;
@@ -291,12 +305,12 @@ requestAnimationFrame(tick);
 
 const buttonOf = (e) => (e.button === 2 ? 2 : e.button === 1 ? 1 : 0);
 
-// ---------------------------------------------------------------- касания: режим тачпада
-// Курсор стоит на месте и сдвигается вслед за пальцем, как на тачпаде ноутбука.
-// Тап — левый клик там, где курсор; двойной тап — правый; два пальца — прокрутка.
-const TAP_MS = 300;          // дольше — уже не тап
-const TAP_SLOP = 10;         // css-пиксели: дальше — уже движение
-const DOUBLE_TAP_MS = 250;   // окно для второго тапа
+// ---------------------------------------------------------------- touch: touchpad mode
+// The cursor stays put and moves with the finger, like on a laptop touchpad.
+// Tap — left click at the cursor; double tap — right click; two fingers — scroll.
+const TAP_MS = 300;          // longer is not a tap
+const TAP_SLOP = 10;         // CSS pixels: farther is a move
+const DOUBLE_TAP_MS = 250;   // window for the second tap
 const tp = { x: 0.5, y: 0.5, lastLocal: 0, touches: new Map(), mode: 'none', start: null, moved: false, pendingTap: false, tapTimer: 0, scrollAt: null };
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
@@ -347,7 +361,7 @@ function touchMove(e) {
       flushPendingTap();
     }
     if (!tp.moved) return;
-    // Медленно — точнее, быстро — дальше: как ускорение указателя на тачпаде.
+    // Slow is more precise, fast goes farther: like pointer acceleration on a touchpad.
     const speed = Math.hypot(dx, dy) / dt;
     const gain = Math.min(2.6, Math.max(0.6, 0.6 + speed * 1.2));
     tp.x = clamp01(tp.x + (dx * gain) / r.width);
@@ -356,7 +370,7 @@ function touchMove(e) {
     movePending = [tp.x, tp.y];
   } else if (tp.mode === 'scroll') {
     const [cx, cy] = centroid();
-    const k = canvas.width / r.width; // в пиксели удалённого экрана
+    const k = canvas.width / r.width; // into remote screen pixels
     wheelX -= (cx - tp.scrollAt[0]) * k;
     wheelY -= (cy - tp.scrollAt[1]) * k;
     tp.scrollAt = [cx, cy];
@@ -366,7 +380,7 @@ function touchMove(e) {
 function touchUp(e) {
   if (!tp.touches.delete(e.pointerId)) return;
   if (tp.touches.size > 0) {
-    if (tp.mode === 'scroll') tp.mode = 'none'; // оставшийся палец курсор не двигает
+    if (tp.mode === 'scroll') tp.mode = 'none'; // the remaining finger doesn't move the cursor
     return;
   }
   const wasTap = tp.mode === 'move' && !tp.moved && e.timeStamp - tp.start.t < TAP_MS;
@@ -375,7 +389,7 @@ function touchUp(e) {
   if (tp.pendingTap) {
     clearTimeout(tp.tapTimer);
     tp.pendingTap = false;
-    click(2); // двойной тап — правая кнопка
+    click(2); // double tap — right button
   } else {
     tp.pendingTap = true;
     tp.tapTimer = setTimeout(() => { tp.pendingTap = false; click(0); }, DOUBLE_TAP_MS);
@@ -383,7 +397,7 @@ function touchUp(e) {
 }
 
 function syncCursor(m) {
-  // Курсор хоста мог сдвинуться и без нас — подхватываем его, пока палец не трогает экран.
+  // The host cursor may have moved on its own — pick it up while no finger is on the screen.
   if (typeof m.cx !== 'number' || tp.touches.size > 0 || performance.now() - tp.lastLocal < 1000) return;
   tp.x = clamp01(m.cx);
   tp.y = clamp01(m.cy);
@@ -451,7 +465,7 @@ window.addEventListener('keyup', (e) => {
 window.addEventListener('blur', releaseAll);
 document.addEventListener('visibilitychange', () => document.hidden && releaseAll());
 
-// ---------------------------------------------------------------- интерфейс
+// ---------------------------------------------------------------- UI
 
 let barTimer = 0;
 function showBar() {
@@ -462,7 +476,7 @@ function showBar() {
 window.addEventListener('mousemove', (e) => { if (e.clientY < 48) showBar(); });
 $('bar').addEventListener('mouseenter', () => { $('bar').classList.add('show'); clearTimeout(barTimer); });
 $('bar').addEventListener('mouseleave', showBar);
-// На телефоне панель открывается и закрывается кнопкой в углу.
+// On a phone the toolbar opens and closes with the corner button.
 $('handle').addEventListener('click', () => { clearTimeout(barTimer); $('bar').classList.toggle('show'); });
 
 $('swap').addEventListener('click', () => { swapCtrl = !swapCtrl; $('swap').classList.toggle('on', swapCtrl); releaseAll(); canvas.focus(); });
@@ -482,7 +496,7 @@ $('leave').addEventListener('click', () => {
   showJoin('');
 });
 document.addEventListener('fullscreenchange', () => {
-  $('full').textContent = document.fullscreenElement ? 'Выйти из полного экрана' : 'Во весь экран';
+  $('full').textContent = document.fullscreenElement ? 'Exit full screen' : 'Full screen';
   fit();
 });
 window.addEventListener('resize', fit);
@@ -494,19 +508,19 @@ setInterval(() => {
   const mbps = (stats.bytes * 8 / dt / 1e6).toFixed(1);
   stats.frames = 0; stats.bytes = 0; stats.t0 = now;
   const codec = host ? (host.codec === 'h264' ? 'H.264' : 'JPEG') : '';
-  $('stat').textContent = host ? `${codec} · ${fps} к/с · ${mbps} Мбит/с · ${Math.round(stats.rtt)} мс` : '';
+  $('stat').textContent = host ? `${codec} · ${fps} fps · ${mbps} Mbps · ${Math.round(stats.rtt)} ms` : '';
   send(JSON.stringify({ t: 'ping', ts: now }));
 }, 1000);
 
-// ---------------------------------------------------------------- экранная клавиатура
-// Шлёт те же HID-коды, что и физическая. Раскладка и сочетания — под ОС хоста.
-// Модификатор: тап — на одно нажатие, двойной тап — фиксация, ещё тап — снять.
+// ---------------------------------------------------------------- on-screen keyboard
+// Sends the same HID codes as a physical keyboard. Layout and shortcuts follow the host OS.
+// Modifier: tap — for one keypress, double tap — lock, another tap — release.
 const osk = (() => {
   const el = $('osk'), keysEl = $('osk-keys'), cutsEl = $('osk-cuts'), head = $('osk-head');
   const sizeEl = $('osk-size'), kbtn = $('kbtn'), bubble = $('osk-bubble');
   const MOD = { ctrl: 0xe0, shift: 0xe1, alt: 0xe2, meta: 0xe3 };
   const STORE = 'rdc.osk.v1';
-  const WIDE = 620; // шире — полная раскладка
+  const WIDE = 620; // wider gets the full layout
 
   const RU = {
     KeyQ: 'й', KeyW: 'ц', KeyE: 'у', KeyR: 'к', KeyT: 'е', KeyY: 'н', KeyU: 'г', KeyI: 'ш', KeyO: 'щ', KeyP: 'з',
@@ -528,41 +542,41 @@ const osk = (() => {
       title: 'macOS', label: { ctrl: '⌃', alt: '⌥', meta: '⌘', shift: '⇧' }, sub: { ctrl: 'control', alt: 'option', meta: 'command' },
       left: ['ctrl', 'alt', 'meta'], right: ['meta', 'alt'], lang: ['ctrl', 'Space'],
       cuts: [
-        ['⌘C', 'Копировать', ['meta'], 'KeyC'], ['⌘V', 'Вставить', ['meta'], 'KeyV'], ['⌘X', 'Вырезать', ['meta'], 'KeyX'],
-        ['⌘Z', 'Отменить', ['meta'], 'KeyZ'], ['⇧⌘Z', 'Повторить', ['shift', 'meta'], 'KeyZ'], ['⌘A', 'Всё', ['meta'], 'KeyA'],
-        ['⌘F', 'Найти', ['meta'], 'KeyF'], ['⌘S', 'Сохранить', ['meta'], 'KeyS'], ['⌘Tab', 'Приложения', ['meta'], 'Tab'],
-        ['⌘Space', 'Spotlight', ['meta'], 'Space'], ['⌃↑', 'Mission Control', ['ctrl'], 'ArrowUp'], ['⌘W', 'Закрыть', ['meta'], 'KeyW'],
-        ['⌘Q', 'Выйти', ['meta'], 'KeyQ'], ['⇧⌘4', 'Снимок', ['shift', 'meta'], 'Digit4'],
+        ['⌘C', 'Copy', ['meta'], 'KeyC'], ['⌘V', 'Paste', ['meta'], 'KeyV'], ['⌘X', 'Cut', ['meta'], 'KeyX'],
+        ['⌘Z', 'Undo', ['meta'], 'KeyZ'], ['⇧⌘Z', 'Redo', ['shift', 'meta'], 'KeyZ'], ['⌘A', 'Select all', ['meta'], 'KeyA'],
+        ['⌘F', 'Find', ['meta'], 'KeyF'], ['⌘S', 'Save', ['meta'], 'KeyS'], ['⌘Tab', 'Apps', ['meta'], 'Tab'],
+        ['⌘Space', 'Spotlight', ['meta'], 'Space'], ['⌃↑', 'Mission Control', ['ctrl'], 'ArrowUp'], ['⌘W', 'Close', ['meta'], 'KeyW'],
+        ['⌘Q', 'Quit', ['meta'], 'KeyQ'], ['⇧⌘4', 'Screenshot', ['shift', 'meta'], 'Digit4'],
       ],
     },
     windows: {
       title: 'Windows', label: { ctrl: 'Ctrl', alt: 'Alt', meta: '⊞', shift: '⇧' }, sub: {},
       left: ['ctrl', 'meta', 'alt'], right: ['alt', 'ctrl'], lang: ['meta', 'Space'],
       cuts: [
-        ['Ctrl+C', 'Копировать', ['ctrl'], 'KeyC'], ['Ctrl+V', 'Вставить', ['ctrl'], 'KeyV'], ['Ctrl+X', 'Вырезать', ['ctrl'], 'KeyX'],
-        ['Ctrl+Z', 'Отменить', ['ctrl'], 'KeyZ'], ['Ctrl+Y', 'Повторить', ['ctrl'], 'KeyY'], ['Ctrl+A', 'Всё', ['ctrl'], 'KeyA'],
-        ['Ctrl+F', 'Найти', ['ctrl'], 'KeyF'], ['Ctrl+S', 'Сохранить', ['ctrl'], 'KeyS'], ['Alt+Tab', 'Окна', ['alt'], 'Tab'],
-        ['⊞', 'Пуск', [], 'MetaLeft'], ['⊞+D', 'Рабочий стол', ['meta'], 'KeyD'], ['⊞+E', 'Проводник', ['meta'], 'KeyE'],
-        ['Alt+F4', 'Закрыть', ['alt'], 'F4'], ['Ctrl+Shift+Esc', 'Диспетчер задач', ['ctrl', 'shift'], 'Escape'],
+        ['Ctrl+C', 'Copy', ['ctrl'], 'KeyC'], ['Ctrl+V', 'Paste', ['ctrl'], 'KeyV'], ['Ctrl+X', 'Cut', ['ctrl'], 'KeyX'],
+        ['Ctrl+Z', 'Undo', ['ctrl'], 'KeyZ'], ['Ctrl+Y', 'Redo', ['ctrl'], 'KeyY'], ['Ctrl+A', 'Select all', ['ctrl'], 'KeyA'],
+        ['Ctrl+F', 'Find', ['ctrl'], 'KeyF'], ['Ctrl+S', 'Save', ['ctrl'], 'KeyS'], ['Alt+Tab', 'Windows', ['alt'], 'Tab'],
+        ['⊞', 'Start', [], 'MetaLeft'], ['⊞+D', 'Desktop', ['meta'], 'KeyD'], ['⊞+E', 'Explorer', ['meta'], 'KeyE'],
+        ['Alt+F4', 'Close', ['alt'], 'F4'], ['Ctrl+Shift+Esc', 'Task Manager', ['ctrl', 'shift'], 'Escape'],
       ],
     },
     linux: {
       title: 'Linux', label: { ctrl: 'Ctrl', alt: 'Alt', meta: '❖', shift: '⇧' }, sub: {},
       left: ['ctrl', 'meta', 'alt'], right: ['alt', 'ctrl'], lang: ['meta', 'Space'],
       cuts: [
-        ['Ctrl+C', 'Копировать', ['ctrl'], 'KeyC'], ['Ctrl+V', 'Вставить', ['ctrl'], 'KeyV'], ['Ctrl+X', 'Вырезать', ['ctrl'], 'KeyX'],
-        ['Ctrl+Z', 'Отменить', ['ctrl'], 'KeyZ'], ['Ctrl+A', 'Всё', ['ctrl'], 'KeyA'], ['Ctrl+F', 'Найти', ['ctrl'], 'KeyF'],
-        ['Ctrl+S', 'Сохранить', ['ctrl'], 'KeyS'], ['Alt+Tab', 'Окна', ['alt'], 'Tab'], ['❖', 'Обзор', [], 'MetaLeft'],
-        ['Alt+F4', 'Закрыть', ['alt'], 'F4'], ['Ctrl+Alt+T', 'Терминал', ['ctrl', 'alt'], 'KeyT'],
+        ['Ctrl+C', 'Copy', ['ctrl'], 'KeyC'], ['Ctrl+V', 'Paste', ['ctrl'], 'KeyV'], ['Ctrl+X', 'Cut', ['ctrl'], 'KeyX'],
+        ['Ctrl+Z', 'Undo', ['ctrl'], 'KeyZ'], ['Ctrl+A', 'Select all', ['ctrl'], 'KeyA'], ['Ctrl+F', 'Find', ['ctrl'], 'KeyF'],
+        ['Ctrl+S', 'Save', ['ctrl'], 'KeyS'], ['Alt+Tab', 'Windows', ['alt'], 'Tab'], ['❖', 'Overview', [], 'MetaLeft'],
+        ['Alt+F4', 'Close', ['alt'], 'F4'], ['Ctrl+Alt+T', 'Terminal', ['ctrl', 'alt'], 'KeyT'],
       ],
     },
   };
 
   let os = OS.macos;
   let page = 'abc';
-  const mods = { ctrl: 0, shift: 0, alt: 0, meta: 0 }; // 0 нет, 1 на одно нажатие, 2 зафиксирован
+  const mods = { ctrl: 0, shift: 0, alt: 0, meta: 0 }; // 0 off, 1 for one keypress, 2 locked
   const lastModTap = {};
-  const presses = new Map(); // pointerId → нажатие
+  const presses = new Map(); // pointerId → press
   let rendered = '';
 
   const st = load();
@@ -574,7 +588,7 @@ const osk = (() => {
   function save() { try { localStorage.setItem(STORE, JSON.stringify(st)); } catch (_) {} }
   const vibrate = () => { try { navigator.vibrate && navigator.vibrate(8); } catch (_) {} };
 
-  // --- описание клавиш
+  // --- key definitions
   const k = (code, w = 1) => ({ code, w });
   const sp = (w) => ({ spacer: true, w });
   const mod = (m, w = 1) => ({ mod: m, w });
@@ -619,7 +633,7 @@ const osk = (() => {
     ];
   }
 
-  // --- подписи
+  // --- labels
   const shiftOn = () => mods.shift > 0;
   function label(code) {
     if (code.startsWith('Key')) return shiftOn() ? code.slice(3) : code.slice(3).toLowerCase();
@@ -644,10 +658,10 @@ const osk = (() => {
       return b;
     }
     if (spec.page) { b.dataset.page = spec.page; b.classList.add('fn'); b.textContent = spec.label; return b; }
-    if (spec.lang) { b.dataset.lang = '1'; b.classList.add('fn'); b.textContent = '🌐'; b.title = 'Сменить язык на компьютере'; return b; }
+    if (spec.lang) { b.dataset.lang = '1'; b.classList.add('fn'); b.textContent = '🌐'; b.title = 'Switch language on the computer'; return b; }
     b.dataset.code = spec.code;
     const text = label(spec.code);
-    b.textContent = spec.code === 'Space' ? 'пробел' : text;
+    b.textContent = spec.code === 'Space' ? 'space' : text;
     if (spec.code === 'Space') b.style.fontSize = 'calc(var(--u) * .3)';
     if (NAMES[spec.code] !== undefined && spec.code !== 'Space' && !/^Arrow/.test(spec.code) && spec.code !== 'Backspace' && spec.code !== 'Enter') b.classList.add('fn');
     if (spec.small || /^F\d+$/.test(spec.code)) b.classList.add('fn');
@@ -676,8 +690,8 @@ const osk = (() => {
     }
     const units = +el.dataset.units || 10;
     const inner = Math.min(width, st.docked ? 980 : width) - 16;
-    // Ширина задаёт размер клавиш, но клавиатура не выше доли экрана: закреплённая —
-    // до 46 % высоты, плавающая — до 62 %.
+    // Width sets the key size, but the keyboard is no taller than a share of the screen: docked —
+    // up to 46% of the height, floating — up to 62%.
     const rows = keysEl.children.length || 4;
     const maxHeight = window.innerHeight * (st.docked ? 0.46 : 0.62) - 90;
     let u = inner / (units * 1.12);
@@ -707,7 +721,7 @@ const osk = (() => {
     }
   }
 
-  // --- отправка
+  // --- sending
   function combo(ms, code) {
     for (const m of ms) sendKey(MOD[m], true);
     sendKey(HID[code], true);
@@ -779,7 +793,7 @@ const osk = (() => {
   keysEl.addEventListener('pointercancel', (e) => release(e.pointerId));
   keysEl.addEventListener('contextmenu', (e) => e.preventDefault());
 
-  // --- окно клавиатуры: показ, место, размер, закрепление
+  // --- keyboard window: visibility, position, size, docking
   function clamp() {
     const r = el.getBoundingClientRect();
     st.w = Math.max(300, Math.min(st.w, window.innerWidth - 8));
@@ -802,7 +816,7 @@ const osk = (() => {
       el.style.left = st.x + 'px';
       el.style.top = st.y + 'px';
     }
-    // Закреплённая внизу клавиатура не закрывает картинку: экран ужимается над ней.
+    // A keyboard docked at the bottom doesn't cover the picture: the screen shrinks above it.
     $('stage').style.bottom = st.visible && st.docked ? el.getBoundingClientRect().height + 'px' : '0px';
     fit();
   }
@@ -829,7 +843,7 @@ const osk = (() => {
   head.addEventListener('pointermove', (e) => {
     if (!drag) return;
     if (drag.undock) {
-      // Тянем закреплённую — она становится плавающей прямо под пальцем.
+      // Dragging the docked keyboard undocks it right under the finger.
       st.docked = false;
       st.w = Math.min(st.w, window.innerWidth - 8);
       drag.undock = false;
@@ -847,7 +861,7 @@ const osk = (() => {
     if (!drag) return;
     const moved = drag.moved;
     drag = null;
-    if (moved && window.innerHeight - el.getBoundingClientRect().bottom < 24) st.docked = true; // к нижнему краю — закрепить
+    if (moved && window.innerHeight - el.getBoundingClientRect().bottom < 24) st.docked = true; // near the bottom edge — dock
     save();
     apply();
   });
@@ -888,7 +902,7 @@ const osk = (() => {
   return {
     setOS(name) {
       os = OS[name] || OS.macos;
-      $('osk-title').textContent = 'Клавиатура · ' + os.title;
+      $('osk-title').textContent = 'Keyboard · ' + os.title;
       renderCuts();
       rendered = '';
       apply();

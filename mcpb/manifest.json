@@ -1,0 +1,44 @@
+{
+  "manifest_version": "0.3",
+  "name": "rdc",
+  "display_name": "RDC — Remote Desktop Control",
+  "version": "@VERSION@",
+  "description": "See and control other computers that run RDC: connect by link or code, then work from screenshots with the mouse and keyboard.",
+  "long_description": "RDC is a lightweight open-source remote desktop. Run it on the computer to control; it shows a link and a 9-digit code. Give the link to Claude: it connects, takes screenshots and uses the mouse and keyboard there. The person at that computer sees that an AI agent is connected and can stop it at any time.",
+  "author": { "name": "Timoshkin Timofey", "url": "https://github.com/ANODs" },
+  "repository": { "type": "git", "url": "https://github.com/ANODs/RDC" },
+  "homepage": "https://github.com/ANODs/RDC",
+  "documentation": "https://github.com/ANODs/RDC#ai-agents",
+  "support": "https://github.com/ANODs/RDC/issues",
+  "license": "Apache-2.0",
+  "keywords": ["remote-desktop", "computer-use", "screenshot", "mouse", "keyboard"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/rdc",
+    "mcp_config": {
+      "command": "${__dirname}/server/rdc",
+      "args": ["mcp"],
+      "env": {},
+      "platform_overrides": {
+        "win32": { "command": "${__dirname}/server/rdc.exe" }
+      }
+    }
+  },
+  "tools": [
+    { "name": "connect", "description": "Connect to a computer by its RDC link or address and code" },
+    { "name": "devices", "description": "List the connected computers" },
+    { "name": "disconnect", "description": "End the session with a computer" },
+    { "name": "screenshot", "description": "The current screen, or an enlarged region of it" },
+    { "name": "click", "description": "Click at a point: left, right or middle, single or double, with modifiers" },
+    { "name": "move", "description": "Move the pointer without clicking" },
+    { "name": "drag", "description": "Drag from one point to another" },
+    { "name": "scroll", "description": "Turn the mouse wheel" },
+    { "name": "type", "description": "Type Unicode text into the focused field" },
+    { "name": "key", "description": "Press keys and shortcuts" },
+    { "name": "wait", "description": "Wait for the screen to change, then screenshot" }
+  ],
+  "compatibility": {
+    "claude_desktop": ">=1.0.0",
+    "platforms": ["darwin", "win32"]
+  }
+}

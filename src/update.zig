@@ -1,13 +1,12 @@
-//! Автообновление из релизов GitHub.
+//! Auto-update from GitHub releases.
 //!
-//! Через 15 с после запуска и дальше раз в 6 часов RDC скачивает latest.json и
-//! latest.json.sig из последнего релиза, проверяет подпись вшитым ключом Ed25519 и,
-//! если версия новее, скачивает архив своей платформы, сверяет размер и SHA-256 и
-//! ставит его, когда к компьютеру никто не подключён (сессии не рвутся). Вручную —
-//! «Настройки → Обновить и перезапустить». Сборки из zig-out сами не обновляются.
+//! 15 s after launch and then every 6 hours, RDC downloads latest.json and
+//! latest.json.sig from the latest release, verifies the signature with the built-in
+//! Ed25519 key and, if the version is newer, downloads the archive for its platform,
+//! checks its size and SHA-256 and installs it when nobody is connected (sessions are
+//! not cut off). Manually: "Settings → Update and Restart". zig-out builds do not self-update.
 const std = @import("std");
-const c = std.c;
-const mac = @import("platform/macos.zig");
+const plat = @import("platform.zig");
 const manifest = @import("core/manifest.zig");
 const build_options = @import("build_options");
 
@@ -18,15 +17,17 @@ const first_check_us: u64 = 15 * 1_000_000;
 const check_interval_us: u64 = 6 * 3600 * 1_000_000;
 const pref_auto = "autoUpdate";
 
-const log = @import("host.zig").log;
+const host = @import("host.zig");
+const log = host.log;
 
 pub const State = enum { idle, checking, up_to_date, available, downloading, installing, failed };
 
 pub const Updater = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
     base_url: ?[]const u8,
     ui: bool,
-    mutex: c.pthread_mutex_t = .{},
+    mutex: std.Io.Mutex = .init,
     state: State = .idle,
     busy: bool = false,
     auto: bool = true,
@@ -42,26 +43,26 @@ pub const Updater = struct {
     message: [256]u8 = undefined,
     message_len: usize = 0,
 
-    pub fn init(gpa: std.mem.Allocator, base_url: ?[]const u8, ui: bool) Updater {
-        var u: Updater = .{ .gpa = gpa, .base_url = base_url, .ui = ui, .started_us = mac.rdc_mac_now_us() };
-        u.auto = mac.rdc_mac_pref_bool(pref_auto, 1) != 0;
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, base_url: ?[]const u8, ui: bool) Updater {
+        var u: Updater = .{ .gpa = gpa, .io = io, .base_url = base_url, .ui = ui, .started_us = host.nowUs(io) };
+        u.auto = plat.rdc_pref_bool(pref_auto, 1) != 0;
         var path: [1024]u8 = undefined;
-        if (mac.rdc_mac_bundle_path(&path, path.len) != 0) {
-            u.dev_build = true; // не из бандла — менять нечего
+        if (plat.rdc_install_path(&path, path.len) != 0) {
+            u.dev_build = true; // not an installed copy — nothing to replace
         } else {
             const p = path[0 .. std.mem.indexOfScalar(u8, &path, 0) orelse 0];
-            u.dev_build = std.mem.indexOf(u8, p, "/zig-out/") != null;
+            u.dev_build = std.mem.indexOf(u8, p, "/zig-out/") != null or std.mem.indexOf(u8, p, "\\zig-out\\") != null;
         }
-        mac.rdc_mac_cleanup_old_bundles();
-        u.setMessage("Установлена версия {s}", .{current_version});
+        plat.rdc_cleanup_old_install();
+        u.setMessage("Version {s} is installed", .{current_version});
         return u;
     }
 
     fn lock(u: *Updater) void {
-        _ = c.pthread_mutex_lock(&u.mutex);
+        u.mutex.lockUncancelable(u.io);
     }
     fn unlock(u: *Updater) void {
-        _ = c.pthread_mutex_unlock(&u.mutex);
+        u.mutex.unlock(u.io);
     }
 
     fn setMessage(u: *Updater, comptime fmt: []const u8, args: anytype) void {
@@ -73,11 +74,11 @@ pub const Updater = struct {
         return u.latest[0..u.latest_len];
     }
 
-    /// Вызывается раз в секунду из потока обслуживания.
+    /// Called once a second from the housekeeping thread.
     pub fn tick(u: *Updater, viewers: usize) void {
-        const now = mac.rdc_mac_now_us();
+        const now = host.nowUs(u.io);
         u.lock();
-        const due = if (u.last_check_us == 0) now - u.started_us >= first_check_us else now - u.last_check_us >= check_interval_us;
+        const due = if (u.last_check_us == 0) now -| u.started_us >= first_check_us else now -| u.last_check_us >= check_interval_us;
         const check = u.auto and !u.busy and due;
         const install = u.auto and !u.dev_build and !u.busy and u.state == .available and viewers == 0;
         if (check or install) u.busy = true;
@@ -105,7 +106,7 @@ pub const Updater = struct {
         u.lock();
         u.auto = on;
         u.unlock();
-        mac.rdc_mac_set_pref_bool(pref_auto, @intFromBool(on));
+        plat.rdc_set_pref_bool(pref_auto, @intFromBool(on));
         u.publish();
     }
 
@@ -119,7 +120,7 @@ pub const Updater = struct {
         t.detach();
     }
 
-    /// Показывает состояние в окне «Настройки».
+    /// Shows the state in the Settings window.
     pub fn publish(u: *Updater) void {
         if (!u.ui) return;
         var msg: [257]u8 = undefined;
@@ -134,7 +135,7 @@ pub const Updater = struct {
         u.unlock();
         @memcpy(ver[0..current_version.len], current_version);
         ver[current_version.len] = 0;
-        mac.rdc_mac_settings_update(ver[0..current_version.len :0].ptr, @intFromBool(auto), msg[0..msg_len :0].ptr, @intFromBool(can_install), @intFromBool(busy));
+        plat.rdc_settings_update(ver[0..current_version.len :0].ptr, @intFromBool(auto), msg[0..msg_len :0].ptr, @intFromBool(can_install), @intFromBool(busy));
     }
 
     fn finish(u: *Updater, state: State, comptime fmt: []const u8, args: anytype) void {
@@ -143,7 +144,7 @@ pub const Updater = struct {
         u.busy = false;
         u.setMessage(fmt, args);
         u.unlock();
-        log("обновление: " ++ fmt, args);
+        log("update: " ++ fmt, args);
         u.publish();
     }
 
@@ -162,12 +163,12 @@ pub const Updater = struct {
         const url_z = try arena.dupeSentinel(u8, url, 0);
         var len: usize = 0;
         var status: c_int = -1;
-        const ptr = mac.rdc_mac_http_get(url_z.ptr, max, &len, &status) orelse {
+        const ptr = plat.rdc_http_get(url_z.ptr, max, &len, &status) orelse {
             if (status == 404) return error.NotFound;
             if (status == 200) return error.TooLarge;
             return if (status < 0) error.Network else error.Http;
         };
-        defer c.free(ptr);
+        defer plat.free(ptr);
         if (status == 404) return error.NotFound;
         if (status != 200) return error.Http;
         return arena.dupe(u8, ptr[0..len]);
@@ -181,24 +182,24 @@ pub const Updater = struct {
 
     fn checkThread(u: *Updater) void {
         u.lock();
-        u.last_check_us = mac.rdc_mac_now_us();
+        u.last_check_us = host.nowUs(u.io);
         u.unlock();
-        u.progress(.checking, "Проверяю обновления…", .{});
+        u.progress(.checking, "Checking for updates…", .{});
         var arena_state = std.heap.ArenaAllocator.init(u.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const man_url = u.urlFor(arena, "latest.json", null) catch return u.finish(.failed, "нет памяти", .{});
-        const sig_url = u.urlFor(arena, "latest.json.sig", null) catch return u.finish(.failed, "нет памяти", .{});
+        const man_url = u.urlFor(arena, "latest.json", null) catch return u.finish(.failed, "out of memory", .{});
+        const sig_url = u.urlFor(arena, "latest.json.sig", null) catch return u.finish(.failed, "out of memory", .{});
         const body = u.fetch(arena, man_url, manifest.max_manifest) catch |e| return u.fetchFailed(e);
         const sig = u.fetch(arena, sig_url, 1024) catch |e| return u.fetchFailed(e);
-        manifest.verify(body, sig) catch return u.finish(.failed, "подпись обновления не сошлась — обновление отклонено", .{});
-        const m = manifest.parse(arena, body) catch return u.finish(.failed, "манифест обновления повреждён", .{});
-        const latest = manifest.Version.parse(m.version) orelse return u.finish(.failed, "непонятная версия в манифесте: {s}", .{m.version});
+        manifest.verify(body, sig) catch return u.finish(.failed, "update signature does not match — update rejected", .{});
+        const m = manifest.parse(arena, body) catch return u.finish(.failed, "update manifest is corrupt", .{});
+        const latest = manifest.Version.parse(m.version) orelse return u.finish(.failed, "unrecognized version in the manifest: {s}", .{m.version});
         const current = manifest.Version.parse(current_version) orelse unreachable;
-        if (!latest.newerThan(current)) return u.finish(.up_to_date, "Установлена последняя версия ({s})", .{current_version});
-        const asset = manifest.assetFor(m, manifest.platform) catch return u.finish(.failed, "в релизе {s} нет сборки для {s}", .{ m.version, manifest.platform });
-        if (m.version.len > u.latest.len or asset.file.len > u.file.len) return u.finish(.failed, "манифест обновления повреждён", .{});
+        if (!latest.newerThan(current)) return u.finish(.up_to_date, "The latest version is installed ({s})", .{current_version});
+        const asset = manifest.assetFor(m, manifest.platform) catch return u.finish(.failed, "release {s} has no build for {s}", .{ m.version, manifest.platform });
+        if (m.version.len > u.latest.len or asset.file.len > u.file.len) return u.finish(.failed, "update manifest is corrupt", .{});
 
         u.lock();
         @memcpy(u.latest[0..m.version.len], m.version);
@@ -210,16 +211,16 @@ pub const Updater = struct {
         const auto = u.auto and !u.dev_build;
         u.unlock();
         if (auto)
-            u.finish(.available, "Доступна версия {s} — установится, когда никто не подключён", .{m.version})
+            u.finish(.available, "Version {s} is available — it will install when nobody is connected", .{m.version})
         else
-            u.finish(.available, "Доступна версия {s}", .{m.version});
+            u.finish(.available, "Version {s} is available", .{m.version});
     }
 
     fn fetchFailed(u: *Updater, e: FetchError) void {
         switch (e) {
-            error.NotFound => u.finish(.up_to_date, "Релизов на GitHub пока нет", .{}),
-            error.Network => u.finish(.failed, "нет связи с GitHub", .{}),
-            else => u.finish(.failed, "GitHub ответил ошибкой ({t})", .{e}),
+            error.NotFound => u.finish(.up_to_date, "No releases on GitHub yet", .{}),
+            error.Network => u.finish(.failed, "cannot reach GitHub", .{}),
+            else => u.finish(.failed, "GitHub returned an error ({t})", .{e}),
         }
     }
 
@@ -236,26 +237,26 @@ pub const Updater = struct {
         const asset: manifest.Asset = .{ .platform = manifest.platform, .file = file, .size = u.size, .sha256 = &u.sha };
         u.unlock();
 
-        u.progress(.downloading, "Скачиваю версию {s}…", .{version});
+        u.progress(.downloading, "Downloading version {s}…", .{version});
         var arena_state = std.heap.ArenaAllocator.init(u.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const asset_url = u.urlFor(arena, file, version) catch return u.finish(.available, "нет памяти", .{});
+        const asset_url = u.urlFor(arena, file, version) catch return u.finish(.available, "out of memory", .{});
         const data = u.fetch(arena, asset_url, @intCast(@min(asset.size + 1, manifest.max_asset))) catch |e| {
             u.lock();
             u.busy = false;
             u.unlock();
-            return u.finish(.available, "Не удалось скачать версию {s} ({t}) — попробую позже", .{ version, e });
+            return u.finish(.available, "Could not download version {s} ({t}) — will try again later", .{ version, e });
         };
-        manifest.checkAsset(asset, data) catch return u.finish(.failed, "архив {s} не совпал с манифестом — отклонён", .{version});
+        manifest.checkAsset(asset, data) catch return u.finish(.failed, "the {s} archive does not match the manifest — rejected", .{version});
 
         var path: [1024]u8 = undefined;
-        if (mac.rdc_mac_write_temp(file_buf[0..file.len :0].ptr, data.ptr, data.len, &path, path.len) != 0)
-            return u.finish(.available, "не записать архив во временную папку", .{});
-        u.progress(.installing, "Устанавливаю версию {s} и перезапускаю…", .{version});
-        log("обновление: ставлю {s}", .{version});
-        const rc = mac.rdc_mac_install_update(@ptrCast(&path), version_buf[0..version.len :0].ptr);
-        // Сюда попадаем только при ошибке: при успехе процесс перезапускается.
-        u.finish(.failed, "не удалось установить версию {s} (код {d}) — подробности в журнале", .{ version, rc });
+        if (plat.rdc_write_temp(file_buf[0..file.len :0].ptr, data.ptr, data.len, &path, path.len) != 0)
+            return u.finish(.available, "cannot write the archive to the temp folder", .{});
+        u.progress(.installing, "Installing version {s} and restarting…", .{version});
+        log("update: installing {s}", .{version});
+        const rc = plat.rdc_install_update(@ptrCast(&path), version_buf[0..version.len :0].ptr);
+        // Only reached on failure: on success the process restarts.
+        u.finish(.failed, "could not install version {s} (code {d}) — details in the log", .{ version, rc });
     }
 };
