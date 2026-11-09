@@ -1,7 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
-  <!-- RDC icon: a screen with a connection coming in from anywhere, and the pointer that
-       controls it. Everything else (PNG, ICNS, ICO) is rendered from this file by
-       tools/make_icons.sh. -->
+  <!-- RDC icon: a screen, a signal reaching it from afar, and the pointer that works on it.
+       Everything else (PNG, ICNS, ICO) is rendered from this file by tools/make_icons.sh. -->
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#2b3040"/>
@@ -14,13 +13,13 @@
   </defs>
   <rect x="64" y="64" width="896" height="896" rx="204" fill="url(#bg)"/>
   <!-- the screen and its stand -->
-  <rect x="196" y="236" width="632" height="416" rx="52" fill="url(#screen)" stroke="#eef1f8" stroke-width="30"/>
-  <rect x="452" y="668" width="120" height="60" rx="14" fill="#eef1f8"/>
-  <rect x="344" y="724" width="336" height="44" rx="22" fill="#eef1f8"/>
-  <!-- the connection: arcs coming in from the far corner -->
-  <circle cx="306" cy="548" r="30" fill="#ffffff"/>
-  <path d="M306 440 a108 108 0 0 1 108 108" fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round" transform="rotate(180 360 494)"/>
-  <path d="M306 332 a216 216 0 0 1 216 216" fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round" opacity=".72" transform="rotate(180 414 440)"/>
+  <rect x="192" y="232" width="640" height="420" rx="48" fill="url(#screen)" stroke="#eef1f8" stroke-width="28"/>
+  <rect x="464" y="666" width="96" height="58" rx="12" fill="#eef1f8"/>
+  <rect x="352" y="722" width="320" height="44" rx="22" fill="#eef1f8"/>
+  <!-- the signal: arcs around a point in the corner, opening toward the pointer -->
+  <circle cx="318" cy="566" r="30" fill="#ffffff"/>
+  <path d="M318 456 A110 110 0 0 1 428 566" fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round"/>
+  <path d="M318 352 A214 214 0 0 1 532 566" fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round" opacity=".7"/>
   <!-- the pointer -->
-  <path d="M598 420 L598 754 L690 668 L752 806 L808 782 L746 646 L854 646 Z" fill="#ffffff" stroke="#11141b" stroke-width="26" stroke-linejoin="round"/>
+  <path d="M610 380 L610 611 L674 554 L716 646 L752 631 L711 540 L786 540 Z" fill="#ffffff" stroke="#11141b" stroke-width="22" stroke-linejoin="round"/>
 </svg>

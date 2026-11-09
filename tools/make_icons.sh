@@ -11,9 +11,30 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-qlmanage -t -s 1024 -o "$work" "$root/design/icon.svg" >/dev/null 2>&1
-master="$work/icon.svg.png"
-[ -f "$master" ] || { echo "make_icons: Quick Look did not render design/icon.svg" >&2; exit 1; }
+# Render at 1024 px with a transparent background. Headless Chrome does that; Quick Look paints
+# the corners white, so without Chrome the plate's rounded shape is cut out afterwards.
+master="$work/icon.png"
+chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+if [ -x "$chrome" ]; then
+  "$chrome" --headless=new --disable-gpu --hide-scrollbars --default-background-color=00000000 \
+    --window-size=1024,1024 --screenshot="$master" "file://$root/design/icon.svg" >/dev/null 2>&1 || true
+fi
+if [ ! -f "$master" ]; then
+  qlmanage -t -s 1024 -o "$work" "$root/design/icon.svg" >/dev/null 2>&1
+  [ -f "$work/icon.svg.png" ] || { echo "make_icons: neither Chrome nor Quick Look rendered design/icon.svg" >&2; exit 1; }
+  python3 - "$work/icon.svg.png" "$master" <<'EOF'
+# Cut the plate (x 64..960, corner radius 204 — the same numbers as in icon.svg) out of the white.
+import sys
+from PIL import Image, ImageDraw
+src, out = sys.argv[1], sys.argv[2]
+im = Image.open(src).convert("RGBA")
+k = 4
+mask = Image.new("L", (1024 * k, 1024 * k), 0)
+ImageDraw.Draw(mask).rounded_rectangle((64 * k, 64 * k, 960 * k, 960 * k), radius=204 * k, fill=255)
+im.putalpha(mask.resize((1024, 1024), Image.LANCZOS))
+im.save(out)
+EOF
+fi
 
 shrink() { # size out
   sips -z "$1" "$1" "$master" --out "$2" >/dev/null

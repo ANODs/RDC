@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "rdc",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "See and control other computers that run RDC: connect by link or code, then work from screenshots with the mouse and keyboard.",
   "author": { "name": "Timoshkin Timofey", "url": "https://github.com/ANODs" },
   "homepage": "https://github.com/ANODs/RDC",
