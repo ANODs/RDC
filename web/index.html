@@ -34,6 +34,18 @@
   #handle { display: none; position: absolute; top: 6px; right: 8px; width: 36px; height: 36px; border-radius: 10px; border: 1px solid var(--line); background: rgba(22,24,29,.75); color: var(--text); font-size: 18px; line-height: 1; }
   @media (pointer: coarse) { #handle { display: block; } }
 
+  /* Camera and microphone of this device for the computer */
+  #media { position: absolute; top: 58px; left: 50%; transform: translateX(-50%); width: min(380px, calc(100% - 16px)); padding: 12px 14px; background: rgba(22,24,29,.96); border: 1px solid var(--line); border-radius: 12px; font-size: 14px; z-index: 15; }
+  #media[hidden] { display: none; }
+  .media-row { display: flex; align-items: center; gap: 10px; min-height: 34px; }
+  .media-row label { display: flex; align-items: center; gap: 8px; flex: none; min-width: 128px; cursor: pointer; }
+  .media-row input { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+  .media-row input:disabled + span { color: var(--muted); }
+  .media-row select { flex: 1; min-width: 0; font: 13px/1.2 inherit; color: var(--text); background: #0f1115; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+  .media-row select[hidden] { display: none; }
+  #media-note { margin-top: 8px; color: var(--muted); font-size: 13px; line-height: 1.35; }
+  #media-note:empty { display: none; }
+
   /* On-screen keyboard */
   body:not(.live) #osk, body:not(.live) #kbtn { display: none !important; }
   #kbtn { position: absolute; right: 14px; bottom: calc(14px + env(safe-area-inset-bottom)); width: 52px; height: 52px; border-radius: 26px; border: 1px solid var(--line); background: rgba(22,24,29,.82); color: var(--text); font-size: 24px; display: none; align-items: center; justify-content: center; z-index: 20; touch-action: manipulation; }
@@ -95,8 +107,14 @@
     <span id="stat"></span>
     <button id="swap" title="Ctrl on this computer acts as ⌘ on the Mac">Ctrl → ⌘</button>
     <button id="kbd">Keyboard</button>
+    <button id="media-btn">Camera and mic</button>
     <button id="full">Full screen</button>
-    <button id="leave">Disconnect</button>
+    <button id="leave" title="Esc on the keyboard does the same">Disconnect</button>
+  </div>
+  <div id="media" hidden>
+    <div class="media-row"><label><input type="checkbox" id="media-mic"><span>Microphone</span></label><select id="media-mic-dev" hidden></select></div>
+    <div class="media-row"><label><input type="checkbox" id="media-cam"><span>Camera</span></label><select id="media-cam-dev" hidden></select></div>
+    <div id="media-note"></div>
   </div>
 </div>
 <button id="kbtn" aria-label="Show keyboard">⌨</button>

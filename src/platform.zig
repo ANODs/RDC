@@ -10,6 +10,18 @@ pub const action_install_update: c_int = 4;
 pub const action_auto_update_on: c_int = 5;
 pub const action_auto_update_off: c_int = 6;
 pub const action_stop_ai: c_int = 7;
+pub const action_stop_media: c_int = 8;
+pub const action_media_install: c_int = 9;
+pub const action_media_remove: c_int = 10;
+
+pub const media_mic: c_int = 1;
+pub const media_camera: c_int = 2;
+pub const media_mic_setup: c_int = 4;
+pub const media_camera_setup: c_int = 8;
+pub const media_mic_installed: c_int = 16;
+pub const media_mic_outdated: c_int = 32;
+pub const media_camera_installed: c_int = 64;
+pub const media_camera_outdated: c_int = 128;
 
 pub const FrameCallback = *const fn (ctx: ?*anyopaque, codec: c_int, data: [*]const u8, len: usize, keyframe: c_int, ts_us: u64, width: c_int, height: c_int) callconv(.c) void;
 pub const CtxCallback = *const fn (ctx: ?*anyopaque) callconv(.c) void;
@@ -53,12 +65,24 @@ pub extern fn rdc_pref_bool(key: [*:0]const u8, def: c_int) c_int;
 pub extern fn rdc_set_pref_bool(key: [*:0]const u8, value: c_int) void;
 pub extern fn rdc_settings_update(version: [*:0]const u8, auto_update: c_int, status: [*:0]const u8, can_install: c_int, busy: c_int) void;
 
+pub extern fn rdc_app_prepare(camera_dll: ?[*]const u8, camera_dll_len: usize) c_int;
 pub extern fn rdc_app_run(on_ready: ?CtxCallback, on_action: ?ActionCallback, ctx: ?*anyopaque) void;
 pub extern fn rdc_app_set_info(code: [*:0]const u8, link: [*:0]const u8) void;
 pub extern fn rdc_app_set_remote(caption: [*:0]const u8, link: [*:0]const u8) void;
 pub extern fn rdc_app_set_status(text: [*:0]const u8) void;
 pub extern fn rdc_app_set_permissions(screen_ok: c_int, input_ok: c_int) void;
 pub extern fn rdc_app_set_ai(active: c_int) void;
+pub extern fn rdc_app_set_media(text: [*:0]const u8) void;
+
+pub extern fn rdc_media_status() c_int;
+pub extern fn rdc_mic_install(install: c_int) c_int;
+pub extern fn rdc_camera_install(install: c_int, dll: ?[*]const u8, dll_len: usize) c_int;
+pub extern fn rdc_mic_start() void;
+pub extern fn rdc_mic_push(pcm: [*]const i16, frames: c_int) void;
+pub extern fn rdc_mic_stop() void;
+pub extern fn rdc_camera_start() void;
+pub extern fn rdc_camera_push(jpeg: [*]const u8, len: usize, width: c_int, height: c_int) void;
+pub extern fn rdc_camera_stop() void;
 
 /// free() from libc — for buffers handed out by the platform layer.
 pub extern fn free(ptr: ?*anyopaque) void;

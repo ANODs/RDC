@@ -23,6 +23,11 @@ typedef void (*rdc_action_cb)(void *ctx, int action);
 #define RDC_ACTION_AUTO_UPDATE_ON 5
 #define RDC_ACTION_AUTO_UPDATE_OFF 6
 #define RDC_ACTION_STOP_AI 7  // disconnect the AI agents, keep people connected
+#define RDC_ACTION_STOP_MEDIA 8  // stop taking the viewer's microphone and camera
+// Install or remove this OS's phone device (the camera on Windows): the host runs
+// rdc_camera_install on a thread, since the DLL's bytes live on the Zig side.
+#define RDC_ACTION_MEDIA_INSTALL 9
+#define RDC_ACTION_MEDIA_REMOVE 10
 
 // Process: the log goes to stderr and to a file (macOS — ~/Library/Logs/RDC/rdc.log,
 // Windows — %LOCALAPPDATA%\RDC\rdc.log).
@@ -80,6 +85,41 @@ void rdc_set_pref_bool(const char *key, int value);
 // Settings window: version, auto-update, status, whether an update can be installed, whether work is in progress.
 void rdc_settings_update(const char *version, int auto_update, const char *status, int can_install, int busy);
 
+// The viewer's microphone and camera as capture devices on this computer — "RDC Microphone" and
+// "RDC Camera" — fed by the host from one viewer's stream (docs/PLAN.md, section 6). macOS has the
+// microphone (a HAL plug-in in RDC.app/Contents/Resources, installed on demand), Windows the camera
+// (a Media Foundation virtual camera). The host keeps working when neither is installed.
+#define RDC_MEDIA_MIC 1               // "RDC Microphone" is available to apps right now
+#define RDC_MEDIA_CAMERA 2            // "RDC Camera" is available to apps right now
+#define RDC_MEDIA_MIC_SETUP 4         // this OS can install the microphone (macOS)
+#define RDC_MEDIA_CAMERA_SETUP 8      // this OS can install the camera (Windows 11)
+#define RDC_MEDIA_MIC_INSTALLED 16    // the microphone driver is in place (loaded after the audio system restarts)
+#define RDC_MEDIA_MIC_OUTDATED 32     // the installed microphone driver is older than the one in this RDC
+#define RDC_MEDIA_CAMERA_INSTALLED 64 // the camera is registered
+#define RDC_MEDIA_CAMERA_OUTDATED 128 // the registered camera is older than the one in this RDC
+int rdc_media_status(void);
+// Installs (1) or removes (0) the device with the OS's administrator prompt; blocks until done.
+// 0 — done, 1 — cancelled by the person, negative — failed (details in the log).
+int rdc_mic_install(int install);
+// dll, dll_len — the camera's media source DLL embedded in the Zig side (Windows); NULL elsewhere.
+int rdc_camera_install(int install, const void *dll, size_t dll_len);
+// One viewer's microphone: 16-bit PCM, 48 kHz, mono, pushed from the viewer's thread about every 20 ms.
+void rdc_mic_start(void);
+void rdc_mic_push(const int16_t *pcm, int frames);
+void rdc_mic_stop(void);
+// One viewer's camera: whole JPEG frames from the viewer's thread, at most 15 a second.
+void rdc_camera_start(void);
+void rdc_camera_push(const uint8_t *jpeg, size_t len, int width, int height);
+void rdc_camera_stop(void);
+
+// The host with a window, after rdc_init and before anything else. Windows: restarts RDC as
+// administrator through the UAC prompt (input then reaches apps that run as administrator, and
+// RDC opens the firewall for viewers and registers the phone camera itself), lets only one
+// window run, and starts the phone camera. camera_dll — the camera's media source DLL that
+// RDC.exe carries (NULL elsewhere). 1 — this process must exit now: another RDC window runs,
+// or the administrator copy has started.
+int rdc_app_prepare(const void *camera_dll, size_t camera_dll_len);
+
 // App window. rdc_app_run blocks the main thread until exit.
 void rdc_app_run(rdc_ctx_cb on_ready, rdc_action_cb on_action, void *ctx);
 void rdc_app_set_info(const char *code, const char *link);
@@ -90,3 +130,6 @@ void rdc_app_set_status(const char *text);
 void rdc_app_set_permissions(int screen_ok, int input_ok);
 // An AI agent is connected: the window shows a Stop button that sends RDC_ACTION_STOP_AI.
 void rdc_app_set_ai(int active);
+// What a viewer lends right now ("Phone microphone live — 1.2.3.4"; "" — nothing): shown with a
+// Stop button that sends RDC_ACTION_STOP_MEDIA.
+void rdc_app_set_media(const char *text);

@@ -8,7 +8,7 @@ const $ = (id) => document.getElementById(id);
 const canH264 = typeof VideoDecoder === 'function' && typeof EncodedVideoChunk === 'function';
 const localIsMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 
-const MSG = { MOVE: 1, BUTTON: 2, WHEEL: 3, KEY: 4, RELEASE_ALL: 5, KEYFRAME: 16 };
+const MSG = { MOVE: 1, BUTTON: 2, WHEEL: 3, KEY: 4, RELEASE_ALL: 5, KEYFRAME: 16, AUDIO: 20, CAMERA: 21 };
 const FRAME = { H264: 1, JPEG: 2 };
 
 // KeyboardEvent.code → USB HID usage (page 0x07). The host maps them to its own OS codes.
@@ -63,6 +63,7 @@ function formatCode(s) {
 function showJoin(error) {
   wantConnected = false;
   osk.reset(); // releases held on-screen keys while the connection is still up
+  media.stopAll();
   closeConn();
   host = null;
   document.body.classList.remove('live');
@@ -120,6 +121,7 @@ function start(raw) {
   // A new target starts from scratch, even if another computer was on screen.
   closeConn();
   resetDecoder();
+  media.stopAll();
   host = null;
   document.body.classList.remove('live');
   $('stage').style.display = 'none';
@@ -174,6 +176,7 @@ function wsLink(h) {
   sock.onclose = () => h.close('', false);
   return {
     send(d) { if (sock.readyState === WebSocket.OPEN) sock.send(d); },
+    buffered() { return sock.bufferedAmount; },
     close() { sock.onclose = null; sock.close(); },
   };
 }
@@ -431,6 +434,7 @@ function rtcLink(code, key, h) {
 
   return {
     send(d) { if (dc && dc.readyState === 'open') dc.send(d); },
+    buffered() { return dc ? dc.bufferedAmount : 0; },
     close() { if (!ended) end(); },
   };
 }
@@ -455,7 +459,11 @@ function onControl(m) {
       syncCursor(m);
       document.body.classList.add('live');
       osk.setOS(m.os);
+      media.setHost(m);
       canvas.focus();
+      break;
+    case 'media':
+      media.onHost(m);
       break;
     case 'size':
       setSize(m.w, m.h);
@@ -733,7 +741,7 @@ function syncCursor(m) {
 // the mouse acts only over the picture, where its place has a meaning. The toolbar, its handle
 // and the AI banner keep their own taps.
 const stage = $('stage');
-const onUi = (e) => !!(e.target.closest && e.target.closest('#bar, #handle, #ai'));
+const onUi = (e) => !!(e.target.closest && e.target.closest('#bar, #handle, #ai, #media'));
 stage.addEventListener('pointermove', (e) => {
   if (e.pointerType === 'touch') return touchMove(e);
   if (e.target !== canvas) return;
@@ -783,6 +791,14 @@ function mapKey(e) {
 
 window.addEventListener('keydown', (e) => {
   if (!host || $('stage').style.display === 'none') return;
+  // Esc on this device's keyboard ends the session; the Esc of the on-screen keyboard is the one
+  // that goes to the computer.
+  if (e.code === 'Escape') {
+    if (e.target.closest && e.target.closest('select, input')) return; // closes a list, nothing more
+    e.preventDefault();
+    if (!e.repeat) leave();
+    return;
+  }
   const u = mapKey(e);
   if (u === undefined) return;
   e.preventDefault();
@@ -822,14 +838,18 @@ $('full').addEventListener('click', async () => {
   if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(() => {});
   canvas.focus();
 });
-$('leave').addEventListener('click', () => {
+// Ends the session from this side: held keys are released on the computer, the picture and this
+// device's microphone and camera stop, the connection closes.
+function leave() {
   releaseAll();
   wantConnected = false;
   host = null;
   closeConn();
   resetDecoder();
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   showJoin('');
-});
+}
+$('leave').addEventListener('click', leave);
 document.addEventListener('fullscreenchange', () => {
   $('full').textContent = document.fullscreenElement ? 'Exit full screen' : 'Full screen';
   fit();
@@ -1265,6 +1285,270 @@ const osk = (() => {
     toggle() { setVisible(!st.visible); },
     reset,
   };
+})();
+
+// ---------------------------------------------------------------- camera and microphone
+// This device's microphone and camera as capture devices on the computer: "RDC Microphone" and
+// "RDC Camera". Audio goes as 20 ms chunks of 16-bit PCM at 48 kHz, video as JPEG frames in pieces
+// (src/core/proto.zig). getUserMedia needs a secure page: the link from anywhere, localhost or https.
+const media = (() => {
+  const panel = $('media'), btn = $('media-btn'), micBox = $('media-mic'), camBox = $('media-cam');
+  const micSel = $('media-mic-dev'), camSel = $('media-cam-dev'), note = $('media-note');
+  const secure = !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  const CAM_FPS = 15, CAM_MAX = 1280, CAM_QUALITY = 0.7, PIECE = 15 * 1024, BACKLOG = 1 << 20;
+  let can = { mic: false, camera: false, os: 'macos' }; // what the computer can take, from ok
+  let on = { mic: false, camera: false };                // what the computer takes now
+  let micStream = null, actx = null, seq = 0;
+  let camStream = null, video = null, canvas = null, camTimer = 0, encoding = false;
+
+  // Runs in the audio thread: mono, resampled to 48 kHz, 16-bit, 960 frames (20 ms) per message.
+  const WORKLET = `
+    class RdcMic extends AudioWorkletProcessor {
+      constructor() { super(); this.ratio = sampleRate / 48000; this.t = 0; this.prev = 0; this.buf = new Int16Array(960); this.n = 0; }
+      push(v) {
+        this.buf[this.n++] = v >= 1 ? 32767 : v <= -1 ? -32768 : (v * 32767) | 0;
+        if (this.n === 960) { this.port.postMessage(this.buf.buffer, [this.buf.buffer]); this.buf = new Int16Array(960); this.n = 0; }
+      }
+      process(inputs) {
+        const chans = inputs[0];
+        if (!chans || !chans.length) return true;
+        let x = chans[0];
+        if (chans.length > 1) {
+          x = new Float32Array(chans[0].length);
+          for (const c of chans) for (let i = 0; i < x.length; i++) x[i] += c[i] / chans.length;
+        }
+        const n = x.length;
+        if (this.ratio === 1) { for (let i = 0; i < n; i++) this.push(x[i]); return true; }
+        // Linear interpolation; position -1 is the last sample of the previous block.
+        let t = this.t;
+        while (t + 1 < n) {
+          const i = Math.floor(t), f = t - i;
+          const a = i < 0 ? this.prev : x[i], b = x[i + 1];
+          this.push(a + (b - a) * f);
+          t += this.ratio;
+        }
+        this.t = t - n;
+        this.prev = x[n - 1];
+        return true;
+      }
+    }
+    registerProcessor('rdc-mic', RdcMic);`;
+
+  const nowUs = () => BigInt(Math.round(performance.now() * 1000));
+
+  function sendAudio(pcm) {
+    if (!conn || conn.buffered() > BACKLOG) return;
+    const m = new Uint8Array(12 + pcm.byteLength);
+    const dv = new DataView(m.buffer);
+    m[0] = MSG.AUDIO;
+    m[1] = 1; // 16-bit PCM, 48 kHz, mono
+    dv.setUint16(2, seq++ & 0xffff, true);
+    dv.setBigUint64(4, nowUs(), true);
+    m.set(new Uint8Array(pcm), 12);
+    send(m.buffer);
+  }
+
+  async function startMic() {
+    const audio = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: { ideal: 1 } };
+    if (micSel.value) audio.deviceId = { exact: micSel.value };
+    micStream = await navigator.mediaDevices.getUserMedia({ audio });
+    const AC = window.AudioContext || window.webkitAudioContext;
+    let source = null;
+    try {
+      actx = new AC({ sampleRate: 48000, latencyHint: 'interactive' });
+      source = actx.createMediaStreamSource(micStream);
+    } catch (_) {
+      // Some browsers refuse a context rate other than the microphone's: the worklet resamples instead.
+      if (actx) actx.close().catch(() => {});
+      actx = new AC({ latencyHint: 'interactive' });
+      source = actx.createMediaStreamSource(micStream);
+    }
+    await actx.resume();
+    const url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
+    try { await actx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+    const node = new AudioWorkletNode(actx, 'rdc-mic', { numberOfInputs: 1, numberOfOutputs: 0 });
+    node.port.onmessage = (e) => sendAudio(e.data);
+    source.connect(node);
+    micStream.getAudioTracks()[0].onended = () => { if (on.mic) toggle('mic', false); };
+  }
+
+  function stopMic() {
+    if (micStream) { for (const t of micStream.getTracks()) t.stop(); micStream = null; }
+    if (actx) { actx.close().catch(() => {}); actx = null; }
+  }
+
+  async function startCam() {
+    const vid = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: CAM_FPS, max: 30 } };
+    if (camSel.value) vid.deviceId = { exact: camSel.value }; else vid.facingMode = 'user';
+    camStream = await navigator.mediaDevices.getUserMedia({ video: vid });
+    video = document.createElement('video');
+    video.muted = true;
+    video.playsInline = true;
+    video.setAttribute('playsinline', '');
+    video.srcObject = camStream;
+    await video.play();
+    camStream.getVideoTracks()[0].onended = () => { if (on.camera) toggle('camera', false); };
+    camTimer = setInterval(sendFrame, 1000 / CAM_FPS);
+  }
+
+  function stopCam() {
+    clearInterval(camTimer);
+    camTimer = 0;
+    if (video) { video.pause(); video.srcObject = null; video = null; }
+    if (camStream) { for (const t of camStream.getTracks()) t.stop(); camStream = null; }
+  }
+
+  // One frame: drawn at most 1280 pixels on its long side, encoded as JPEG, sent in pieces.
+  async function sendFrame() {
+    if (encoding || !video || video.readyState < 2 || !conn || conn.buffered() > BACKLOG) return;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return;
+    encoding = true;
+    try {
+      const k = Math.min(1, CAM_MAX / Math.max(vw, vh));
+      const w = Math.round(vw * k) & ~1, h = Math.round(vh * k) & ~1;
+      let blob;
+      if (typeof OffscreenCanvas === 'function') {
+        if (!canvas || canvas.width !== w || canvas.height !== h) canvas = new OffscreenCanvas(w, h);
+        canvas.getContext('2d').drawImage(video, 0, 0, w, h);
+        blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: CAM_QUALITY });
+      } else {
+        if (!canvas) canvas = document.createElement('canvas');
+        if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+        canvas.getContext('2d').drawImage(video, 0, 0, w, h);
+        blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', CAM_QUALITY));
+      }
+      if (!blob || !camStream) return;
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const ts = nowUs();
+      let off = 0, first = true;
+      do {
+        const take = Math.min(PIECE, bytes.length - off);
+        const last = off + take >= bytes.length;
+        const hdr = first ? 14 : 2;
+        const m = new Uint8Array(hdr + take);
+        m[0] = MSG.CAMERA;
+        m[1] = (first ? 1 : 0) | (last ? 2 : 0);
+        if (first) {
+          const dv = new DataView(m.buffer);
+          dv.setUint16(2, w, true);
+          dv.setUint16(4, h, true);
+          dv.setBigUint64(6, ts, true);
+        }
+        m.set(bytes.subarray(off, off + take), hdr);
+        send(m.buffer);
+        off += take;
+        first = false;
+      } while (off < bytes.length);
+    } catch (e) {
+      console.warn('camera', e);
+    } finally {
+      encoding = false;
+    }
+  }
+
+  // The capture starts in the tap itself (browsers want getUserMedia there), then the computer is asked.
+  async function toggle(kind, want) {
+    const box = kind === 'mic' ? micBox : camBox;
+    if (want) {
+      try {
+        await (kind === 'mic' ? startMic() : startCam());
+      } catch (e) {
+        box.checked = false;
+        if (kind === 'mic') stopMic(); else stopCam();
+        const denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
+        say(denied ? `The browser did not allow access to the ${kind === 'mic' ? 'microphone' : 'camera'}` : String((e && e.message) || e));
+        return;
+      }
+    } else {
+      if (kind === 'mic') stopMic(); else stopCam();
+      on[kind] = false;
+      paint();
+    }
+    send(JSON.stringify({ t: 'media', mic: kind === 'mic' ? want : on.mic, camera: kind === 'camera' ? want : on.camera }));
+  }
+
+  function paint() {
+    const live = on.mic || on.camera;
+    btn.classList.toggle('on', live);
+    btn.textContent = live ? (on.mic && on.camera ? 'Mic and camera on' : on.mic ? 'Mic on' : 'Camera on') : 'Camera and mic';
+  }
+
+  function say(text) { note.textContent = text || ''; }
+
+  // Device names show up once the browser has granted access.
+  async function fillDevices() {
+    if (!secure || !navigator.mediaDevices.enumerateDevices) return;
+    let list = [];
+    try { list = await navigator.mediaDevices.enumerateDevices(); } catch (_) { return; }
+    for (const [sel, kind, name] of [[micSel, 'audioinput', 'Microphone'], [camSel, 'videoinput', 'Camera']]) {
+      const cur = sel.value;
+      sel.textContent = '';
+      let n = 0;
+      for (const d of list) {
+        if (d.kind !== kind) continue;
+        const o = document.createElement('option');
+        o.value = d.deviceId;
+        o.textContent = d.label || `${name} ${++n}`;
+        sel.append(o);
+      }
+      if (cur) sel.value = cur;
+      sel.hidden = sel.options.length < 2;
+    }
+  }
+
+  // The computer's answer: what it takes now, and why not.
+  function onHost(m) {
+    on = { mic: !!m.mic, camera: !!m.camera };
+    if (!on.mic && micStream) stopMic();
+    if (!on.camera && camStream) stopCam();
+    micBox.checked = on.mic;
+    camBox.checked = on.camera;
+    if (m.msg) say(m.msg);
+    else if (on.mic || on.camera) say(`Live: on the computer, pick "RDC ${on.mic ? 'Microphone' : 'Camera'}" in any app`);
+    else say('');
+    paint();
+  }
+
+  // What this computer can take, from the host's ok. After a reconnect the devices that were
+  // on stay on: the computer is asked again, and its answer settles the switches.
+  function setHost(m) {
+    can = { mic: !!m.mic, camera: !!m.camera, os: m.os };
+    if (micStream && !can.mic) stopMic();
+    if (camStream && !can.camera) stopCam();
+    const again = { mic: !!micStream, camera: !!camStream };
+    on = { mic: false, camera: false };
+    micBox.checked = again.mic;
+    camBox.checked = again.camera;
+    if (again.mic || again.camera) send(JSON.stringify({ t: 'media', mic: again.mic, camera: again.camera }));
+    micBox.disabled = !secure || !can.mic;
+    camBox.disabled = !secure || !can.camera;
+    const mac = m.os === 'macos';
+    if (!secure) say('The camera and microphone work only on a secure page: open the link from anywhere (the second link in the RDC window), or http://localhost on the computer itself');
+    else if (!can.mic && !can.camera) say(mac ? 'On the computer, click "Enable phone microphone" in the RDC window first. A phone camera is not available on a Mac.'
+                                               : 'On the computer, click "Enable phone camera" in the RDC window first. A phone microphone is not available on Windows.');
+    else if (!can.mic) say(mac ? 'Microphone: in the RDC window on the computer, click "Enable phone microphone"' : 'A phone microphone is not available on a Windows computer');
+    else if (!can.camera) say(mac ? 'A phone camera is not available on a Mac: it needs a signed camera extension' : 'Camera: in the RDC window on the computer, click "Enable phone camera"');
+    else say('');
+    paint();
+  }
+
+  function stopAll() {
+    stopMic();
+    stopCam();
+    on = { mic: false, camera: false };
+    micBox.checked = camBox.checked = false;
+    panel.hidden = true;
+    paint();
+  }
+
+  btn.addEventListener('click', () => { panel.hidden = !panel.hidden; if (!panel.hidden) fillDevices(); });
+  micBox.addEventListener('change', () => toggle('mic', micBox.checked));
+  camBox.addEventListener('change', () => toggle('camera', camBox.checked));
+  micSel.addEventListener('change', () => { if (on.mic) { stopMic(); toggle('mic', true); } });
+  camSel.addEventListener('change', () => { if (on.camera) { stopCam(); toggle('camera', true); } });
+  if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) navigator.mediaDevices.addEventListener('devicechange', fillDevices);
+  return { setHost, onHost, stopAll };
 })();
 
 // Digits get grouped as they are typed; a pasted link stays as it is.

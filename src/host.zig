@@ -29,6 +29,15 @@ const web = @import("web");
 
 pub const version = update.current_version;
 pub const max_viewers = 4;
+
+/// The camera's media source DLL, embedded on Windows (build.zig); empty elsewhere.
+const camera_dll: []const u8 = if (builtin.os.tag == .windows) @embedFile("camera_dll") else "";
+pub fn cameraDll() ?[*]const u8 {
+    return if (camera_dll.len > 0) camera_dll.ptr else null;
+}
+pub fn cameraDllLen() usize {
+    return camera_dll.len;
+}
 /// WebRTC sessions at once, admitted or still connecting.
 const max_rtc = max_viewers + 4;
 /// The longest --remote-url: the link adds the code and the key, and the Windows window holds 255 characters.
@@ -208,6 +217,10 @@ const Viewer = struct {
     /// Name of the AI agent behind this viewer (rdc mcp), empty for a person.
     ai_buf: [48]u8 = undefined,
     ai_len: usize = 0,
+    /// A JPEG frame from the viewer's camera, put together from pieces on this viewer's thread;
+    /// the buffer is allocated on the first piece.
+    cam_buf: []u8 = &.{},
+    cam: proto.CameraAssembler = .{},
 
     fn ai(v: *const Viewer) []const u8 {
         return v.ai_buf[0..v.ai_len];
@@ -278,6 +291,14 @@ const Viewer = struct {
     fn pushText(v: *Viewer, payload: []const u8) void {
         const m = Msg.text(v.host.gpa, .text, payload) orelse return;
         v.push(m);
+    }
+
+    /// Which of this viewer's devices the computer takes now, and why not.
+    fn pushMedia(v: *Viewer, mic: bool, camera: bool, msg: []const u8) void {
+        var esc: [200]u8 = undefined;
+        var buf: [320]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"t\":\"media\",\"mic\":{},\"camera\":{},\"msg\":\"{s}\"}}", .{ mic, camera, proto.jsonEscape(&esc, msg) }) catch return;
+        v.pushText(json);
     }
 
     fn pop(v: *Viewer) ?*Msg {
@@ -392,6 +413,10 @@ pub const Host = struct {
     remote_shown: bool = false,
     /// Keeps the "from anywhere" part of the window in step when two threads refresh it.
     remote_ui_mutex: Io.Mutex = .init,
+    /// The viewer whose microphone and camera this computer uses right now, and which of them (under mutex).
+    media_owner: ?*Viewer = null,
+    media_mic: bool = false,
+    media_cam: bool = false,
 
     fn lock(h: *Host) void {
         h.mutex.lockUncancelable(h.io);
@@ -605,12 +630,18 @@ pub const Host = struct {
                     const v = viewer.* orelse return true;
                     log("viewer {s} stopped the AI agents", .{v.peer.str()});
                     h.stopAi("A viewer stopped the AI agent");
+                } else if (std.mem.eql(u8, t, "media")) {
+                    const v = viewer.* orelse return true;
+                    h.setMedia(v, proto.jsonTrue(msg, "mic"), proto.jsonTrue(msg, "camera"));
                 }
                 return true;
             },
             .binary => {
-                if (viewer.* == null) return false;
-                if (proto.decodeInput(payload)) |in| applyInput(in);
+                const v = viewer.* orelse return false;
+                if (proto.decodeInput(payload)) |in| switch (in) {
+                    .audio, .camera => h.onMedia(v, in),
+                    else => applyInput(in),
+                };
                 return true;
             },
             .ping => {
@@ -662,11 +693,12 @@ pub const Host = struct {
         if (proto.jsonString(hello, "ai")) |name| v.setAi(name);
         v.last_us.store(now, .monotonic);
         var name_buf: [160]u8 = undefined;
-        var ok_buf: [400]u8 = undefined;
+        var ok_buf: [512]u8 = undefined;
         var cx: f64 = 0.5;
         var cy: f64 = 0.5;
         plat.rdc_cursor_pos(&cx, &cy);
-        const ok = std.fmt.bufPrint(&ok_buf, "{{\"t\":\"ok\",\"w\":{d},\"h\":{d},\"os\":\"{s}\",\"name\":\"{s}\",\"codec\":\"{s}\",\"version\":\"{s}\",\"text\":true,\"cx\":{d:.4},\"cy\":{d:.4}}}", .{
+        const media = plat.rdc_media_status();
+        const ok = std.fmt.bufPrint(&ok_buf, "{{\"t\":\"ok\",\"w\":{d},\"h\":{d},\"os\":\"{s}\",\"name\":\"{s}\",\"codec\":\"{s}\",\"version\":\"{s}\",\"text\":true,\"cx\":{d:.4},\"cy\":{d:.4},\"mic\":{},\"camera\":{}}}", .{
             h.frame_w,
             h.frame_h,
             os_name,
@@ -675,6 +707,8 @@ pub const Host = struct {
             version,
             cx,
             cy,
+            media & plat.media_mic != 0,
+            media & plat.media_camera != 0,
         }) catch "{\"t\":\"ok\"}";
         v.pushText(ok);
         v.writer = std.Thread.spawn(.{}, Viewer.writerMain, .{v}) catch {
@@ -701,6 +735,7 @@ pub const Host = struct {
     }
 
     fn removeViewer(h: *Host, v: *Viewer) void {
+        h.dropMedia(v);
         h.lock();
         var left: usize = 0;
         for (&h.viewers) |*s| {
@@ -714,6 +749,7 @@ pub const Host = struct {
         v.abort();
         if (v.writer) |t| t.join();
         v.drain();
+        if (v.cam_buf.len > 0) h.gpa.free(v.cam_buf);
         plat.rdc_release_all();
         if (v.ai_len > 0) {
             log("AI agent {s} ({s}) disconnected", .{ v.ai(), v.peer.str() });
@@ -772,6 +808,161 @@ pub const Host = struct {
             if (maybe != null) n += 1;
         }
         return n;
+    }
+
+    // -----------------------------------------------------------------------
+    // The viewer's microphone and camera as this computer's capture devices (docs/PLAN.md, section 6):
+    // one viewer at a time, only the devices this OS has.
+
+    /// A viewer asks the computer to take (or drop) its microphone and camera. Answers media {mic, camera, msg}.
+    fn setMedia(h: *Host, v: *Viewer, want_mic: bool, want_cam: bool) void {
+        const status = plat.rdc_media_status();
+        const has_mic = status & plat.media_mic != 0;
+        const has_cam = status & plat.media_camera != 0;
+        const mac = builtin.os.tag == .macos;
+        var reason: []const u8 = "";
+        if (want_mic and !has_mic) reason = if (mac)
+            "RDC Microphone is not enabled on the computer: in the RDC window there, click Enable phone microphone"
+        else
+            "A phone microphone is not available on a Windows computer";
+        if (want_cam and !has_cam) reason = if (mac)
+            "A phone camera is not available on a Mac: it needs Apple's signed camera extension"
+        else
+            "RDC Camera is not enabled on the computer: in the RDC window there, click Enable phone camera";
+        const mic = want_mic and has_mic;
+        const cam = want_cam and has_cam;
+        h.lock();
+        if (h.media_owner) |owner| {
+            if (owner != v and (mic or cam)) {
+                v.pushMedia(false, false, "Another viewer's microphone or camera is in use on the computer");
+                h.unlock();
+                return;
+            }
+        }
+        const was_mic = h.media_owner == v and h.media_mic;
+        const was_cam = h.media_owner == v and h.media_cam;
+        if (h.media_owner == v or mic or cam) {
+            h.media_owner = if (mic or cam) v else null;
+            h.media_mic = mic;
+            h.media_cam = cam;
+        }
+        v.pushMedia(mic, cam, reason);
+        h.unlock();
+        if (mic and !was_mic) plat.rdc_mic_start();
+        if (!mic and was_mic) plat.rdc_mic_stop();
+        if (cam and !was_cam) plat.rdc_camera_start();
+        if (!cam and was_cam) plat.rdc_camera_stop();
+        if (!cam) v.cam.reset();
+        if (mic != was_mic) log("viewer {s}: phone microphone {s}", .{ v.peer.str(), if (mic) "on" else "off" });
+        if (cam != was_cam) log("viewer {s}: phone camera {s}", .{ v.peer.str(), if (cam) "on" else "off" });
+        h.updateMediaUi();
+    }
+
+    /// The viewer that lent its devices is leaving.
+    fn dropMedia(h: *Host, v: *Viewer) void {
+        h.lock();
+        if (h.media_owner != v) {
+            h.unlock();
+            return;
+        }
+        const mic = h.media_mic;
+        const cam = h.media_cam;
+        h.media_owner = null;
+        h.media_mic = false;
+        h.media_cam = false;
+        h.unlock();
+        if (mic) plat.rdc_mic_stop();
+        if (cam) plat.rdc_camera_stop();
+        h.updateMediaUi();
+    }
+
+    /// The person at the computer pressed Stop: the viewer hears why.
+    fn stopMedia(h: *Host, reason: []const u8) void {
+        h.lock();
+        const owner = h.media_owner orelse {
+            h.unlock();
+            return;
+        };
+        const mic = h.media_mic;
+        const cam = h.media_cam;
+        h.media_owner = null;
+        h.media_mic = false;
+        h.media_cam = false;
+        owner.pushMedia(false, false, reason);
+        h.unlock();
+        if (mic) plat.rdc_mic_stop();
+        if (cam) plat.rdc_camera_stop();
+        log("the host stopped the phone's microphone and camera", .{});
+        h.updateMediaUi();
+    }
+
+    /// Samples and frames from a viewer: taken only from the viewer whose devices are on.
+    fn onMedia(h: *Host, v: *Viewer, in: proto.Input) void {
+        h.lock();
+        const mine = h.media_owner == v;
+        const mic = mine and h.media_mic;
+        const cam = mine and h.media_cam;
+        h.unlock();
+        switch (in) {
+            .audio => |a| if (mic) {
+                // Little-endian 16-bit samples, copied out of the message so they are aligned.
+                var samples: [2400]i16 = undefined; // up to 50 ms at a time
+                var off: usize = 0;
+                while (off < a.pcm.len) {
+                    const take = @min(a.pcm.len - off, samples.len * 2);
+                    @memcpy(std.mem.sliceAsBytes(samples[0 .. take / 2]), a.pcm[off .. off + take]);
+                    plat.rdc_mic_push(&samples, @intCast(take / 2));
+                    off += take;
+                }
+            },
+            .camera => |c| if (cam) h.onCameraPiece(v, c),
+            else => {},
+        }
+    }
+
+    fn onCameraPiece(h: *Host, v: *Viewer, c: proto.CameraPiece) void {
+        if (v.cam_buf.len == 0) {
+            if (!c.first) return;
+            v.cam_buf = h.gpa.alloc(u8, proto.camera_frame_max) catch return;
+        }
+        if (v.cam.push(v.cam_buf, c)) |f| plat.rdc_camera_push(f.jpeg.ptr, f.jpeg.len, f.width, f.height);
+    }
+
+    /// The window's Enable / Remove button for this OS's phone device: the install blocks on the
+    /// administrator prompt, so it runs on its own thread.
+    fn installMedia(h: *Host, install: bool) void {
+        _ = h;
+        const t = std.Thread.spawn(.{}, installMediaThread, .{install}) catch return;
+        t.detach();
+    }
+
+    fn installMediaThread(install: bool) void {
+        const status = plat.rdc_media_status();
+        const camera = status & plat.media_camera_setup != 0;
+        const what: []const u8 = if (camera) "RDC Camera" else "RDC Microphone";
+        const rc = if (camera) plat.rdc_camera_install(@intFromBool(install), cameraDll(), cameraDllLen()) else plat.rdc_mic_install(@intFromBool(install));
+        if (rc == 0) {
+            log("{s} {s}", .{ what, if (install) "installed" else "removed" });
+        } else if (rc == 1) {
+            log("{s}: cancelled by the person at the computer", .{what});
+        } else {
+            log("{s}: could not {s} ({d})", .{ what, if (install) "install" else "remove", rc });
+        }
+    }
+
+    /// The window: what a viewer lends right now, with a Stop button.
+    fn updateMediaUi(h: *Host) void {
+        if (!h.opts.ui) return;
+        var buf: [160]u8 = undefined;
+        var n: usize = 0;
+        h.lock();
+        if (h.media_owner) |o| {
+            const what: []const u8 = if (h.media_mic and h.media_cam) "Phone microphone and camera live" else if (h.media_mic) "Phone microphone live" else "Phone camera live";
+            if (std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s} — {s}", .{ what, o.peer.str() })) |s| n = s.len else |_| {}
+        }
+        h.unlock();
+        buf[n] = 0;
+        plat.rdc_app_set_media(buf[0..n :0].ptr);
     }
 
     /// Disconnects viewers that have sent nothing for too long.
@@ -1199,6 +1390,7 @@ fn applyInput(in: proto.Input) void {
         .release_all => plat.rdc_release_all(),
         .text => |t| plat.rdc_text(t.ptr, t.len),
         .keyframe => plat.rdc_request_keyframe(),
+        .audio, .camera => {}, // Host.onMedia takes these
     }
 }
 
@@ -1216,6 +1408,8 @@ fn onAction(ctx: ?*anyopaque, action: c_int) callconv(.c) void {
             log("the host stopped the AI agents", .{});
             h.stopAi("The person at the computer stopped the AI agent");
         },
+        plat.action_stop_media => h.stopMedia("The person at the computer stopped the phone's microphone and camera"),
+        plat.action_media_install, plat.action_media_remove => h.installMedia(action == plat.action_media_install),
         plat.action_new_code => h.renewCode(),
         plat.action_check_update => h.updater.checkNow(),
         plat.action_install_update => {

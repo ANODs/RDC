@@ -9,6 +9,20 @@ const zon: struct {
     paths: []const []const u8,
 } = @import("build.zig.zon");
 
+const mic_c_flags = [_][]const u8{ "-std=c11", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-four-char-constants", "-Wno-multichar" };
+
+/// RDCMicrophone.driver at `dir` under the install prefix: the plug-in's binary and Info.plist.
+fn micDriver(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, sanitize: std.zig.SanitizeC, dir: []const u8) [2]*std.Build.Step {
+    const mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .sanitize_c = sanitize });
+    mod.addCSourceFile(.{ .file = b.path("src/platform/macos/mic_driver.c"), .flags = &mic_c_flags });
+    mod.linkFramework("CoreAudio", .{});
+    mod.linkFramework("CoreFoundation", .{});
+    const lib = b.addLibrary(.{ .name = "RDCMicrophone", .linkage = .dynamic, .root_module = mod });
+    const bin = b.addInstallFileWithDir(lib.getEmittedBin(), .{ .custom = b.fmt("{s}/Contents/MacOS", .{dir}) }, "RDCMicrophone");
+    const plist = b.addInstallFileWithDir(b.path("macos/RDCMicrophone-Info.plist"), .{ .custom = b.fmt("{s}/Contents", .{dir}) }, "Info.plist");
+    return .{ &bin.step, &plist.step };
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -51,9 +65,23 @@ pub fn build(b: *std.Build) void {
         });
         const libs = [_][]const u8{
             "d3d11",    "dxgi",     "ole32",  "oleaut32", "user32",   "gdi32",   "shell32",
-            "advapi32", "iphlpapi", "ws2_32", "winhttp",  "comctl32", "version",
+            "advapi32", "iphlpapi", "ws2_32", "winhttp",  "comctl32", "version", "mfplat",
         };
         for (libs) |lib| root.linkSystemLibrary(lib, .{});
+        // "RDC Camera" (docs/PLAN.md, section 6): rdc-camera.dll, the Media Foundation media source
+        // that Windows 11's Frame Server service loads; RDC.exe carries it and installs it. It runs
+        // inside a system service, so it is built without the C sanitizer: a trap there would stop
+        // the camera for every app.
+        const cam_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .sanitize_c = .off });
+        cam_mod.addCSourceFile(.{
+            .file = b.path("src/platform/windows/camera.c"),
+            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-missing-field-initializers", "-Wno-multichar", "-DUNICODE", "-D_UNICODE", "-DCOBJMACROS", "-DWIN32_LEAN_AND_MEAN", "-D_WIN32_WINNT=0x0A00", "-DWINVER=0x0A00" },
+        });
+        for ([_][]const u8{ "mfplat", "ole32", "kernel32" }) |lib| cam_mod.linkSystemLibrary(lib, .{});
+        const camera = b.addLibrary(.{ .name = "rdc-camera", .linkage = .dynamic, .root_module = cam_mod, .win32_module_definition = b.path("src/platform/windows/camera.def") });
+        root.addAnonymousImport("camera_dll", .{ .root_source_file = camera.getEmittedBin() });
+        b.step("camera-dll", "Build rdc-camera.dll alone").dependOn(&b.addInstallArtifact(camera, .{}).step);
+
         // Version info in rdc.exe: the updater checks the downloaded file against it.
         const sv = std.SemanticVersion.parse(version) catch @panic("version must look like 1.2.3");
         root.addWin32ResourceFile(.{ .file = b.path("windows/rdc.rc"), .flags = &.{
@@ -69,6 +97,7 @@ pub fn build(b: *std.Build) void {
         const frameworks = [_][]const u8{
             "Foundation", "AppKit",       "ScreenCaptureKit",    "VideoToolbox", "CoreMedia",
             "CoreVideo",  "CoreGraphics", "ApplicationServices", "IOSurface",    "ImageIO",
+            "CoreAudio",
         };
         for (frameworks) |fw| root.linkFramework(fw, .{});
     }
@@ -120,11 +149,26 @@ pub fn build(b: *std.Build) void {
         const icon = b.addInstallFileWithDir(b.path("macos/RDC.icns"), .{ .custom = "RDC.app/Contents/Resources" }, "RDC.icns");
         const bin = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "RDC.app/Contents/MacOS" } } });
 
+        // "RDC Microphone": the CoreAudio HAL plug-in (docs/PLAN.md, section 6), a CFPlugIn bundle in
+        // Contents/Resources that "Enable phone microphone" copies to /Library/Audio/Plug-Ins/HAL.
+        // It runs inside coreaudiod, so it ships without the C sanitizer: a trap there would stop
+        // audio for every app. `zig build mic-check` checks a Debug copy with the sanitizer on.
+        // Its version is its own (macos/RDCMicrophone-Info.plist): an installed driver is out of
+        // date only when the driver itself changes, not with every RDC release.
+        const driver = "RDC.app/Contents/Resources/RDCMicrophone.driver";
+        const mic_steps = micDriver(b, target, optimize, .off, driver);
+
         // "-" means ad-hoc signing. By default macOS recognizes such a build by its code hash,
         // which changes with every rebuild, so the Screen Recording and
         // Accessibility permissions get lost. An explicit "by identifier" requirement
         // keeps RDC recognizable across builds and updates. With a certificate: -Dsign="RDC Dev".
         const identity = b.option([]const u8, "sign", "RDC.app signing identity: '-' (ad-hoc) or a certificate name") orelse "-";
+        // Nested code first: the plug-in carries its own signature inside the app's.
+        const sign_mic = b.addSystemCommand(&.{ "codesign", "--force", "--sign", identity, "--identifier", "com.anods.rdc.microphone" });
+        if (std.mem.eql(u8, identity, "-")) sign_mic.addArgs(&.{ "--requirements", "=designated => identifier \"com.anods.rdc.microphone\"" });
+        sign_mic.addDirectoryArg(b.graph.path(.install_prefix, driver));
+        sign_mic.has_side_effects = true;
+        for (mic_steps) |s| sign_mic.step.dependOn(s);
         const sign = b.addSystemCommand(&.{ "codesign", "--force", "--sign", identity, "--identifier", "com.anods.rdc" });
         if (std.mem.eql(u8, identity, "-")) sign.addArgs(&.{ "--requirements", "=designated => identifier \"com.anods.rdc\"" });
         sign.addDirectoryArg(b.graph.path(.install_prefix, "RDC.app"));
@@ -132,7 +176,23 @@ pub fn build(b: *std.Build) void {
         sign.step.dependOn(&plist.step);
         sign.step.dependOn(&icon.step);
         sign.step.dependOn(&bin.step);
+        sign.step.dependOn(&sign_mic.step);
         b.step("app", "Build zig-out/RDC.app").dependOn(&sign.step);
+
+        // zig build mic-check: loads a Debug copy of the plug-in, built with the C sanitizer, the way
+        // coreaudiod does, asks it every property and plays audio through it.
+        const check_driver = "mic-check/RDCMicrophone.driver";
+        const check_steps = micDriver(b, target, .Debug, .full, check_driver);
+        const mic_test_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+        mic_test_mod.addCSourceFile(.{ .file = b.path("src/platform/macos/mic_test.c"), .flags = &mic_c_flags });
+        mic_test_mod.linkFramework("CoreAudio", .{});
+        mic_test_mod.linkFramework("CoreFoundation", .{});
+        const mic_test = b.addExecutable(.{ .name = "mic_test", .root_module = mic_test_mod });
+        const run_mic_test = b.addRunArtifact(mic_test);
+        run_mic_test.addDirectoryArg(b.graph.path(.install_prefix, check_driver));
+        run_mic_test.has_side_effects = true;
+        for (check_steps) |s| run_mic_test.step.dependOn(s);
+        b.step("mic-check", "Load RDCMicrophone.driver like coreaudiod does and check it").dependOn(&run_mic_test.step);
 
         const open = b.addSystemCommand(&.{ "open", "-n" });
         open.addDirectoryArg(b.graph.path(.install_prefix, "RDC.app"));

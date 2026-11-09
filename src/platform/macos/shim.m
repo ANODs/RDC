@@ -7,6 +7,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <ImageIO/ImageIO.h>
+#import <CoreAudio/CoreAudio.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -18,6 +19,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "platform.h"
+#include "mic_writer.h"
 
 // ---------------------------------------------------------------------------
 // Log
@@ -856,6 +858,147 @@ int rdc_computer_name(char *buf, int buflen) {
 }
 
 // ---------------------------------------------------------------------------
+// The viewer's microphone as "RDC Microphone": the HAL plug-in in Contents/Resources, copied to
+// /Library/Audio/Plug-Ins/HAL on demand and fed through shared memory (mic_shm.h). The camera is
+// not available on macOS: a camera extension needs an entitlement from a paid developer account.
+
+static NSString *const kMicDriverName = @"RDCMicrophone.driver";
+static NSString *const kMicDriverDir = @"/Library/Audio/Plug-Ins/HAL";
+static NSString *const kMicDeviceUID = @"com.anods.rdc.mic";
+static pthread_mutex_t g_mic_mutex = PTHREAD_MUTEX_INITIALIZER;
+static rdc_mic_writer g_mic;
+
+static NSString *mic_bundled_path(void) {
+    return [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:kMicDriverName];
+}
+
+static NSString *mic_installed_path(void) {
+    return [kMicDriverDir stringByAppendingPathComponent:kMicDriverName];
+}
+
+static NSString *bundle_version(NSString *path) {
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[path stringByAppendingPathComponent:@"Contents/Info.plist"]];
+    return info[@"CFBundleVersion"];
+}
+
+// The device the plug-in publishes, if coreaudiod has loaded it.
+static AudioObjectID mic_device(void) {
+    CFStringRef uid = (__bridge CFStringRef)kMicDeviceUID;
+    AudioObjectID dev = kAudioObjectUnknown;
+    UInt32 size = sizeof dev;
+    AudioObjectPropertyAddress addr = {kAudioHardwarePropertyTranslateUIDToDevice, kAudioObjectPropertyScopeGlobal,
+                                       kAudioObjectPropertyElementMain};
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, sizeof uid, &uid, &size, &dev) != noErr) return kAudioObjectUnknown;
+    return dev;
+}
+
+int rdc_media_status(void) {
+    @autoreleasepool {
+        int status = RDC_MEDIA_MIC_SETUP;
+        if ([NSFileManager.defaultManager fileExistsAtPath:mic_installed_path()]) {
+            status |= RDC_MEDIA_MIC_INSTALLED;
+            NSString *installed = bundle_version(mic_installed_path()), *ours = bundle_version(mic_bundled_path());
+            if (ours && installed && ![installed isEqualToString:ours]) status |= RDC_MEDIA_MIC_OUTDATED;
+        }
+        if (mic_device() != kAudioObjectUnknown) status |= RDC_MEDIA_MIC;
+        return status;
+    }
+}
+
+static NSString *sh_quote(NSString *s) {
+    return [NSString stringWithFormat:@"'%@'", [s stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
+}
+
+static NSString *applescript_string(NSString *s) {
+    return [[s stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"] stringByReplacingOccurrencesOfString:@"\""
+                                                                                                withString:@"\\\""];
+}
+
+// Runs a shell command as administrator through the system's password dialog (osascript's
+// "do shell script … with administrator privileges"), which shows `prompt`. 0 — done,
+// 1 — cancelled, -1 — failed.
+static int run_as_admin(NSString *command, NSString *prompt) {
+    NSString *script = [NSString stringWithFormat:@"do shell script \"%@\" with prompt \"%@\" with administrator privileges",
+                                                  applescript_string(command), applescript_string(prompt)];
+    NSTask *t = [NSTask new];
+    t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/osascript"];
+    t.arguments = @[ @"-e", script ];
+    NSPipe *errPipe = [NSPipe pipe];
+    t.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+    t.standardError = errPipe;
+    NSError *e = nil;
+    if (![t launchAndReturnError:&e]) {
+        rlog("osascript: %s", e.localizedDescription.UTF8String);
+        return -1;
+    }
+    NSData *errData = [errPipe.fileHandleForReading readDataToEndOfFile];
+    [t waitUntilExit];
+    if (t.terminationStatus == 0) return 0;
+    NSString *err = [[NSString alloc] initWithData:errData encoding:NSUTF8StringEncoding] ?: @"";
+    if ([err containsString:@"-128"]) return 1;  // "User canceled."
+    rlog("administrator command failed: %s",
+         [err stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].UTF8String);
+    return -1;
+}
+
+int rdc_mic_install(int install) {
+    @autoreleasepool {
+        NSString *dst = mic_installed_path();
+        // launchd starts coreaudiod again at once; kickstart can be refused under SIP, killall cannot.
+        NSString *restart = @"(/bin/launchctl kickstart -kp system/com.apple.audio.coreaudiod || /usr/bin/killall coreaudiod)";
+        NSString *cmd;
+        if (install) {
+            NSString *src = mic_bundled_path();
+            if (![NSFileManager.defaultManager fileExistsAtPath:src]) {
+                rlog("this build of RDC carries no %s", kMicDriverName.UTF8String);
+                return -2;
+            }
+            // Copy, make it root's and strip any quarantine, then restart the audio system: it loads
+            // plug-ins only at start (audio pauses for a second).
+            cmd = [NSString stringWithFormat:@"/bin/mkdir -p %@ && /bin/rm -rf %@ && /bin/cp -R %@ %@ && "
+                                             @"/usr/sbin/chown -R root:wheel %@ && /bin/chmod -R go-w %@ && "
+                                             @"(/usr/bin/xattr -cr %@ || true) && %@",
+                                             sh_quote(kMicDriverDir), sh_quote(dst), sh_quote(src), sh_quote(kMicDriverDir),
+                                             sh_quote(dst), sh_quote(dst), sh_quote(dst), restart];
+        } else {
+            cmd = [NSString stringWithFormat:@"/bin/rm -rf %@ && %@", sh_quote(dst), restart];
+        }
+        int rc = run_as_admin(cmd, install ? @"RDC wants to install RDC Microphone: then a phone connected to RDC can be a microphone of this Mac. "
+                                             @"Sound pauses for a second while the audio system restarts."
+                                           : @"RDC wants to remove RDC Microphone. Sound pauses for a second while the audio system restarts.");
+        if (rc == 0) rlog(install ? "RDC Microphone installed, the audio system restarted" : "RDC Microphone removed, the audio system restarted");
+        return rc;
+    }
+}
+
+void rdc_mic_start(void) {
+    pthread_mutex_lock(&g_mic_mutex);
+    char err[128];
+    if (rdc_mic_writer_open(&g_mic, err, sizeof err) != 0) rlog("phone microphone: %s", err);
+    rdc_mic_writer_start(&g_mic);
+    pthread_mutex_unlock(&g_mic_mutex);
+}
+
+void rdc_mic_push(const int16_t *pcm, int frames) {
+    if (frames <= 0) return;
+    pthread_mutex_lock(&g_mic_mutex);
+    rdc_mic_writer_push(&g_mic, pcm, (uint32_t)frames, now_us());
+    pthread_mutex_unlock(&g_mic_mutex);
+}
+
+void rdc_mic_stop(void) {
+    pthread_mutex_lock(&g_mic_mutex);
+    rdc_mic_writer_stop(&g_mic);
+    pthread_mutex_unlock(&g_mic_mutex);
+}
+
+int rdc_camera_install(int install, const void *dll, size_t dll_len) { return -1; }
+int rdc_app_prepare(const void *camera_dll, size_t camera_dll_len) { return 0; }
+void rdc_camera_start(void) {}
+void rdc_camera_push(const uint8_t *jpeg, size_t len, int width, int height) {}
+void rdc_camera_stop(void) {}
+
+// ---------------------------------------------------------------------------
 // App window
 
 @interface RDCAppDelegate : NSObject <NSApplicationDelegate>
@@ -880,7 +1023,15 @@ int rdc_computer_name(char *buf, int buflen) {
 @property(nonatomic, strong) NSTextField *setStatus;
 @property(nonatomic, strong) NSButton *setCheck;
 @property(nonatomic, strong) NSButton *setInstall;
+@property(nonatomic, strong) NSButton *setRemoveMic;
+@property(nonatomic, strong) NSTextField *mediaLabel;
+@property(nonatomic, strong) NSButton *mediaStopButton;
+@property(nonatomic, strong) NSTextField *micCaption;
+@property(nonatomic, strong) NSButton *micButton;
+@property(nonatomic) BOOL micBusy;
+@property(nonatomic) int mediaStatus;
 - (void)refreshSettings;
+- (void)refreshMedia;
 @end
 
 // Settings window state (written from any thread, drawn on the main one).
@@ -960,6 +1111,21 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     NSStackView *permButtons = [NSStackView stackViewWithViews:@[ self.screenButton, self.inputButton ]];
     permButtons.spacing = 8;
 
+    // The viewer's phone as a microphone of this Mac: what is live now, and the driver's state.
+    self.mediaLabel = make_label(@"", 13, NSFontWeightMedium, NSColor.systemGreenColor);
+    self.mediaLabel.hidden = YES;
+    self.mediaStopButton = [NSButton buttonWithTitle:@"Stop phone microphone" target:self action:@selector(stopMedia:)];
+    self.mediaStopButton.hidden = YES;
+    self.micCaption = make_label(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    self.micCaption.lineBreakMode = NSLineBreakByWordWrapping;  // a paragraph, not a one-line label
+    self.micCaption.cell.wraps = YES;
+    self.micCaption.cell.scrollable = NO;
+    self.micCaption.usesSingleLineMode = NO;
+    self.micCaption.maximumNumberOfLines = 0;
+    self.micCaption.preferredMaxLayoutWidth = 390;
+    self.micButton = [NSButton buttonWithTitle:@"Enable phone microphone" target:self action:@selector(enableMic:)];
+    self.micButton.hidden = YES;
+
     self.kickButton = [NSButton buttonWithTitle:@"Disconnect all" target:self action:@selector(disconnectAll:)];
     NSButton *renew = [NSButton buttonWithTitle:@"New code" target:self action:@selector(newCode:)];
     self.settingsButton = [NSButton buttonWithTitle:@"Settings…" target:self action:@selector(showSettings:)];
@@ -968,8 +1134,8 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
 
     NSStackView *stack = [NSStackView stackViewWithViews:@[
         caption, self.codeLabel, linkCaption, self.linkLabel, linkButtons, self.remoteCaption, self.remoteLabel,
-        self.remoteButtons, self.statusLabel, self.permLabel, permButtons,
-        sessionButtons
+        self.remoteButtons, self.statusLabel, self.permLabel, permButtons, self.mediaLabel, self.mediaStopButton,
+        self.micCaption, self.micButton, sessionButtons
     ]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeCenterX;
@@ -983,12 +1149,83 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     [stack setCustomSpacing:18 afterView:self.remoteButtons];
     [self.linkLabel.widthAnchor constraintLessThanOrEqualToConstant:390].active = YES;
     [self.remoteLabel.widthAnchor constraintLessThanOrEqualToConstant:390].active = YES;
+    [self.micCaption.widthAnchor constraintLessThanOrEqualToConstant:390].active = YES;
     self.window.contentView = stack;
+    [self refreshMedia];
     [self.window center];
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 
     if (g_on_ready) g_on_ready(g_app_ctx);
+}
+
+// The window grows and shrinks with what it shows, keeping its top edge in place.
+- (void)fitWindow {
+    NSView *stack = self.window.contentView;
+    CGFloat want = MAX(450, stack.fittingSize.height);
+    NSRect frame = self.window.frame;
+    CGFloat have = [self.window contentRectForFrameRect:frame].size.height;
+    if (fabs(want - have) < 2) return;
+    frame.origin.y -= want - have;
+    frame.size.height += want - have;
+    [self.window setFrame:frame display:YES animate:NO];
+}
+
+- (void)refreshMedia {
+    int status = rdc_media_status();
+    self.mediaStatus = status;
+    NSString *text;
+    NSString *button = nil;
+    if (status & RDC_MEDIA_MIC) {
+        text = @"Phone microphone is ready: a phone connected to RDC can be this Mac's microphone — pick "
+               @"\"RDC Microphone\" in any app. There is no phone camera on a Mac: it needs Apple's signed camera extension.";
+        if (status & RDC_MEDIA_MIC_OUTDATED) button = @"Update phone microphone";
+    } else if (status & RDC_MEDIA_MIC_INSTALLED) {
+        text = @"Phone microphone is installed, but the audio system has not loaded it — restart the Mac.";
+        button = (status & RDC_MEDIA_MIC_OUTDATED) ? @"Update phone microphone" : @"Reinstall phone microphone";
+    } else {
+        text = @"Phone microphone is off. Enable it, and a phone connected to RDC can be this Mac's microphone "
+               @"(\"RDC Microphone\" in any app). It asks for the administrator password once; sound pauses for a second.";
+        button = @"Enable phone microphone";
+    }
+    self.micCaption.stringValue = text;
+    self.micButton.hidden = button == nil;
+    if (button) self.micButton.title = button;
+    self.micButton.enabled = !self.micBusy;
+    [self refreshSettings];
+    [self fitWindow];
+}
+
+- (void)enableMic:(id)sender {
+    [self installMic:YES];
+}
+
+- (void)installMic:(BOOL)install {
+    if (self.micBusy) return;
+    self.micBusy = YES;
+    self.micButton.enabled = NO;
+    self.setRemoveMic.enabled = NO;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int rc = rdc_mic_install(install);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.micBusy = NO;
+            [self refreshMedia];
+            if (rc < 0) {
+                NSAlert *alert = [NSAlert new];
+                alert.messageText = install ? @"Could not install RDC Microphone" : @"Could not remove RDC Microphone";
+                alert.informativeText = @"Details are in the log: ~/Library/Logs/RDC/rdc.log";
+                [alert runModal];
+            }
+        });
+    });
+}
+
+- (void)stopMedia:(id)sender {
+    if (g_on_action) g_on_action(g_app_ctx, RDC_ACTION_STOP_MEDIA);
+}
+
+- (void)removeMic:(id)sender {
+    [self installMic:NO];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)app {
@@ -1052,7 +1289,9 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
         self.setInstall.keyEquivalent = @"\r";
         NSStackView *buttons = [NSStackView stackViewWithViews:@[ self.setCheck, self.setInstall ]];
         buttons.spacing = 8;
-        NSStackView *stack = [NSStackView stackViewWithViews:@[ self.setVersion, self.setAuto, hint, self.setStatus, buttons ]];
+        self.setRemoveMic = [NSButton buttonWithTitle:@"Remove phone microphone" target:self action:@selector(removeMic:)];
+        self.setRemoveMic.hidden = YES;
+        NSStackView *stack = [NSStackView stackViewWithViews:@[ self.setVersion, self.setAuto, hint, self.setStatus, buttons, self.setRemoveMic ]];
         stack.orientation = NSUserInterfaceLayoutOrientationVertical;
         stack.alignment = NSLayoutAttributeCenterX;
         stack.spacing = 12;
@@ -1078,6 +1317,8 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     self.setCheck.enabled = !g_set_busy;
     self.setInstall.hidden = !g_set_can_install;
     self.setInstall.enabled = g_set_can_install && !g_set_busy;
+    self.setRemoveMic.hidden = !(self.mediaStatus & RDC_MEDIA_MIC_INSTALLED);
+    self.setRemoveMic.enabled = !self.micBusy;
 }
 
 - (void)toggleAuto:(NSButton *)sender {
@@ -1149,6 +1390,8 @@ void rdc_app_set_status(const char *text) {
 }
 
 void rdc_app_set_permissions(int screen_ok, int input_ok) {
+    // Every couple of seconds from housekeeping: a good moment to look at the driver's state too.
+    int media = rdc_media_status();
     dispatch_async(dispatch_get_main_queue(), ^{
         NSMutableArray *missing = [NSMutableArray array];
         if (!screen_ok) [missing addObject:@"Screen Recording — without it viewers can't see the screen"];
@@ -1157,6 +1400,17 @@ void rdc_app_set_permissions(int screen_ok, int input_ok) {
         g_app.permLabel.hidden = missing.count == 0;
         g_app.screenButton.hidden = screen_ok != 0;
         g_app.inputButton.hidden = input_ok != 0;
+        if (media != g_app.mediaStatus) [g_app refreshMedia];
+    });
+}
+
+void rdc_app_set_media(const char *text) {
+    NSString *t = [NSString stringWithUTF8String:text] ?: @"";
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_app.mediaLabel.stringValue = t;
+        g_app.mediaLabel.hidden = t.length == 0;
+        g_app.mediaStopButton.hidden = t.length == 0;
+        [g_app fitWindow];
     });
 }
 

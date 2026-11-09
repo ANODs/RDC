@@ -17,6 +17,9 @@
 #include <knownfolders.h>
 #include <commctrl.h>
 #include <winver.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <sddl.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -24,6 +27,7 @@
 #include <string.h>
 #include <wchar.h>
 #include "platform.h"
+#include "camera_pipe.h"
 
 // ---------------------------------------------------------------------------
 // Strings, time, log
@@ -110,26 +114,6 @@ uint64_t rdc_now_us(void) {
     return t / f * 1000000ULL + t % f * 1000000ULL / f;
 }
 
-// A second launch shows the first one's window. After an update (RDC_RESTART) the new
-// version waits for the old one to exit.
-static HANDLE g_instance;
-
-static void single_instance(void) {
-    if (wcsstr(GetCommandLineW(), L"--no-ui")) return;
-    g_instance = CreateMutexW(NULL, FALSE, L"Local\\RDC-host");
-    if (!g_instance) return;
-    DWORD wait = GetEnvironmentVariableW(L"RDC_RESTART", NULL, 0) ? 15000 : 0;
-    SetEnvironmentVariableW(L"RDC_RESTART", NULL);
-    DWORD r = WaitForSingleObject(g_instance, wait);
-    if (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED) return;
-    HWND other = FindWindowW(L"RDCWindow", NULL);
-    if (other) {
-        ShowWindow(other, SW_RESTORE);
-        SetForegroundWindow(other);
-    }
-    ExitProcess(0);
-}
-
 void rdc_init(void) {
     QueryPerformanceFrequency(&g_qpf);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);  // in case the manifest did not apply
@@ -149,7 +133,8 @@ void rdc_init(void) {
         g_log_file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
                                  FILE_ATTRIBUTE_NORMAL, NULL);
     }
-    single_instance();
+    // One window at a time is rdc_app_prepare's business: `rdc mcp` and a host without a window
+    // run next to it freely.
 }
 
 // Windows has no separate permissions for screen capture and input.
@@ -1226,19 +1211,653 @@ void rdc_set_pref_bool(const char *key, int value) {
 }
 
 // ---------------------------------------------------------------------------
+// Administrator rights. RDC with a window restarts itself as administrator through the UAC
+// prompt (rdc_app_prepare): Windows delivers injected input only to windows of the same or a
+// lower integrity level, so without the rights a viewer cannot click in Task Manager, an
+// installer or any app that runs as administrator. With them RDC also opens Windows Firewall
+// for viewers and registers the phone camera, with no more prompts. Declined, RDC runs as before.
+
+static void post_refresh(void);
+static HANDLE g_instance;  // held by the one RDC window of this session
+static int g_elevated;
+static UINT g_msg_show;    // "RDC.ShowWindow": a second launch asks the running window to come forward
+
+static int is_elevated(void) {
+    HANDLE token = NULL;
+    TOKEN_ELEVATION e;
+    DWORD n = 0;
+    int yes = 0;
+    memset(&e, 0, sizeof e);
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        if (GetTokenInformation(token, TokenElevation, &e, sizeof e, &n)) yes = e.TokenIsElevated != 0;
+        CloseHandle(token);
+    }
+    return yes;
+}
+
+// The arguments this process was started with, without the program's own name.
+static const wchar_t *own_args(void) {
+    const wchar_t *p = GetCommandLineW();
+    if (*p == L'"') {
+        p++;
+        while (*p && *p != L'"') p++;
+        if (*p) p++;
+    } else {
+        while (*p && *p != L' ' && *p != L'\t') p++;
+    }
+    while (*p == L' ' || *p == L'\t') p++;
+    return p;
+}
+
+// Starts this exe again as administrator with these arguments; with `wait`, until it exits.
+// 0 — started (its exit code in *code), 1 — the person declined the UAC prompt, -1 — failed.
+static int run_elevated(const wchar_t *args, int wait, DWORD *code) {
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return -1;
+    SHELLEXECUTEINFOW sei;
+    memset(&sei, 0, sizeof sei);
+    sei.cbSize = sizeof sei;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe;
+    sei.lpParameters = args;
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) return GetLastError() == ERROR_CANCELLED ? 1 : -1;
+    if (sei.hProcess) {
+        if (wait) {
+            WaitForSingleObject(sei.hProcess, 120000);
+            if (code) GetExitCodeProcess(sei.hProcess, code);
+        }
+        CloseHandle(sei.hProcess);
+    }
+    return 0;
+}
+
+// Lets viewers in through Windows Firewall: an inbound rule for this exe, written again on every
+// start as administrator, since the file may have moved.
+static void firewall_open(void) {
+    wchar_t exe[MAX_PATH], sys[MAX_PATH], cmd[2048];
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH) || !GetSystemDirectoryW(sys, MAX_PATH)) return;
+    wfmt(cmd, 2048, L"\"%ls\\netsh.exe\" advfirewall firewall delete rule name=\"RDC\"", sys);
+    run_hidden(cmd);
+    wfmt(cmd, 2048, L"\"%ls\\netsh.exe\" advfirewall firewall add rule name=\"RDC\" dir=in action=allow program=\"%ls\" enable=yes profile=any",
+         sys, exe);
+    int rc = run_hidden(cmd);
+    if (rc == 0)
+        rlog("firewall: viewers are allowed in (rule \"RDC\")");
+    else
+        rlog("firewall: could not add the rule (netsh returned %d)", rc);
+}
+
+// ---------------------------------------------------------------------------
+// "RDC Camera": the viewer's camera as a Windows 11 virtual camera (docs/PLAN.md, section 6).
+// rdc-camera.dll (camera.c) is the media source that the Frame Server service loads; RDC.exe
+// carries it, writes it to %ProgramData%\RDC\ and registers its class under HKLM, which takes
+// administrator rights. While RDC runs it keeps the camera registered with the Frame Server
+// (session lifetime: gone when RDC exits) and serves frames over the pipe of camera_pipe.h: each
+// media source says which size its app picked and gets NV12 frames of that size, made from the
+// viewer's JPEG with WIC. Windows has no user-mode way to add a microphone, so there is none.
+
+// mfvirtualcamera.h is newer than the mingw headers: the parts used here, from the Windows SDK.
+typedef struct IMFVirtualCamera IMFVirtualCamera;
+typedef struct IMFVirtualCameraVtbl {
+    IMFAttributesVtbl attributes;  // IUnknown and IMFAttributes: 33 entries
+    HRESULT(STDMETHODCALLTYPE *AddDeviceSourceInfo)(IMFVirtualCamera *This, LPCWSTR info);
+    HRESULT(STDMETHODCALLTYPE *AddProperty)(IMFVirtualCamera *This, const void *key, ULONG type, const BYTE *data, ULONG size);
+    HRESULT(STDMETHODCALLTYPE *AddRegistryEntry)(IMFVirtualCamera *This, LPCWSTR name, LPCWSTR subkey, DWORD type, const BYTE *data, ULONG size);
+    HRESULT(STDMETHODCALLTYPE *Start)(IMFVirtualCamera *This, IMFAsyncCallback *callback);
+    HRESULT(STDMETHODCALLTYPE *Stop)(IMFVirtualCamera *This);
+    HRESULT(STDMETHODCALLTYPE *Remove)(IMFVirtualCamera *This);
+    HRESULT(STDMETHODCALLTYPE *GetMediaSource)(IMFVirtualCamera *This, IMFMediaSource **source);
+    HRESULT(STDMETHODCALLTYPE *SendCameraProperty)(IMFVirtualCamera *This, REFGUID set, ULONG id, ULONG flags, void *payload, ULONG payload_len, void *data, ULONG data_len, ULONG *written);
+    HRESULT(STDMETHODCALLTYPE *CreateSyncEvent)(IMFVirtualCamera *This, REFGUID set, ULONG id, ULONG flags, HANDLE event, void **sync);
+    HRESULT(STDMETHODCALLTYPE *CreateSyncSemaphore)(IMFVirtualCamera *This, REFGUID set, ULONG id, ULONG flags, HANDLE semaphore, LONG adjustment, void **sync);
+    HRESULT(STDMETHODCALLTYPE *Shutdown)(IMFVirtualCamera *This);
+} IMFVirtualCameraVtbl;
+struct IMFVirtualCamera {
+    const IMFVirtualCameraVtbl *lpVtbl;
+};
+// MFVirtualCameraType_SoftwareCameraSource, MFVirtualCameraLifetime_Session, MFVirtualCameraAccess_CurrentUser: all 0.
+typedef HRESULT(WINAPI *MFCreateVirtualCameraFn)(int type, int lifetime, int access, LPCWSTR name, LPCWSTR source_id,
+                                                 const GUID *categories, ULONG category_count, IMFVirtualCamera **camera);
+
+#define CAMERA_KEY L"Software\\Classes\\CLSID\\" RDC_CAMERA_CLSID_STR
+#define CAMERA_PREF "phoneCamera"  // 0 after "Remove phone camera": do not register it again on its own
+
+static const void *g_cam_dll;  // rdc-camera.dll as RDC.exe carries it
+static size_t g_cam_dll_len;
+static SRWLOCK g_cam_control = SRWLOCK_INIT;  // starting and stopping the virtual camera
+static HANDLE g_cam_thread, g_cam_quit;       // the thread that owns the IMFVirtualCamera
+static volatile LONG g_cam_running;           // "RDC Camera" is in the apps' lists right now
+static volatile LONG g_cam_live;              // a viewer's camera is on
+static uint64_t g_cam_retry_us;               // do not ask the Frame Server again before this
+static volatile LONG g_cam_state = -1;        // cached camera_registered()
+static uint64_t g_cam_state_us;
+
+static INIT_ONCE g_cam_api_once = INIT_ONCE_STATIC_INIT;
+static MFCreateVirtualCameraFn g_cam_api;
+
+static BOOL CALLBACK camera_api_init(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
+    HMODULE m = LoadLibraryW(L"mfsensorgroup.dll");
+    if (m) g_cam_api = (MFCreateVirtualCameraFn)(void *)GetProcAddress(m, "MFCreateVirtualCamera");
+    return TRUE;
+}
+
+// MFCreateVirtualCamera, or NULL before Windows 11.
+static MFCreateVirtualCameraFn camera_api(void) {
+    InitOnceExecuteOnce(&g_cam_api_once, camera_api_init, NULL, NULL);
+    return g_cam_api;
+}
+
+static void camera_paths(wchar_t *dir, wchar_t *dll) {
+    PWSTR pd = NULL;
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, NULL, &pd)) && pd) {
+        wfmt(dir, MAX_PATH, L"%ls\\RDC", pd);
+        CoTaskMemFree(pd);
+    } else {
+        wcscpy(dir, L"C:\\ProgramData\\RDC");
+    }
+    wfmt(dll, MAX_PATH, L"%ls\\%ls", dir, RDC_CAMERA_DLL_NAME);
+}
+
+// 0 — not registered; 1 — registered with the DLL this RDC carries; 2 — registered with another one.
+static int camera_registered(void) {
+    wchar_t dir[MAX_PATH], path[MAX_PATH], reg[MAX_PATH];
+    camera_paths(dir, path);
+    DWORD size = sizeof reg;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, CAMERA_KEY L"\\InprocServer32", NULL, RRF_RT_REG_SZ, NULL, reg, &size) != ERROR_SUCCESS) return 0;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    int same = _wcsicmp(reg, path) == 0;
+    if (same && g_cam_dll && g_cam_dll_len) {
+        LARGE_INTEGER len;
+        same = GetFileSizeEx(f, &len) && (uint64_t)len.QuadPart == g_cam_dll_len;
+        uint8_t *have = same ? malloc(g_cam_dll_len) : NULL;
+        size_t total = 0;
+        DWORD got = 0;
+        while (have && total < g_cam_dll_len && ReadFile(f, have + total, (DWORD)(g_cam_dll_len - total), &got, NULL) && got) total += got;
+        same = have && total == g_cam_dll_len && memcmp(have, g_cam_dll, g_cam_dll_len) == 0;
+        free(have);
+    }
+    CloseHandle(f);
+    return same ? 1 : 2;
+}
+
+// camera_registered(), looked up at most once in two seconds: the window asks often.
+static int camera_state(void) {
+    uint64_t now = rdc_now_us();
+    LONG s = g_cam_state;
+    if (s < 0 || now - g_cam_state_us > 2000000) {
+        s = camera_registered();
+        g_cam_state_us = now;
+        InterlockedExchange(&g_cam_state, s);
+    }
+    return (int)s;
+}
+
+// As administrator: writes the DLL and its COM class, or removes them. 0 or a negative error.
+static int camera_register(int install) {
+    wchar_t dir[MAX_PATH], path[MAX_PATH], old[MAX_PATH];
+    camera_paths(dir, path);
+    InterlockedExchange(&g_cam_state, -1);
+    if (!install) {
+        LONG rc = RegDeleteTreeW(HKEY_LOCAL_MACHINE, CAMERA_KEY);
+        // The Frame Server may still hold the file: then it goes at the next restart of Windows.
+        if (!DeleteFileW(path) && GetLastError() != ERROR_FILE_NOT_FOUND) MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+        if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) {
+            rlog("phone camera: cannot remove the registration (%ld)", (long)rc);
+            return -4;
+        }
+        return 0;
+    }
+    if (!g_cam_dll || !g_cam_dll_len) return -2;
+    CreateDirectoryW(dir, NULL);
+    // A loaded DLL cannot be overwritten, but it can be renamed out of the way.
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES && !DeleteFileW(path)) {
+        wfmt(old, MAX_PATH, L"%ls.old-%lu", path, (unsigned long)GetTickCount());
+        if (MoveFileExW(path, old, MOVEFILE_REPLACE_EXISTING)) MoveFileExW(old, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+    }
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        rlog("phone camera: cannot write the media source into ProgramData (%lu)", (unsigned long)GetLastError());
+        return -3;
+    }
+    DWORD written = 0;
+    BOOL ok = WriteFile(f, g_cam_dll, (DWORD)g_cam_dll_len, &written, NULL) && written == g_cam_dll_len;
+    CloseHandle(f);
+    if (!ok) return -3;
+    static const wchar_t name[] = L"RDC Camera media source", both[] = L"Both";
+    HKEY k;
+    LONG rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, CAMERA_KEY, 0, NULL, 0, KEY_WRITE, NULL, &k, NULL);
+    if (rc == ERROR_SUCCESS) {
+        RegSetValueExW(k, NULL, 0, REG_SZ, (const BYTE *)name, sizeof name);
+        RegCloseKey(k);
+        rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, CAMERA_KEY L"\\InprocServer32", 0, NULL, 0, KEY_WRITE, NULL, &k, NULL);
+    }
+    if (rc == ERROR_SUCCESS) {
+        rc = RegSetValueExW(k, NULL, 0, REG_SZ, (const BYTE *)path, (DWORD)((wcslen(path) + 1) * sizeof(wchar_t)));
+        if (rc == ERROR_SUCCESS) rc = RegSetValueExW(k, L"ThreadingModel", 0, REG_SZ, (const BYTE *)both, sizeof both);
+        RegCloseKey(k);
+    }
+    if (rc != ERROR_SUCCESS) {
+        rlog("phone camera: cannot register the media source (%ld)", (long)rc);
+        return -4;
+    }
+    return 0;
+}
+
+// --- Frames for the media sources: the pipe's server.
+
+typedef struct CamClient {
+    struct CamClient *next;
+    HANDLE pipe, event;  // event: a frame or "camera off" waits to be sent
+    uint32_t w, h;       // the size this app picked
+    uint8_t *frame;      // NV12 of that size waiting to be sent: the newest one only
+    int clear;           // say that the phone's camera is off
+} CamClient;
+
+static SRWLOCK g_cam_lock = SRWLOCK_INIT;  // the list and what waits in each client
+static CamClient *g_cam_clients;
+static HANDLE g_cam_server;
+
+static BOOL pipe_read_all(HANDLE p, void *buf, DWORD len) {
+    DWORD total = 0, n = 0;
+    while (total < len) {
+        if (!ReadFile(p, (uint8_t *)buf + total, len - total, &n, NULL) || n == 0) return FALSE;
+        total += n;
+    }
+    return TRUE;
+}
+
+static BOOL pipe_write_all(HANDLE p, const void *buf, DWORD len) {
+    DWORD total = 0, n = 0;
+    while (total < len) {
+        if (!WriteFile(p, (const uint8_t *)buf + total, len - total, &n, NULL)) return FALSE;
+        total += n;
+    }
+    return TRUE;
+}
+
+static DWORD WINAPI camera_client_main(LPVOID arg) {
+    CamClient *c = arg;
+    rdc_camera_want want;
+    int listed = 0;
+    if (pipe_read_all(c->pipe, &want, sizeof want) && want.magic == RDC_CAMERA_WANT && want.width >= 16 && want.width <= 4096 &&
+        want.height >= 16 && want.height <= 4096 && !((want.width | want.height) & 1)) {
+        c->w = want.width;
+        c->h = want.height;
+        AcquireSRWLockExclusive(&g_cam_lock);
+        c->next = g_cam_clients;
+        g_cam_clients = c;
+        ReleaseSRWLockExclusive(&g_cam_lock);
+        listed = 1;
+        for (;;) {
+            DWORD r = WaitForSingleObject(c->event, 2000);
+            if (r == WAIT_TIMEOUT) {
+                // Nothing to send: is the media source still there?
+                DWORD avail = 0;
+                if (!PeekNamedPipe(c->pipe, NULL, 0, NULL, &avail, NULL)) break;
+                continue;
+            }
+            AcquireSRWLockExclusive(&g_cam_lock);
+            uint8_t *frame = c->frame;
+            int clear = c->clear;
+            c->frame = NULL;
+            c->clear = 0;
+            ReleaseSRWLockExclusive(&g_cam_lock);
+            rdc_camera_frame hdr = {RDC_CAMERA_FRAME, c->w, c->h, frame ? c->w * c->h * 3 / 2 : 0};
+            BOOL ok = TRUE;
+            if (frame || clear) ok = pipe_write_all(c->pipe, &hdr, sizeof hdr) && (!frame || pipe_write_all(c->pipe, frame, hdr.size));
+            free(frame);
+            if (!ok) break;
+        }
+    }
+    if (listed) {
+        AcquireSRWLockExclusive(&g_cam_lock);
+        for (CamClient **pp = &g_cam_clients; *pp; pp = &(*pp)->next) {
+            if (*pp == c) {
+                *pp = c->next;
+                break;
+            }
+        }
+        ReleaseSRWLockExclusive(&g_cam_lock);
+    }
+    DisconnectNamedPipe(c->pipe);
+    CloseHandle(c->pipe);
+    CloseHandle(c->event);
+    free(c->frame);
+    free(c);
+    return 0;
+}
+
+static DWORD WINAPI camera_server_main(LPVOID arg) {
+    // Anyone on this computer may connect and read: the Frame Server runs as Local Service in
+    // session 0. Frames only flow out, and only to local clients.
+    SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, FALSE};
+    PSECURITY_DESCRIPTOR sd = NULL;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(A;;GRGW;;;WD)", SDDL_REVISION_1, &sd, NULL)) sa.lpSecurityDescriptor = sd;
+    for (;;) {
+        HANDLE p = CreateNamedPipeW(RDC_CAMERA_PIPE, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                                    PIPE_UNLIMITED_INSTANCES, 1 << 20, 4096, 0, &sa);
+        if (p == INVALID_HANDLE_VALUE) {
+            rlog("phone camera: cannot open the frame pipe (%lu)", (unsigned long)GetLastError());
+            Sleep(5000);
+            continue;
+        }
+        if (!ConnectNamedPipe(p, NULL) && GetLastError() != ERROR_PIPE_CONNECTED) {
+            CloseHandle(p);
+            continue;
+        }
+        CamClient *c = calloc(1, sizeof *c);
+        HANDLE t = NULL;
+        if (c) {
+            c->pipe = p;
+            c->event = CreateEventW(NULL, FALSE, FALSE, NULL);
+            if (c->event) t = CreateThread(NULL, 0, camera_client_main, c, 0, NULL);
+        }
+        if (t) {
+            CloseHandle(t);
+        } else {
+            if (c && c->event) CloseHandle(c->event);
+            free(c);
+            CloseHandle(p);
+        }
+    }
+}
+
+// --- The virtual camera itself.
+
+static DWORD WINAPI camera_main(LPVOID arg) {
+    MFCreateVirtualCameraFn create = camera_api();
+    HRESULT co = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    HRESULT mf = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+    IMFVirtualCamera *cam = NULL;
+    HRESULT hr = FAILED(mf) ? mf : create(0, 0, 0, RDC_CAMERA_FRIENDLY_NAME, RDC_CAMERA_CLSID_STR, NULL, 0, &cam);
+    if (SUCCEEDED(hr)) hr = cam->lpVtbl->Start(cam, NULL);
+    if (SUCCEEDED(hr)) {
+        InterlockedExchange(&g_cam_running, 1);
+        rlog("phone camera: \"RDC Camera\" is in the apps' camera lists");
+        post_refresh();
+        WaitForSingleObject(g_cam_quit, INFINITE);
+        InterlockedExchange(&g_cam_running, 0);
+    } else if (hr == E_ACCESSDENIED) {
+        rlog("phone camera: Windows refused the virtual camera — camera access is off in Settings > Privacy & security > Camera");
+    } else {
+        rlog("phone camera: Windows did not start the virtual camera (0x%08lx)", (unsigned long)hr);
+    }
+    if (cam) {
+        cam->lpVtbl->Shutdown(cam);  // a session camera leaves the apps' lists here
+        cam->lpVtbl->attributes.Release((IMFAttributes *)cam);
+    }
+    if (SUCCEEDED(mf)) MFShutdown();
+    if (SUCCEEDED(co)) CoUninitialize();
+    post_refresh();
+    return 0;
+}
+
+// Registers "RDC Camera" with the Frame Server if its media source is installed; no more than
+// one try in half a minute while Windows refuses.
+static void camera_open(void) {
+    if (!camera_api() || camera_state() != 1) return;
+    AcquireSRWLockExclusive(&g_cam_control);
+    if (g_cam_thread && WaitForSingleObject(g_cam_thread, 0) == WAIT_OBJECT_0) {  // the last try has ended
+        CloseHandle(g_cam_thread);
+        CloseHandle(g_cam_quit);
+        g_cam_thread = g_cam_quit = NULL;
+    }
+    uint64_t now = rdc_now_us();
+    if (!g_cam_thread && now >= g_cam_retry_us) {
+        g_cam_retry_us = now + 30000000;
+        if (!g_cam_server) g_cam_server = CreateThread(NULL, 0, camera_server_main, NULL, 0, NULL);
+        g_cam_quit = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (g_cam_quit) g_cam_thread = CreateThread(NULL, 0, camera_main, NULL, 0, NULL);
+        if (!g_cam_thread && g_cam_quit) {
+            CloseHandle(g_cam_quit);
+            g_cam_quit = NULL;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_cam_control);
+}
+
+static void camera_close(void) {
+    AcquireSRWLockExclusive(&g_cam_control);
+    if (g_cam_thread) {
+        SetEvent(g_cam_quit);
+        WaitForSingleObject(g_cam_thread, 10000);
+        CloseHandle(g_cam_thread);
+        CloseHandle(g_cam_quit);
+        g_cam_thread = g_cam_quit = NULL;
+    }
+    g_cam_retry_us = 0;
+    ReleaseSRWLockExclusive(&g_cam_control);
+}
+
+int rdc_media_status(void) {
+    if (!camera_api()) return 0;  // Windows 10: no virtual camera; no microphone on any Windows
+    int status = RDC_MEDIA_CAMERA_SETUP;
+    int state = camera_state();
+    if (state) status |= RDC_MEDIA_CAMERA_INSTALLED;
+    if (state == 2) status |= RDC_MEDIA_CAMERA_OUTDATED;
+    if (g_cam_running)
+        status |= RDC_MEDIA_CAMERA;
+    else if (state == 1)
+        camera_open();
+    return status;
+}
+
+int rdc_mic_install(int install) { return -1; }
+void rdc_mic_start(void) {}
+void rdc_mic_push(const int16_t *pcm, int frames) {}
+void rdc_mic_stop(void) {}
+
+int rdc_camera_install(int install, const void *dll, size_t dll_len) {
+    if (dll && dll_len) {
+        g_cam_dll = dll;
+        g_cam_dll_len = dll_len;
+    }
+    if (!camera_api()) {
+        rlog("phone camera: this needs Windows 11");
+        return -1;
+    }
+    if (!install) camera_close();  // let go of the camera before its media source is removed
+    int rc;
+    if (is_elevated()) {
+        rc = camera_register(install);
+    } else {
+        DWORD code = 1;
+        int r = run_elevated(install ? L"--register-camera" : L"--unregister-camera", 1, &code);
+        rc = r == 1 ? 1 : r == 0 && code == 0 ? 0 : -1;
+    }
+    InterlockedExchange(&g_cam_state, -1);
+    if (rc == 0) rdc_set_pref_bool(CAMERA_PREF, install);
+    post_refresh();
+    return rc;
+}
+
+void rdc_camera_start(void) { InterlockedExchange(&g_cam_live, 1); }
+
+void rdc_camera_stop(void) {
+    InterlockedExchange(&g_cam_live, 0);
+    AcquireSRWLockExclusive(&g_cam_lock);
+    for (CamClient *c = g_cam_clients; c; c = c->next) {
+        free(c->frame);
+        c->frame = NULL;
+        c->clear = 1;
+        SetEvent(c->event);
+    }
+    ReleaseSRWLockExclusive(&g_cam_lock);
+}
+
+// BGRA (bw × bh) into the middle of an NV12 frame (w × h), black around it. BT.601, video range.
+static void bgra_to_nv12(const uint8_t *bgra, int stride, int bw, int bh, uint8_t *nv12, int w, int h) {
+    uint8_t *yp = nv12, *uvp = nv12 + (size_t)w * h;
+    memset(yp, 16, (size_t)w * h);
+    memset(uvp, 128, (size_t)w * h / 2);
+    int ox = ((w - bw) / 2) & ~1, oy = ((h - bh) / 2) & ~1;
+    for (int y = 0; y < bh; y++) {
+        const uint8_t *s = bgra + (size_t)y * stride;
+        uint8_t *d = yp + (size_t)(oy + y) * w + ox;
+        for (int x = 0; x < bw; x++, s += 4) d[x] = (uint8_t)((66 * s[2] + 129 * s[1] + 25 * s[0] + 128 + (16 << 8)) >> 8);
+    }
+    for (int y = 0; y + 1 < bh; y += 2) {
+        const uint8_t *s0 = bgra + (size_t)y * stride, *s1 = s0 + stride;
+        uint8_t *d = uvp + (size_t)((oy + y) / 2) * w + ox;
+        for (int x = 0; x + 1 < bw; x += 2) {
+            const uint8_t *a = s0 + x * 4, *b2 = s1 + x * 4;
+            int b = a[0] + a[4] + b2[0] + b2[4], g = a[1] + a[5] + b2[1] + b2[5], r = a[2] + a[6] + b2[2] + b2[6];  // 2 × 2 pixels
+            d[x] = (uint8_t)((-38 * r - 74 * g + 112 * b + 512 + (128 << 10)) >> 10);
+            d[x + 1] = (uint8_t)((112 * r - 94 * g - 18 * b + 512 + (128 << 10)) >> 10);
+        }
+    }
+}
+
+// One JPEG frame from the viewer: decoded, fitted into each size the apps picked, handed to the
+// media sources. Called on the viewer's thread, up to 15 times a second.
+void rdc_camera_push(const uint8_t *jpeg, size_t len, int width, int height) {
+    if (!g_cam_live || !jpeg || len == 0 || len > (8u << 20)) return;
+    uint32_t sizes[4][2];
+    int count = 0;
+    AcquireSRWLockShared(&g_cam_lock);
+    for (CamClient *c = g_cam_clients; c; c = c->next) {
+        int known = 0;
+        for (int i = 0; i < count; i++) known |= sizes[i][0] == c->w && sizes[i][1] == c->h;
+        if (!known && count < 4) {
+            sizes[count][0] = c->w;
+            sizes[count][1] = c->h;
+            count++;
+        }
+    }
+    ReleaseSRWLockShared(&g_cam_lock);
+    if (count == 0) return;  // no app has the camera open
+
+    HRESULT co = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    IWICImagingFactory *wic = NULL;
+    IWICStream *in = NULL;
+    IWICBitmapDecoder *dec = NULL;
+    IWICBitmapFrameDecode *src = NULL;
+    UINT iw = 0, ih = 0;
+    if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&wic))) goto done;
+    if (FAILED(IWICImagingFactory_CreateStream(wic, &in))) goto done;
+    if (FAILED(IWICStream_InitializeFromMemory(in, (BYTE *)jpeg, (DWORD)len))) goto done;
+    if (FAILED(IWICImagingFactory_CreateDecoderFromStream(wic, (IStream *)in, NULL, WICDecodeMetadataCacheOnDemand, &dec))) goto done;
+    if (FAILED(IWICBitmapDecoder_GetFrame(dec, 0, &src))) goto done;
+    if (FAILED(IWICBitmapFrameDecode_GetSize(src, &iw, &ih)) || iw < 2 || ih < 2 || iw > 8192 || ih > 8192) goto done;
+    for (int i = 0; i < count; i++) {
+        int w = (int)sizes[i][0], h = (int)sizes[i][1];
+        // The whole picture, as large as fits, with even sides.
+        double k = (double)w / iw < (double)h / ih ? (double)w / iw : (double)h / ih;
+        int bw = (int)(iw * k + 0.5) & ~1, bh = (int)(ih * k + 0.5) & ~1;
+        if (bw < 2) bw = 2;
+        if (bh < 2) bh = 2;
+        if (bw > w) bw = w;
+        if (bh > h) bh = h;
+        IWICBitmapScaler *scaler = NULL;
+        IWICFormatConverter *conv = NULL;
+        uint8_t *bgra = malloc((size_t)bw * bh * 4), *nv12 = malloc((size_t)w * h * 3 / 2);
+        int ok = bgra && nv12 && SUCCEEDED(IWICImagingFactory_CreateBitmapScaler(wic, &scaler)) &&
+                 SUCCEEDED(IWICBitmapScaler_Initialize(scaler, (IWICBitmapSource *)src, (UINT)bw, (UINT)bh, WICBitmapInterpolationModeLinear)) &&
+                 SUCCEEDED(IWICImagingFactory_CreateFormatConverter(wic, &conv)) &&
+                 SUCCEEDED(IWICFormatConverter_Initialize(conv, (IWICBitmapSource *)scaler, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0.0,
+                                                          WICBitmapPaletteTypeCustom)) &&
+                 SUCCEEDED(IWICFormatConverter_CopyPixels(conv, NULL, (UINT)bw * 4, (UINT)bw * (UINT)bh * 4, bgra));
+        if (conv) IWICFormatConverter_Release(conv);
+        if (scaler) IWICBitmapScaler_Release(scaler);
+        if (ok) {
+            bgra_to_nv12(bgra, bw * 4, bw, bh, nv12, w, h);
+            size_t size = (size_t)w * h * 3 / 2;
+            AcquireSRWLockExclusive(&g_cam_lock);
+            for (CamClient *c = g_cam_clients; c; c = c->next) {
+                if ((int)c->w != w || (int)c->h != h) continue;
+                uint8_t *copy = malloc(size);
+                if (!copy) continue;
+                memcpy(copy, nv12, size);
+                free(c->frame);  // an unsent older frame gives way
+                c->frame = copy;
+                SetEvent(c->event);
+            }
+            ReleaseSRWLockExclusive(&g_cam_lock);
+        }
+        free(bgra);
+        free(nv12);
+    }
+done:
+    if (src) IWICBitmapFrameDecode_Release(src);
+    if (dec) IWICBitmapDecoder_Release(dec);
+    if (in) IWICStream_Release(in);
+    if (wic) IWICImagingFactory_Release(wic);
+    if (SUCCEEDED(co)) CoUninitialize();
+}
+
+// What RDC does once it has administrator rights, off the window's thread.
+static DWORD WINAPI admin_setup_main(LPVOID arg) {
+    firewall_open();
+    if (camera_api() && rdc_pref_bool(CAMERA_PREF, 1) && camera_registered() != 1) {
+        if (camera_register(1) == 0) rlog("phone camera: the media source is installed");
+    }
+    camera_open();
+    post_refresh();
+    return 0;
+}
+
+int rdc_app_prepare(const void *camera_dll, size_t camera_dll_len) {
+    g_cam_dll = camera_dll;
+    g_cam_dll_len = camera_dll_len;
+    int relaunched = wcsstr(GetCommandLineW(), L"--elevated") != NULL;  // the copy the UAC prompt started
+    int restart = GetEnvironmentVariableW(L"RDC_RESTART", NULL, 0) != 0;  // an update: the old version is leaving
+    SetEnvironmentVariableW(L"RDC_RESTART", NULL);
+    g_elevated = is_elevated();
+    g_msg_show = RegisterWindowMessageW(L"RDC.ShowWindow");
+    if (!restart && !relaunched) {
+        // Already running: its window comes forward, whatever rights either of the two has.
+        HWND other = FindWindowW(L"RDCWindow", NULL);
+        if (other) {
+            PostMessageW(other, g_msg_show, 0, 0);
+            return 1;
+        }
+    }
+    if (!g_elevated && !relaunched) {
+        wchar_t args[2048];
+        wfmt(args, 2048, L"%ls --elevated", own_args());
+        int r = run_elevated(args, 0, NULL);
+        if (r == 0) return 1;  // the administrator copy takes over
+        if (r == 1)
+            rlog("running without administrator rights (the UAC prompt was declined): input will not reach apps that run as administrator");
+        else
+            rlog("could not restart as administrator (%lu)", (unsigned long)GetLastError());
+    }
+    g_instance = CreateMutexW(NULL, FALSE, L"Local\\RDC-host");
+    if (g_instance) {
+        DWORD r = WaitForSingleObject(g_instance, restart || relaunched ? 15000 : 0);
+        if (r != WAIT_OBJECT_0 && r != WAIT_ABANDONED) {
+            HWND other = FindWindowW(L"RDCWindow", NULL);
+            if (other) PostMessageW(other, g_msg_show, 0, 0);
+            return 1;
+        }
+    }
+    if (g_elevated) {
+        HANDLE t = CreateThread(NULL, 0, admin_setup_main, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    } else {
+        camera_open();  // registered by an earlier run as administrator
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // App window
 
-enum { ID_COPY = 101, ID_OPEN, ID_NEWCODE, ID_KICK, ID_AUTO, ID_CHECK, ID_INSTALL, ID_COPY_REMOTE, ID_OPEN_REMOTE };
+enum { ID_COPY = 101, ID_OPEN, ID_NEWCODE, ID_KICK, ID_AUTO, ID_CHECK, ID_INSTALL, ID_COPY_REMOTE, ID_OPEN_REMOTE, ID_MEDIA_STOP, ID_CAMERA };
 #define WM_RDC_REFRESH (WM_APP + 1)
 #define WM_RDC_READY (WM_APP + 2)
 #define TIMER_COPIED 1
 #define CLIENT_W 440
-#define CLIENT_H 482
+#define CLIENT_H 600
 static const DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 
 static HWND volatile g_hwnd;
 static HWND g_code, g_link, g_copy, g_status, g_upd_status, g_auto, g_check, g_install, g_lbl_code, g_lbl_link, g_kick;
 static HWND g_lbl_remote, g_remote, g_copy_remote, g_open_remote;
+static HWND g_media, g_media_stop, g_cam_caption, g_cam_button;
 static volatile LONG g_ai_active;  // an AI agent is connected: the kick button stops it
 static HFONT g_font, g_font_big, g_font_small;
 static rdc_ctx_cb g_on_ready;
@@ -1250,6 +1869,7 @@ static int g_dpi = 96;
 static SRWLOCK g_ui_lock = SRWLOCK_INIT;
 static wchar_t g_ui_code[32] = L"— — —", g_ui_link[256] = L"", g_ui_remote[256] = L"", g_ui_status[512] = L"Starting…";
 static wchar_t g_ui_remote_caption[128] = L"";
+static wchar_t g_ui_media[160] = L"";  // what a viewer lends right now
 static wchar_t g_ui_version[32] = L"", g_ui_upd[512] = L"";
 static int g_ui_auto = 1, g_ui_can_install, g_ui_busy;
 
@@ -1264,8 +1884,9 @@ static void set_text(HWND w, const wchar_t *text) {
 static void refresh_ui(void) {
     HWND hwnd = g_hwnd;
     if (!hwnd) return;
-    wchar_t code[32], link[256], remote[256], remote_caption[128], status[512], ver[32], upd[512], title[64];
+    wchar_t code[32], link[256], remote[256], remote_caption[128], status[512], ver[32], upd[512], title[64], media[160];
     AcquireSRWLockShared(&g_ui_lock);
+    wcscpy(media, g_ui_media);
     wcscpy(code, g_ui_code);
     wcscpy(link, g_ui_link);
     wcscpy(remote, g_ui_remote);
@@ -1285,11 +1906,32 @@ static void refresh_ui(void) {
     ShowWindow(g_open_remote, has_remote ? SW_SHOW : SW_HIDE);
     set_text(g_status, status);
     set_text(g_upd_status, upd);
-    if (ver[0])
-        wfmt(title, 64, L"RDC %ls", ver);
-    else
-        wcscpy(title, L"RDC");
+    wfmt(title, 64, L"RDC%ls%ls%ls", ver[0] ? L" " : L"", ver, g_elevated ? L" — administrator" : L"");
     set_text(hwnd, title);
+    // The viewer's phone as this PC's camera: what is live, and the camera's state with its button.
+    int ms = rdc_media_status();
+    const wchar_t *caption, *cam_button = NULL;
+    if (ms & RDC_MEDIA_CAMERA) {
+        caption = L"Phone camera is ready: a phone connected to RDC can be this PC's camera — pick \"RDC Camera\" in any app. "
+                  L"Windows has no way to add a phone microphone.";
+        cam_button = L"Remove phone camera";
+    } else if (ms & RDC_MEDIA_CAMERA_OUTDATED) {
+        caption = L"Phone camera is installed from another version of RDC. Update it to use it with this one.";
+        cam_button = L"Update phone camera";
+    } else if (ms & RDC_MEDIA_CAMERA_INSTALLED) {
+        caption = L"Phone camera is installed, but Windows has not started it — the reason is in the log.";
+        cam_button = L"Remove phone camera";
+    } else if (ms & RDC_MEDIA_CAMERA_SETUP) {
+        caption = L"Phone camera is off. Enable it, and a phone connected to RDC can be this PC's camera (\"RDC Camera\" in any app).";
+        cam_button = L"Enable phone camera";
+    } else {
+        caption = L"A phone as this PC's camera needs Windows 11. Windows has no way to add a phone microphone.";
+    }
+    set_text(g_cam_caption, caption);
+    if (cam_button) set_text(g_cam_button, cam_button);
+    ShowWindow(g_cam_button, cam_button ? SW_SHOW : SW_HIDE);
+    set_text(g_media, media);
+    ShowWindow(g_media_stop, media[0] ? SW_SHOW : SW_HIDE);
     SendMessageW(g_auto, BM_SETCHECK, autoupd ? BST_CHECKED : BST_UNCHECKED, 0);
     EnableWindow(g_check, !busy);
     ShowWindow(g_install, can ? SW_SHOW : SW_HIDE);
@@ -1337,11 +1979,18 @@ static void build_controls(HWND p) {
     g_status = make(p, L"STATIC", L"", SS_CENTER | SS_ENDELLIPSIS, 0, 12, 280, 416, 20, 0, g_font);
     make(p, L"BUTTON", L"New code", btn, 0, 45, 306, 170, 30, ID_NEWCODE, g_font);
     g_kick = make(p, L"BUTTON", L"Disconnect all", btn, 0, 225, 306, 170, 30, ID_KICK, g_font);
-    make(p, L"STATIC", L"", SS_ETCHEDHORZ, 0, 24, 350, 392, 2, 0, g_font);
-    g_auto = make(p, L"BUTTON", L"Update automatically", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 28, 364, 210, 26, ID_AUTO, g_font);
-    g_check = make(p, L"BUTTON", L"Check for updates", btn, 0, 245, 362, 170, 30, ID_CHECK, g_font);
-    g_upd_status = make(p, L"STATIC", L"", SS_CENTER, 0, 12, 400, 416, 34, 0, g_font_small);
-    g_install = make(p, L"BUTTON", L"Update and restart", btn, 0, 110, 438, 220, 30, ID_INSTALL, g_font);
+    // The viewer's phone as this PC's camera: what is live now, the camera's state, its buttons.
+    g_media = make(p, L"STATIC", L"", SS_CENTER | SS_ENDELLIPSIS, 0, 12, 346, 416, 20, 0, g_font);
+    g_cam_caption = make(p, L"STATIC", L"", SS_CENTER, 0, 24, 370, 392, 52, 0, g_font_small);
+    g_cam_button = make(p, L"BUTTON", L"Enable phone camera", btn, 0, 45, 428, 170, 30, ID_CAMERA, g_font);
+    g_media_stop = make(p, L"BUTTON", L"Stop phone camera", btn, 0, 225, 428, 170, 30, ID_MEDIA_STOP, g_font);
+    ShowWindow(g_cam_button, SW_HIDE);
+    ShowWindow(g_media_stop, SW_HIDE);
+    make(p, L"STATIC", L"", SS_ETCHEDHORZ, 0, 24, 470, 392, 2, 0, g_font);
+    g_auto = make(p, L"BUTTON", L"Update automatically", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 28, 484, 210, 26, ID_AUTO, g_font);
+    g_check = make(p, L"BUTTON", L"Check for updates", btn, 0, 245, 482, 170, 30, ID_CHECK, g_font);
+    g_upd_status = make(p, L"STATIC", L"", SS_CENTER, 0, 12, 520, 416, 34, 0, g_font_small);
+    g_install = make(p, L"BUTTON", L"Update and restart", btn, 0, 110, 558, 220, 30, ID_INSTALL, g_font);
     ShowWindow(g_install, SW_HIDE);
 }
 
@@ -1392,9 +2041,16 @@ static void action(int a) {
 }
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_msg_show && msg == g_msg_show) {  // a second launch of RDC: come forward
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+        return 0;
+    }
     switch (msg) {
     case WM_CREATE: {
         g_hwnd = hwnd;
+        // A launch without administrator rights may ask this window to come forward too.
+        if (g_msg_show) ChangeWindowMessageFilterEx(hwnd, g_msg_show, MSGFLT_ALLOW, NULL);
         g_dpi = (int)GetDpiForWindow(hwnd);
         rebuild(hwnd);
         int w, h;
@@ -1448,14 +2104,22 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_INSTALL:
             action(RDC_ACTION_INSTALL_UPDATE);
             break;
+        case ID_MEDIA_STOP:
+            action(RDC_ACTION_STOP_MEDIA);
+            break;
+        case ID_CAMERA: {
+            int ms = rdc_media_status();
+            action((ms & RDC_MEDIA_CAMERA_INSTALLED) && !(ms & RDC_MEDIA_CAMERA_OUTDATED) ? RDC_ACTION_MEDIA_REMOVE : RDC_ACTION_MEDIA_INSTALL);
+            break;
+        }
         }
         return 0;
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wp;
         HWND c = (HWND)lp;
         SetBkMode(dc, TRANSPARENT);
-        int gray = c == g_lbl_code || c == g_lbl_link || c == g_upd_status;
-        SetTextColor(dc, GetSysColor(gray ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT));
+        int gray = c == g_lbl_code || c == g_lbl_link || c == g_upd_status || c == g_cam_caption;
+        SetTextColor(dc, c == g_media ? RGB(0, 128, 64) : GetSysColor(gray ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT));
         return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
     }
     case WM_DPICHANGED: {
@@ -1511,6 +2175,7 @@ void rdc_app_run(rdc_ctx_cb on_ready, rdc_action_cb on_action, void *ctx) {
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
+    camera_close();  // "RDC Camera" leaves the apps' lists with RDC
     ExitProcess(0);
 }
 
@@ -1537,7 +2202,16 @@ void rdc_app_set_status(const char *text) {
     post_refresh();
 }
 
-void rdc_app_set_permissions(int screen_ok, int input_ok) {}
+// Windows asks for no permissions; the call comes every couple of seconds, so the window looks
+// at the phone camera's state then.
+void rdc_app_set_permissions(int screen_ok, int input_ok) { post_refresh(); }
+
+void rdc_app_set_media(const char *text) {
+    AcquireSRWLockExclusive(&g_ui_lock);
+    to_wide(text, g_ui_media, 160);
+    ReleaseSRWLockExclusive(&g_ui_lock);
+    post_refresh();
+}
 
 void rdc_app_set_ai(int active) {
     LONG now = active ? 1 : 0;

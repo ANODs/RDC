@@ -1,0 +1,4 @@
+LIBRARY "rdc-camera"
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE
