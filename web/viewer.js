@@ -729,33 +729,42 @@ function syncCursor(m) {
   tp.y = clamp01(m.cy);
 }
 
-canvas.addEventListener('pointermove', (e) => {
+// A finger is a touchpad, so it works on the whole page, the bars around the picture included;
+// the mouse acts only over the picture, where its place has a meaning. The toolbar, its handle
+// and the AI banner keep their own taps.
+const stage = $('stage');
+const onUi = (e) => !!(e.target.closest && e.target.closest('#bar, #handle, #ai'));
+stage.addEventListener('pointermove', (e) => {
   if (e.pointerType === 'touch') return touchMove(e);
+  if (e.target !== canvas) return;
   movePending = norm(e);
 });
-canvas.addEventListener('pointerdown', (e) => {
+stage.addEventListener('pointerdown', (e) => {
+  if (onUi(e)) return;
+  if (e.pointerType !== 'touch' && e.target !== canvas) return;
   e.preventDefault();
   canvas.focus();
-  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {} // later events of this pointer target the picture
   if (e.pointerType === 'touch') return touchDown(e);
   const [x, y] = norm(e);
   movePending = null;
   sendMove(x, y);
   sendButton(buttonOf(e), true, x, y);
 });
-canvas.addEventListener('pointerup', (e) => {
-  e.preventDefault();
+stage.addEventListener('pointerup', (e) => {
   if (e.pointerType === 'touch') return touchUp(e);
+  if (e.target !== canvas) return;
+  e.preventDefault();
   const [x, y] = norm(e);
   sendButton(buttonOf(e), false, x, y);
 });
-canvas.addEventListener('pointercancel', (e) => {
+stage.addEventListener('pointercancel', (e) => {
   if (e.pointerType !== 'touch') return;
   tp.touches.delete(e.pointerId);
   if (tp.touches.size === 0) tp.mode = 'none';
 });
-canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-canvas.addEventListener('wheel', (e) => {
+stage.addEventListener('contextmenu', (e) => e.preventDefault());
+stage.addEventListener('wheel', (e) => {
   e.preventDefault();
   const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
   wheelX += e.deltaX * k;
@@ -909,7 +918,9 @@ const osk = (() => {
   const st = load();
 
   function load() {
-    const d = { visible: false, docked: window.innerWidth < 700, ghost: false, w: Math.min(window.innerWidth - 16, 760), x: 8, y: 80 };
+    // ru: the Cyrillic letters are the big labels and the Latin ones the small — for a computer
+    // whose layout is Russian right now.
+    const d = { visible: false, docked: window.innerWidth < 700, ghost: false, ru: false, w: Math.min(window.innerWidth - 16, 760), x: 8, y: 80 };
     try { return Object.assign(d, JSON.parse(localStorage.getItem(STORE) || '{}')); } catch (_) { return d; }
   }
   function save() { try { localStorage.setItem(STORE, JSON.stringify(st)); } catch (_) {} }
@@ -962,7 +973,10 @@ const osk = (() => {
 
   // --- labels
   const shiftOn = () => mods.shift > 0;
+  /// The Latin label of a key that also has a Cyrillic letter, without Shift.
+  const latin = (code) => (code.startsWith('Key') ? code.slice(3).toLowerCase() : PLAIN[code]);
   function label(code) {
+    if (st.ru && RU[code]) return shiftOn() ? RU[code].toUpperCase() : RU[code];
     if (code.startsWith('Key')) return shiftOn() ? code.slice(3) : code.slice(3).toLowerCase();
     if (code.startsWith('Digit')) return shiftOn() ? SHIFTED[code] : code.slice(5);
     if (PLAIN[code]) return shiftOn() ? SHIFTED[code] : PLAIN[code];
@@ -992,7 +1006,9 @@ const osk = (() => {
     if (spec.code === 'Space') b.style.fontSize = 'calc(var(--u) * .3)';
     if (NAMES[spec.code] !== undefined && spec.code !== 'Space' && !/^Arrow/.test(spec.code) && spec.code !== 'Backspace' && spec.code !== 'Enter') b.classList.add('fn');
     if (spec.small || /^F\d+$/.test(spec.code)) b.classList.add('fn');
-    if (RU[spec.code]) { const a = document.createElement('span'); a.className = 'alt'; a.textContent = RU[spec.code]; b.append(a); }
+    // The other alphabet, small: Cyrillic under Latin labels, Latin under Cyrillic ones.
+    const alt = RU[spec.code] && (st.ru ? latin(spec.code) : RU[spec.code]);
+    if (alt) { const a = document.createElement('span'); a.className = 'alt'; a.textContent = alt; b.append(a); }
     return b;
   }
 
@@ -1000,7 +1016,7 @@ const osk = (() => {
     if (el.hidden) return;
     const width = el.getBoundingClientRect().width;
     const wide = width >= WIDE;
-    const sig = [wide, page, os.title, shiftOn()].join('|');
+    const sig = [wide, page, os.title, shiftOn(), st.ru].join('|');
     if (force || sig !== rendered) {
       rendered = sig;
       keysEl.textContent = '';
@@ -1079,7 +1095,15 @@ const osk = (() => {
   function press(b, id) {
     if (b.dataset.mod) return tapMod(b.dataset.mod);
     if (b.dataset.page) { page = b.dataset.page; vibrate(); return render(); }
-    if (b.dataset.lang) { const [m, code] = os.lang; return combo([m], code); }
+    if (b.dataset.lang) {
+      // The computer switches its layout; the labels follow (most computers have exactly two).
+      // The EN/RU button in the header corrects them when they get out of step.
+      const [m, code] = os.lang;
+      st.ru = !st.ru;
+      save();
+      apply();
+      return combo([m], code);
+    }
     const code = b.dataset.code;
     if (!code || HID[code] === undefined) return;
     const usage = HID[code];
@@ -1136,6 +1160,9 @@ const osk = (() => {
     el.classList.toggle('ghost', st.ghost);
     head.querySelector('[data-act="dock"]').classList.toggle('on', st.docked);
     head.querySelector('[data-act="ghost"]').classList.toggle('on', st.ghost);
+    const langBtn = head.querySelector('[data-act="lang"]');
+    langBtn.textContent = st.ru ? 'RU' : 'EN';
+    langBtn.classList.toggle('on', st.ru);
     if (!st.docked) el.style.width = Math.max(300, Math.min(st.w, window.innerWidth - 8)) + 'px';
     render();
     if (!st.docked) {
@@ -1197,6 +1224,7 @@ const osk = (() => {
     if (act === 'hide') setVisible(false);
     else if (act === 'dock') { st.docked = !st.docked; save(); apply(); }
     else if (act === 'ghost') { st.ghost = !st.ghost; save(); apply(); }
+    else if (act === 'lang') { st.ru = !st.ru; save(); apply(); }
   });
 
   let resize = null;
