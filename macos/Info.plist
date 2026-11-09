@@ -32,6 +32,6 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>RDC — Remote Desktop Control</string>
+	<string>Copyright 2026 Timoshkin Timofey. Apache License 2.0.</string>
 </dict>
 </plist>

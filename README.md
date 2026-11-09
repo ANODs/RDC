@@ -46,3 +46,7 @@ Tests: `zig build test`. Local release build: `zig build release -Doptimize=Rele
 | Android | viewer and host (planned) |
 | iOS / iPadOS | viewer and screen sharing (planned) |
 | Browser | viewer |
+
+## License
+
+Copyright 2026 Timoshkin Timofey. RDC is open source under the [Apache License 2.0](LICENSE).

@@ -10,5 +10,6 @@
         "web",
         "macos",
         "tools",
+        "LICENSE",
     },
 }
