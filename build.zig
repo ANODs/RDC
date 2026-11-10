@@ -97,7 +97,7 @@ pub fn build(b: *std.Build) void {
         const frameworks = [_][]const u8{
             "Foundation", "AppKit",       "ScreenCaptureKit",    "VideoToolbox", "CoreMedia",
             "CoreVideo",  "CoreGraphics", "ApplicationServices", "IOSurface",    "ImageIO",
-            "CoreAudio",
+            "CoreAudio",  "IOKit",        "LocalAuthentication",
         };
         for (frameworks) |fw| root.linkFramework(fw, .{});
     }

@@ -13,6 +13,9 @@ pub const action_stop_ai: c_int = 7;
 pub const action_stop_media: c_int = 8;
 pub const action_media_install: c_int = 9;
 pub const action_media_remove: c_int = 10;
+pub const action_permanent_on: c_int = 11;
+pub const action_permanent_off: c_int = 12;
+pub const action_permanent_reset: c_int = 13;
 
 pub const media_mic: c_int = 1;
 pub const media_camera: c_int = 2;
@@ -63,6 +66,9 @@ pub extern fn rdc_install_path(buf: [*]u8, buflen: c_int) c_int;
 pub extern fn rdc_cleanup_old_install() void;
 pub extern fn rdc_pref_bool(key: [*:0]const u8, def: c_int) c_int;
 pub extern fn rdc_set_pref_bool(key: [*:0]const u8, value: c_int) void;
+pub extern fn rdc_seed_load(buf: [*]u8, cap: c_int) c_int;
+pub extern fn rdc_seed_save(data: [*]const u8, len: c_int) c_int;
+pub extern fn rdc_app_set_permanent(on: c_int, link: [*:0]const u8, link_qr: ?[*]const u8, link_qr_size: c_int, auth_qr: ?[*]const u8, auth_qr_size: c_int, secret_text: [*:0]const u8) void;
 pub extern fn rdc_settings_update(version: [*:0]const u8, auto_update: c_int, status: [*:0]const u8, can_install: c_int, busy: c_int) void;
 
 pub extern fn rdc_app_prepare(camera_dll: ?[*]const u8, camera_dll_len: usize) c_int;

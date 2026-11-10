@@ -10,6 +10,7 @@ Lightweight, low-latency cross-platform remote desktop written in Zig.
 - From anywhere — a phone on mobile data, another network: the RDC window shows a second link that opens the viewer from [GitHub Pages](https://anods.github.io/RDC/). The page finds the computer through public MQTT brokers, with the handshake sealed by a key from the link, and connects to it directly over WebRTC. No servers of our own, no relay, nothing to install on the phone.
 - Full mouse and keyboard control. On phones, a touchpad mode: tap for left click, double tap for right click, two fingers to scroll. Esc on the viewer's keyboard ends the session; the Esc of the on-screen keyboard is the one that goes to the computer.
 - Your phone as the computer's microphone or camera: the viewer's **Camera and mic** button lends them, and on the computer they are ordinary devices, "RDC Microphone" and "RDC Camera", that any app can pick — see [below](#phone-as-a-microphone-and-camera).
+- Permanent access (macOS, off by default): a link of your own that never changes and asks for a code from an authenticator app — with start at login and keep-awake, your Mac is reachable when no one is at it. See [below](#permanent-access).
 - On-screen keyboard that matches the host OS (⌘/⌥/⌃ for macOS, Ctrl/Win/Alt for Windows), with OS-specific shortcuts. It can be moved, resized, docked and hidden.
 - H.264 via WebCodecs where the browser supports it, JPEG otherwise.
 - Automatic updates from GitHub Releases, verified with an Ed25519 signature.
@@ -44,7 +45,18 @@ The device that opened the viewer — a phone, a laptop — can lend its microph
 | Windows 11 | Not available: Windows has no way to add a microphone without a kernel driver. | "RDC Camera": registered by RDC when it starts as administrator, or with **Enable phone camera** in its window. Built, not yet run on a PC. |
 | Windows 10 | Not available. | Not available: the virtual camera API came with Windows 11. |
 
-Audio travels as 48 kHz PCM and video as JPEG frames, over the same connection as the screen. On a Mac with the browser on the same machine the microphone arrives 70 ms later; expect about 100 ms on a home network and under 300 ms on mobile data. One viewer at a time lends its devices.
+Audio travels as 48 kHz PCM and video as JPEG frames, over the same connection as the screen. The camera starts in **Light** quality (640×360, 10 frames a second), which keeps the phone cool; **HD** is 1280×720 at 15. On a Mac with the browser on the same machine the microphone arrives 70 ms later; expect about 100 ms on a home network and under 300 ms on mobile data. One viewer at a time lends its devices.
+
+## Permanent access
+
+For reaching your own Mac when no one is there to read you a code. In RDC, open **Settings** (⌘,) and switch on **Permanent access**, then **Set up the phone…**:
+
+1. Point the phone's camera at the first QR code: it opens your permanent link. Keep it — add the page to the home screen.
+2. In an authenticator app (Google Authenticator, 1Password, any TOTP app), scan the second QR code. It is shown after Touch ID or your password.
+
+From then on: open the link, enter the app's current 6-digit code, and you are in. The link alone lets no one in; a code works once; after 5 wrong codes the link waits half a minute, after 20 a day. **New link and key…** replaces both if the phone is lost.
+
+Two more switches in Settings make the Mac reachable: **Start RDC at login** (it starts hidden and keeps running when its window is closed) and **Keep this Mac awake** (a sleeping computer cannot be reached). The Mac must be logged in; a MacBook with its lid closed sleeps anyway. Windows does not have these settings yet.
 
 ## Download
 

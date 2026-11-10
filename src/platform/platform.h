@@ -28,6 +28,10 @@ typedef void (*rdc_action_cb)(void *ctx, int action);
 // rdc_camera_install on a thread, since the DLL's bytes live on the Zig side.
 #define RDC_ACTION_MEDIA_INSTALL 9
 #define RDC_ACTION_MEDIA_REMOVE 10
+// Settings → permanent access (docs/PLAN.md, section 6): on, off, a new link and authenticator key.
+#define RDC_ACTION_PERMANENT_ON 11
+#define RDC_ACTION_PERMANENT_OFF 12
+#define RDC_ACTION_PERMANENT_RESET 13
 
 // Process: the log goes to stderr and to a file (macOS — ~/Library/Logs/RDC/rdc.log,
 // Windows — %LOCALAPPDATA%\RDC\rdc.log).
@@ -82,6 +86,17 @@ int rdc_install_path(char *buf, int buflen);  // path to RDC.app (macOS) or rdc.
 void rdc_cleanup_old_install(void);          // remove leftovers of the previous version after an update
 int rdc_pref_bool(const char *key, int def);
 void rdc_set_pref_bool(const char *key, int value);
+// The seed of permanent access, kept between runs in a file only this user can read (macOS —
+// ~/Library/Application Support/RDC/permanent, Windows — %LOCALAPPDATA%\RDC\permanent). The process
+// that loads it holds it until it exits. Load: bytes read, 0 — none yet, -1 — failed, -2 — another
+// RDC on this computer holds it. Save: 0 — saved.
+int rdc_seed_load(void *buf, int cap);
+int rdc_seed_save(const void *data, int len);
+// Settings → permanent access: whether it is on, its link, and two QR codes (modules row by row,
+// 1 — dark): the link for a phone's camera and the key for an authenticator app, with the same
+// key as text for typing in by hand.
+void rdc_app_set_permanent(int on, const char *link, const uint8_t *link_qr, int link_qr_size,
+                           const uint8_t *auth_qr, int auth_qr_size, const char *secret_text);
 // Settings window: version, auto-update, status, whether an update can be installed, whether work is in progress.
 void rdc_settings_update(const char *version, int auto_update, const char *status, int can_install, int busy);
 

@@ -73,6 +73,8 @@ pub fn main(init: std.process.Init) !void {
             opts.update_url = args[i];
         } else if (eql(u8, a, "--no-remote")) {
             opts.remote = false;
+        } else if (eql(u8, a, "--login")) {
+            opts.login = true; // started by the OS at login: the window stays hidden
         } else if (eql(u8, a, "--elevated")) {
             continue; // Windows: this copy was started as administrator (rdc_app_prepare)
         } else if (i + 1 < args.len and eql(u8, a, "--remote-url")) {

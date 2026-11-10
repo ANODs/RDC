@@ -1190,6 +1190,45 @@ int rdc_install_update(const char *file_path, const char *version) {
     return 0;
 }
 
+// Permanent access: the seed file, held open (and so by one RDC only) for as long as this process lives.
+static HANDLE g_seed = INVALID_HANDLE_VALUE;
+
+static int seed_open(void) {
+    if (g_seed != INVALID_HANDLE_VALUE) return 0;
+    wchar_t dir[MAX_PATH], path[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return -1;
+    wfmt(path, MAX_PATH, L"%ls\\RDC", dir);
+    CreateDirectoryW(path, NULL);
+    wfmt(path, MAX_PATH, L"%ls\\RDC\\permanent", dir);
+    HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_SHARING_VIOLATION ? -2 : -1;
+    g_seed = h;
+    return 0;
+}
+
+int rdc_seed_load(void *buf, int cap) {
+    int rc = seed_open();
+    if (rc != 0) return rc;
+    DWORD got = 0;
+    SetFilePointer(g_seed, 0, NULL, FILE_BEGIN);
+    if (!ReadFile(g_seed, buf, (DWORD)cap, &got, NULL)) return -1;
+    return (int)got;
+}
+
+int rdc_seed_save(const void *data, int len) {
+    if (seed_open() != 0) return -1;
+    DWORD put = 0;
+    SetFilePointer(g_seed, 0, NULL, FILE_BEGIN);
+    if (!SetEndOfFile(g_seed) || !WriteFile(g_seed, data, (DWORD)len, &put, NULL) || put != (DWORD)len) return -1;
+    FlushFileBuffers(g_seed);
+    return 0;
+}
+
+// The settings for permanent access live in the macOS window so far; on Windows it stays off.
+void rdc_app_set_permanent(int on, const char *link, const uint8_t *link_qr, int link_qr_size,
+                           const uint8_t *auth_qr, int auth_qr_size, const char *secret_text) {}
+
 int rdc_pref_bool(const char *key, int def) {
     wchar_t wk[128];
     to_wide(key, wk, 128);

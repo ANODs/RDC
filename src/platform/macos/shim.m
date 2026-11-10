@@ -8,7 +8,11 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <ImageIO/ImageIO.h>
 #import <CoreAudio/CoreAudio.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
+#import <LocalAuthentication/LocalAuthentication.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -851,6 +855,115 @@ void rdc_set_pref_bool(const char *key, int value) {
     [NSUserDefaults.standardUserDefaults setBool:value != 0 forKey:[NSString stringWithUTF8String:key]];
 }
 
+// ---------------------------------------------------------------------------
+// Permanent access: the seed file, start at login, staying awake
+
+static int g_seed_fd = -1;  // open and locked for as long as this process lives
+
+static int seed_open(void) {
+    if (g_seed_fd >= 0) return 0;
+    @autoreleasepool {
+        NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/RDC"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES
+                                                   attributes:@{NSFilePosixPermissions : @0700}
+                                                        error:nil];
+        int fd = open([dir stringByAppendingPathComponent:@"permanent"].fileSystemRepresentation, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            rlog("permanent access: cannot open the key file: %s", strerror(errno));
+            return -1;
+        }
+        if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            close(fd);
+            return -2;
+        }
+        fchmod(fd, 0600);
+        g_seed_fd = fd;
+        return 0;
+    }
+}
+
+int rdc_seed_load(void *buf, int cap) {
+    int rc = seed_open();
+    if (rc != 0) return rc;
+    ssize_t n = pread(g_seed_fd, buf, (size_t)cap, 0);
+    return n < 0 ? -1 : (int)n;
+}
+
+int rdc_seed_save(const void *data, int len) {
+    if (seed_open() != 0) return -1;
+    if (ftruncate(g_seed_fd, 0) != 0 || pwrite(g_seed_fd, data, (size_t)len, 0) != len) return -1;
+    fsync(g_seed_fd);
+    return 0;
+}
+
+// Start at login: a LaunchAgent that opens this copy of RDC with --login (the window stays hidden).
+static NSString *const kAgentLabel = @"com.anods.rdc.login";
+
+static NSString *agent_path(void) {
+    return [NSHomeDirectory() stringByAppendingFormat:@"/Library/LaunchAgents/%@.plist", kAgentLabel];
+}
+
+static NSString *own_binary(void) {
+    return NSBundle.mainBundle.executablePath ?: NSProcessInfo.processInfo.arguments.firstObject;
+}
+
+static int autostart_on(void) {
+    return [NSFileManager.defaultManager fileExistsAtPath:agent_path()];
+}
+
+static int autostart_set(int on) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (!on) {
+        NSError *e = nil;
+        if ([fm fileExistsAtPath:agent_path()] && ![fm removeItemAtPath:agent_path() error:&e]) {
+            rlog("start at login: cannot remove %s: %s", agent_path().UTF8String, e.localizedDescription.UTF8String);
+            return -1;
+        }
+        rlog("start at login: off");
+        return 0;
+    }
+    NSDictionary *job = @{
+        @"Label" : kAgentLabel,
+        @"ProgramArguments" : @[ own_binary(), @"--login" ],
+        @"RunAtLoad" : @YES,
+        @"ProcessType" : @"Interactive",
+        @"LimitLoadToSessionType" : @"Aqua",
+        @"AssociatedBundleIdentifiers" : @[ @"com.anods.rdc" ],
+    };
+    [fm createDirectoryAtPath:agent_path().stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
+    NSError *e = nil;
+    NSData *xml = [NSPropertyListSerialization dataWithPropertyList:job format:NSPropertyListXMLFormat_v1_0 options:0 error:&e];
+    if (!xml || ![xml writeToFile:agent_path() options:NSDataWritingAtomic error:&e]) {
+        rlog("start at login: cannot write %s: %s", agent_path().UTF8String, e.localizedDescription.UTF8String);
+        return -1;
+    }
+    rlog("start at login: on (%s)", own_binary().UTF8String);
+    return 0;
+}
+
+// RDC was moved since the agent was written: point it at where RDC is now.
+static void autostart_repair(void) {
+    NSDictionary *job = [NSDictionary dictionaryWithContentsOfFile:agent_path()];
+    NSString *program = [job[@"ProgramArguments"] firstObject];
+    if (!job || (program && [NSFileManager.defaultManager isExecutableFileAtPath:program])) return;
+    autostart_set(1);
+}
+
+// Keep awake: the computer does not fall asleep on its own while RDC runs (the display still may).
+static IOPMAssertionID g_awake;
+
+static void keep_awake(int on) {
+    if (on && !g_awake) {
+        if (IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep, kIOPMAssertionLevelOn,
+                                        CFSTR("RDC keeps this Mac reachable"), &g_awake) != kIOReturnSuccess)
+            g_awake = 0;
+    } else if (!on && g_awake) {
+        IOPMAssertionRelease(g_awake);
+        g_awake = 0;
+    }
+}
+
 int rdc_computer_name(char *buf, int buflen) {
     NSString *name = [NSHost currentHost].localizedName ?: NSProcessInfo.processInfo.hostName;
     if (!name) return -1;
@@ -1030,6 +1143,19 @@ void rdc_camera_stop(void) {}
 @property(nonatomic, strong) NSButton *micButton;
 @property(nonatomic) BOOL micBusy;
 @property(nonatomic) int mediaStatus;
+@property(nonatomic, strong) NSButton *setPermanent;
+@property(nonatomic, strong) NSStackView *permBox;
+@property(nonatomic, strong) NSWindow *permWindow;
+@property(nonatomic, strong) NSButton *permSetup;
+@property(nonatomic, strong) NSImageView *permLinkQR;
+@property(nonatomic, strong) NSTextField *permLinkLabel;
+@property(nonatomic, strong) NSImageView *permAuthQR;
+@property(nonatomic, strong) NSTextField *permKeyLabel;
+@property(nonatomic, strong) NSButton *permShow;
+@property(nonatomic, strong) NSButton *setLogin;
+@property(nonatomic, strong) NSButton *setAwake;
+@property(nonatomic) BOOL permRevealed;
+@property(nonatomic, strong) id activity;
 - (void)refreshSettings;
 - (void)refreshMedia;
 @end
@@ -1039,10 +1165,45 @@ static NSString *g_set_version = @"";
 static NSString *g_set_status = @"";
 static int g_set_auto = 1, g_set_can_install = 0, g_set_busy = 0;
 
+// Permanent access, as the host last described it.
+static int g_perm_on;
+static NSString *g_perm_link = @"";
+static NSString *g_perm_key = @"";
+static NSImage *g_perm_link_qr, *g_perm_auth_qr;
+
 static rdc_ctx_cb g_on_ready;
 static rdc_action_cb g_on_action;
 static void *g_app_ctx;
 static RDCAppDelegate *g_app;
+
+// A QR code as an image: black on white whatever the theme, with the quiet zone scanners need.
+static NSImage *qr_image(const uint8_t *modules, int size, CGFloat side) {
+    if (!modules || size <= 0) return nil;
+    NSData *data = [NSData dataWithBytes:modules length:(NSUInteger)(size * size)];
+    return [NSImage imageWithSize:NSMakeSize(side, side)
+                          flipped:YES
+                   drawingHandler:^BOOL(NSRect r) {
+                       const uint8_t *m = data.bytes;
+                       CGFloat cell = r.size.width / (size + 8);
+                       [NSColor.whiteColor setFill];
+                       NSRectFill(r);
+                       [NSColor.blackColor setFill];
+                       for (int y = 0; y < size; y++)
+                           for (int x = 0; x < size; x++)
+                               if (m[y * size + x]) NSRectFill(NSMakeRect((x + 4) * cell, (y + 4) * cell, cell + 0.5, cell + 0.5));
+                       return YES;
+                   }];
+}
+
+static NSTextField *make_note(NSString *text) {
+    NSTextField *l = [NSTextField wrappingLabelWithString:text];
+    l.font = [NSFont systemFontOfSize:11];
+    l.textColor = NSColor.secondaryLabelColor;
+    l.alignment = NSTextAlignmentCenter;
+    l.selectable = NO;
+    [l.widthAnchor constraintEqualToConstant:400].active = YES;
+    return l;
+}
 
 static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight, NSColor *color) {
     NSTextField *l = [NSTextField labelWithString:text];
@@ -1073,6 +1234,7 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
                                                 backing:NSBackingStoreBuffered
                                                   defer:NO];
     self.window.title = @"RDC";
+    self.window.releasedWhenClosed = NO;
 
     NSTextField *caption = make_label(@"Connection code", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
     self.codeLabel = make_label(@"— — —", 40, NSFontWeightSemibold, NSColor.labelColor);
@@ -1153,10 +1315,23 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     self.window.contentView = stack;
     [self refreshMedia];
     [self.window center];
-    [self.window makeKeyAndOrderFront:nil];
-    [NSApp activateIgnoringOtherApps:YES];
+    // Waiting for connections in the background is this app's work: no App Nap.
+    self.activity = [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+                                                                 reason:@"Waiting for remote desktop connections"];
+    autostart_repair();
+    keep_awake(rdc_pref_bool("keep_awake", 0));
+    // Started by the system at login: stay out of the way until the Dock icon is clicked.
+    if (![NSProcessInfo.processInfo.arguments containsObject:@"--login"]) {
+        [self.window makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+    }
 
     if (g_on_ready) g_on_ready(g_app_ctx);
+}
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)app hasVisibleWindows:(BOOL)visible {
+    if (!visible) [self.window makeKeyAndOrderFront:nil];
+    return YES;
 }
 
 // The window grows and shrinks with what it shows, keeping its top edge in place.
@@ -1228,8 +1403,9 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     [self installMic:NO];
 }
 
+// With "start at login" on, RDC is there to be reached: closing the window leaves it running.
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)app {
-    return YES;
+    return !autostart_on();
 }
 
 - (void)copyLink:(id)sender {
@@ -1291,11 +1467,69 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
         buttons.spacing = 8;
         self.setRemoveMic = [NSButton buttonWithTitle:@"Remove phone microphone" target:self action:@selector(removeMic:)];
         self.setRemoveMic.hidden = YES;
-        NSStackView *stack = [NSStackView stackViewWithViews:@[ self.setVersion, self.setAuto, hint, self.setStatus, buttons, self.setRemoveMic ]];
+        // Permanent access, start at login, staying awake: all off until switched on here.
+        NSBox *line = [NSBox new];
+        line.boxType = NSBoxSeparator;
+        self.setPermanent = [NSButton checkboxWithTitle:@"Permanent access"
+                                                 target:self
+                                                 action:@selector(togglePermanent:)];
+        NSTextField *permHint = make_note(@"A link of your own that never changes. Whoever opens it must enter the current 6-digit code "
+                                          @"from your authenticator app (Google Authenticator and the like), so the link alone lets no one in.");
+        NSTextField *step1 = make_note(@"1. Open the link on your phone — point its camera at this code — and keep it: "
+                                       @"add the page to the home screen.");
+        self.permLinkQR = [NSImageView new];
+        [self.permLinkQR.widthAnchor constraintEqualToConstant:170].active = YES;
+        [self.permLinkQR.heightAnchor constraintEqualToConstant:170].active = YES;
+        self.permLinkLabel = make_label(@"", 11, NSFontWeightRegular, NSColor.linkColor);
+        self.permLinkLabel.selectable = YES;
+        self.permLinkLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        [self.permLinkLabel.widthAnchor constraintLessThanOrEqualToConstant:400].active = YES;
+        NSButton *copyPerm = [NSButton buttonWithTitle:@"Copy link" target:self action:@selector(copyPermanentLink:)];
+        NSTextField *step2 = make_note(@"2. Add this computer to the authenticator app: in the app, scan the second code. "
+                                       @"Anyone who sees it can make the codes, so it is shown only when you ask.");
+        self.permShow = [NSButton buttonWithTitle:@"Show the code for the authenticator app" target:self action:@selector(revealPermanent:)];
+        self.permAuthQR = [NSImageView new];
+        [self.permAuthQR.widthAnchor constraintEqualToConstant:190].active = YES;
+        [self.permAuthQR.heightAnchor constraintEqualToConstant:190].active = YES;
+        self.permKeyLabel = make_label(@"", 11, NSFontWeightRegular, NSColor.labelColor);
+        self.permKeyLabel.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+        self.permKeyLabel.selectable = YES;
+        NSButton *resetPerm = [NSButton buttonWithTitle:@"New link and key…" target:self action:@selector(resetPermanent:)];
+        self.permBox = [NSStackView stackViewWithViews:@[
+            step1, self.permLinkQR, self.permLinkLabel, copyPerm, step2, self.permShow, self.permAuthQR, self.permKeyLabel, resetPerm
+        ]];
+        self.permBox.orientation = NSUserInterfaceLayoutOrientationVertical;
+        self.permBox.alignment = NSLayoutAttributeCenterX;
+        self.permBox.spacing = 10;
+        self.permBox.edgeInsets = NSEdgeInsetsMake(20, 20, 20, 20);
+        [self.permBox setCustomSpacing:20 afterView:copyPerm];
+        [self.permBox setCustomSpacing:20 afterView:self.permKeyLabel];
+        self.permWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 440, 400)
+                                                      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                                                        backing:NSBackingStoreBuffered
+                                                          defer:NO];
+        self.permWindow.title = @"Permanent access";
+        self.permWindow.releasedWhenClosed = NO;
+        self.permWindow.contentView = self.permBox;
+        self.permSetup = [NSButton buttonWithTitle:@"Set up the phone…" target:self action:@selector(showPermanent:)];
+        self.setLogin = [NSButton checkboxWithTitle:@"Start RDC at login"
+                                             target:self
+                                             action:@selector(toggleLogin:)];
+        NSTextField *loginHint = make_note(@"RDC starts hidden when you log in and keeps running when its window is closed.");
+        self.setAwake = [NSButton checkboxWithTitle:@"Keep this Mac awake" target:self action:@selector(toggleAwake:)];
+        NSTextField *awakeHint = make_note(@"A sleeping computer cannot be reached. The display may still turn off; a MacBook with its lid closed sleeps anyway.");
+        NSStackView *stack = [NSStackView stackViewWithViews:@[
+            self.setVersion, self.setAuto, hint, self.setStatus, buttons, self.setRemoveMic, line, self.setPermanent, permHint,
+            self.permSetup, self.setLogin, loginHint, self.setAwake, awakeHint
+        ]];
         stack.orientation = NSUserInterfaceLayoutOrientationVertical;
         stack.alignment = NSLayoutAttributeCenterX;
         stack.spacing = 12;
         stack.edgeInsets = NSEdgeInsetsMake(20, 20, 20, 20);
+        [stack setCustomSpacing:4 afterView:self.setPermanent];
+        [stack setCustomSpacing:4 afterView:self.setLogin];
+        [stack setCustomSpacing:4 afterView:self.setAwake];
+        [line.widthAnchor constraintEqualToConstant:400].active = YES;
         [hint.widthAnchor constraintLessThanOrEqualToConstant:400].active = YES;
         [self.setStatus.widthAnchor constraintLessThanOrEqualToConstant:400].active = YES;
         w.contentView = stack;
@@ -1319,6 +1553,88 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     self.setInstall.enabled = g_set_can_install && !g_set_busy;
     self.setRemoveMic.hidden = !(self.mediaStatus & RDC_MEDIA_MIC_INSTALLED);
     self.setRemoveMic.enabled = !self.micBusy;
+    if (!g_perm_on) self.permRevealed = NO;
+    self.setPermanent.state = g_perm_on ? NSControlStateValueOn : NSControlStateValueOff;
+    self.permSetup.hidden = !g_perm_on;
+    if (!g_perm_on) [self.permWindow orderOut:nil];
+    self.permLinkQR.image = g_perm_link_qr;
+    self.permLinkLabel.stringValue = g_perm_link;
+    self.permShow.hidden = self.permRevealed;
+    self.permAuthQR.hidden = !self.permRevealed;
+    self.permKeyLabel.hidden = !self.permRevealed;
+    self.permAuthQR.image = self.permRevealed ? g_perm_auth_qr : nil;
+    self.permKeyLabel.stringValue = self.permRevealed ? [@"Or type the key: " stringByAppendingString:g_perm_key] : @"";
+    self.setLogin.state = autostart_on() ? NSControlStateValueOn : NSControlStateValueOff;
+    self.setAwake.state = rdc_pref_bool("keep_awake", 0) ? NSControlStateValueOn : NSControlStateValueOff;
+    // Each window is as tall as what it shows, with its top edge in place.
+    for (NSWindow *w in @[ self.settingsWindow, self.permWindow ]) {
+        [w.contentView layoutSubtreeIfNeeded];
+        CGFloat want = w.contentView.fittingSize.height;
+        NSRect frame = w.frame;
+        CGFloat have = [w contentRectForFrameRect:frame].size.height;
+        if (fabs(want - have) < 2) continue;
+        frame.origin.y -= want - have;
+        frame.size.height += want - have;
+        [w setFrame:frame display:YES animate:NO];
+    }
+}
+
+- (void)showPermanent:(id)sender {
+    self.permRevealed = NO;  // every visit asks again before the key is shown
+    [self refreshSettings];
+    [self.permWindow center];
+    [self.permWindow makeKeyAndOrderFront:nil];
+}
+
+- (void)togglePermanent:(NSButton *)sender {
+    if (g_on_action) g_on_action(g_app_ctx, sender.state == NSControlStateValueOn ? RDC_ACTION_PERMANENT_ON : RDC_ACTION_PERMANENT_OFF);
+}
+
+- (void)copyPermanentLink:(id)sender {
+    if (g_perm_link.length == 0) return;
+    [NSPasteboard.generalPasteboard clearContents];
+    [NSPasteboard.generalPasteboard setString:g_perm_link forType:NSPasteboardTypeString];
+}
+
+// The authenticator key is as good as the codes: it appears only for the person at this Mac —
+// Touch ID or the account password — never for someone who is merely connected.
+- (void)revealPermanent:(id)sender {
+    LAContext *auth = [LAContext new];
+    NSError *e = nil;
+    if (![auth canEvaluatePolicy:LAPolicyDeviceOwnerAuthentication error:&e]) {
+        self.permRevealed = YES;  // this Mac has no password at all
+        return [self refreshSettings];
+    }
+    [auth evaluatePolicy:LAPolicyDeviceOwnerAuthentication
+         localizedReason:@"show the code for the authenticator app"
+                   reply:^(BOOL ok, NSError *err) {
+                       dispatch_async(dispatch_get_main_queue(), ^{
+                           if (ok) self.permRevealed = YES;
+                           [self refreshSettings];
+                       });
+                   }];
+}
+
+- (void)resetPermanent:(id)sender {
+    NSAlert *alert = [NSAlert new];
+    alert.messageText = @"Make a new link and key?";
+    alert.informativeText = @"The old link and the entry in the authenticator app stop working. You will set both up again.";
+    [alert addButtonWithTitle:@"New link and key"];
+    [alert addButtonWithTitle:@"Cancel"];
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+    self.permRevealed = NO;
+    if (g_on_action) g_on_action(g_app_ctx, RDC_ACTION_PERMANENT_RESET);
+}
+
+- (void)toggleLogin:(NSButton *)sender {
+    autostart_set(sender.state == NSControlStateValueOn);
+    [self refreshSettings];
+}
+
+- (void)toggleAwake:(NSButton *)sender {
+    int on = sender.state == NSControlStateValueOn;
+    rdc_set_pref_bool("keep_awake", on);
+    keep_awake(on);
 }
 
 - (void)toggleAuto:(NSButton *)sender {
@@ -1343,6 +1659,23 @@ void rdc_settings_update(const char *version, int auto_update, const char *statu
         g_set_auto = auto_update;
         g_set_can_install = can_install;
         g_set_busy = busy;
+        [g_app refreshSettings];
+    });
+}
+
+void rdc_app_set_permanent(int on, const char *link, const uint8_t *link_qr, int link_qr_size,
+                           const uint8_t *auth_qr, int auth_qr_size, const char *secret_text) {
+    NSString *l = [NSString stringWithUTF8String:link] ?: @"";
+    NSString *k = [NSString stringWithUTF8String:secret_text] ?: @"";
+    NSImage *lq = qr_image(link_qr, link_qr_size, 170);
+    NSImage *aq = qr_image(auth_qr, auth_qr_size, 190);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (![g_perm_key isEqualToString:k]) g_app.permRevealed = NO;  // a new key is hidden again
+        g_perm_on = on;
+        g_perm_link = l;
+        g_perm_key = k;
+        g_perm_link_qr = lq;
+        g_perm_auth_qr = aq;
         [g_app refreshSettings];
     });
 }

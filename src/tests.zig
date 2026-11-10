@@ -3,6 +3,8 @@ test {
     _ = @import("core/code.zig");
     _ = @import("core/keymap.zig");
     _ = @import("core/proto.zig");
+    _ = @import("core/totp.zig");
+    _ = @import("core/qr.zig");
     _ = @import("net/ws.zig");
     _ = @import("net/http.zig");
     _ = @import("net/stun.zig");

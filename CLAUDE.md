@@ -9,6 +9,8 @@ A cross-platform remote desktop in Zig: macOS, Windows, Linux, then Android, iOS
 - `src/net/` — the network. Local network: `http.zig`, `ws.zig`. From anywhere (`docs/PLAN.md`, section 6): `signal.zig` + `mqtt.zig` (the host finds browsers through public MQTT brokers; topic and AES-GCM key from the code and the link's key), `webrtc.zig` (one session: socket, ICE, glue), `stun.zig`, `sdp.zig`, `dtls.zig` (DTLS 1.2 server), `sctp.zig` (data channel). The browser side is in `web/viewer.js` (`rtcLink`, `signaling`).
 - The viewer's microphone and camera as capture devices on the host (`docs/PLAN.md`, section 6): `src/platform/macos/mic_driver.c` — "RDC Microphone", a CoreAudio HAL plug-in (`mic_shm.h` — the shared-memory ring, `mic_writer.h` — the host's side, `mic_test.c` — the harness behind `zig build mic-check`; its own version is in `macos/RDCMicrophone-Info.plist`); `src/platform/windows/camera.c` — "RDC Camera", the media source of Windows 11's virtual camera, embedded in RDC.exe (`camera_pipe.h` — how RDC.exe feeds it). The browser side is `media` in `web/viewer.js`; the messages are in `src/core/proto.zig`.
 
+- Permanent access (`docs/PLAN.md`, section 6): `src/core/totp.zig` (the seed, the link key, TOTP codes, the wrong-code guard), `src/core/qr.zig` (QR codes for the setup window), `Host.setPermanent`/`admitPermanentLocked` in `src/host.zig`, the Settings and "Permanent access" windows, start at login and keep-awake in `src/platform/macos/shim.m`. The browser side is `startPermanent` in `web/viewer.js`.
+
 ## Build
 `ZIG=~/Applications/zig-0.17.1/zig`; run commands from the project root:
 - `"$ZIG" build test` — tests of the pure modules (`src/tests.zig`)

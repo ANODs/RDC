@@ -40,6 +40,9 @@ const ctx2d = canvas.getContext('2d', { alpha: false, desynchronized: true });
 let conn = null;               // the current transport: {send(data), close()}
 let code = '';
 let key = '';                  // the key of a link from anywhere; empty — this network
+let perm = false;              // the permanent link: the computer asks for a code from an authenticator app
+let otp = '';                  // the code just typed, for one hello
+let resume = '';               // lets this tab reconnect without a new code
 let host = null;               // {w, h, os, name, codec}
 let wantConnected = false;
 let forceJpeg = false;
@@ -60,8 +63,38 @@ function formatCode(s) {
   return d.replace(/(\d{3})(?=\d)/g, '$1 ');
 }
 
+// The permanent link has "my" where an ordinary one has the code; keep in sync with link_name in src/core/totp.zig.
+const PERMANENT = 'my';
+const resumeSlot = () => 'rdc.resume.' + key;
+function loadResume() { try { return sessionStorage.getItem(resumeSlot()) || ''; } catch (_) { return ''; } }
+function saveResume(v) {
+  resume = v;
+  try { if (v) sessionStorage.setItem(resumeSlot(), v); else sessionStorage.removeItem(resumeSlot()); } catch (_) {}
+}
+
+// What the join card asks for: an authenticator code, a link, or the 9-digit code.
+function paintJoin() {
+  const c = $('code');
+  c.classList.toggle('link', !perm && !servedByHost);
+  if (perm) {
+    $('hint').textContent = 'Enter the 6-digit code from your authenticator app';
+    c.placeholder = '123 456';
+    c.setAttribute('inputmode', 'numeric');
+    c.setAttribute('autocomplete', 'one-time-code');
+  } else {
+    $('hint').textContent = servedByHost ? 'Enter the code from the RDC window on the computer'
+                                         : 'Open the link from the RDC window on the computer, or paste it here';
+    c.placeholder = servedByHost ? '123 456 789' : 'Link from the RDC window';
+    c.setAttribute('inputmode', servedByHost ? 'numeric' : 'url');
+    c.setAttribute('autocomplete', 'off');
+  }
+}
+
 function showJoin(error) {
   wantConnected = false;
+  otp = '';
+  if (perm) $('code').value = '';
+  paintJoin();
   osk.reset(); // releases held on-screen keys while the connection is still up
   media.stopAll();
   closeConn();
@@ -96,6 +129,8 @@ function parseEntry(text) {
   const hash = s.lastIndexOf('#');
   if (hash >= 0) s = s.slice(hash + 1);
   s = s.replace(/\s/g, '');
+  const p = /^my-([A-Za-z0-9_-]{22})$/.exec(s);
+  if (p) return { code: PERMANENT, key: p[1], perm: true };
   const m = /^(\d{9})(?:-([A-Za-z0-9_-]{22}))?$/.exec(s);
   if (m) return { code: m[1], key: m[2] || '' };
   return { code: s.replace(/\D/g, ''), key: '' };
@@ -105,8 +140,52 @@ function parseEntry(text) {
 const servedByHost = location.protocol === 'http:';
 const canRtc = typeof RTCPeerConnection === 'function' && !!(window.crypto && crypto.subtle) && window.isSecureContext;
 
+// The permanent link: connect at once if this tab has been let in before, otherwise ask for a code.
+function startPermanent(k) {
+  closeConn();
+  resetDecoder();
+  media.stopAll();
+  host = null;
+  document.body.classList.remove('live');
+  $('stage').style.display = 'none';
+  $('join').style.display = 'flex';
+  perm = true;
+  code = PERMANENT;
+  key = k;
+  otp = '';
+  resume = loadResume();
+  $('code').value = '';
+  paintJoin();
+  if (!canRtc) {
+    perm = false;
+    return showJoin(servedByHost ? 'Open the permanent link itself, as the RDC window shows it'
+                                 : 'This browser cannot connect from anywhere: it has no WebRTC');
+  }
+  signaling(code, key).catch(() => {}); // the brokers connect while the code is typed
+  if (!resume) return showJoin('');
+  progress('Connecting…');
+  wantConnected = true;
+  connect();
+}
+
+// A code typed on the permanent link's card.
+function submitOtp(text) {
+  const d = text.replace(/\D/g, '');
+  if (d.length !== 6) return showJoin('The code is 6 digits');
+  otp = d;
+  saveResume('');
+  progress('Connecting…');
+  wantConnected = true;
+  connect();
+}
+
 function start(raw) {
   const e = parseEntry(raw);
+  if (e.perm) return startPermanent(e.key);
+  perm = false;
+  otp = '';
+  resume = '';
+  paintJoin();
   code = e.code;
   key = e.key;
   if (code.length !== 9) return showJoin(servedByHost ? 'The code must be 9 digits' : 'Open the link from the RDC window on the computer');
@@ -139,9 +218,17 @@ function closeConn() {
 
 function connect() {
   closeConn();
+  // The permanent link with nothing to show the computer: ask for a code instead of trying.
+  if (perm && !resume && !otp) return showJoin('Enter a new code from your authenticator app');
   let c = null;
   const handlers = {
-    open() { send(JSON.stringify({ t: 'hello', code, h264: canH264 && !forceJpeg, agent: navigator.userAgent })); },
+    open() {
+      const hello = { t: 'hello', h264: canH264 && !forceJpeg, agent: navigator.userAgent };
+      if (!perm) hello.code = code;
+      else if (resume) hello.resume = resume;
+      else hello.otp = otp;
+      send(JSON.stringify(hello));
+    },
     message(data) {
       if (typeof data === 'string') onControl(JSON.parse(data));
       else onFrame(data);
@@ -443,6 +530,8 @@ function onControl(m) {
   switch (m.t) {
     case 'ok':
       host = m;
+      otp = '';
+      if (perm && m.resume) saveResume(m.resume);
       $('join').style.display = 'none';
       $('stage').style.display = 'flex';
       $('veil').style.display = 'none';
@@ -473,7 +562,13 @@ function onControl(m) {
       syncCursor(m);
       break;
     case 'err':
-      if (m.fatal) { closeConn(); host = null; showJoin(m.msg); break; }
+      if (m.fatal) {
+        closeConn();
+        host = null;
+        if (perm) saveResume(''); // whatever let this tab in no longer does
+        showJoin(m.msg);
+        break;
+      }
       $('veil').textContent = m.msg;
       $('veil').style.display = 'flex';
       gotFrame = false;
@@ -481,6 +576,7 @@ function onControl(m) {
     case 'bye':
       closeConn();
       host = null;
+      if (perm) saveResume('');
       showJoin(m.msg || 'The host ended the session');
       break;
     case 'viewers': {
@@ -1295,7 +1391,11 @@ const media = (() => {
   const panel = $('media'), btn = $('media-btn'), micBox = $('media-mic'), camBox = $('media-cam');
   const micSel = $('media-mic-dev'), camSel = $('media-cam-dev'), note = $('media-note');
   const secure = !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
-  const CAM_FPS = 15, CAM_MAX = 1280, CAM_QUALITY = 0.7, PIECE = 15 * 1024, BACKLOG = 1 << 20;
+  // Encoding JPEG frames is what warms a phone up, and its cost grows with pixels per second.
+  // "Light" (the default) asks the camera itself for a small, slow picture: 12 times less work than HD.
+  const CAM_MODES = { light: { w: 640, h: 360, fps: 10, q: 0.6 }, hd: { w: 1280, h: 720, fps: 15, q: 0.7 } };
+  const camMode = () => CAM_MODES[$('media-cam-q').value] || CAM_MODES.light;
+  const PIECE = 15 * 1024, BACKLOG = 1 << 20;
   let can = { mic: false, camera: false, os: 'macos' }; // what the computer can take, from ok
   let on = { mic: false, camera: false };                // what the computer takes now
   let micStream = null, actx = null, seq = 0;
@@ -1378,7 +1478,9 @@ const media = (() => {
   }
 
   async function startCam() {
-    const vid = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: CAM_FPS, max: 30 } };
+    const mode = camMode();
+    // The camera is asked for this size and rate, so the phone does not capture more than is sent.
+    const vid = { width: { ideal: mode.w }, height: { ideal: mode.h }, frameRate: { ideal: mode.fps, max: mode.fps } };
     if (camSel.value) vid.deviceId = { exact: camSel.value }; else vid.facingMode = 'user';
     camStream = await navigator.mediaDevices.getUserMedia({ video: vid });
     video = document.createElement('video');
@@ -1388,7 +1490,7 @@ const media = (() => {
     video.srcObject = camStream;
     await video.play();
     camStream.getVideoTracks()[0].onended = () => { if (on.camera) toggle('camera', false); };
-    camTimer = setInterval(sendFrame, 1000 / CAM_FPS);
+    camTimer = setInterval(sendFrame, 1000 / mode.fps);
   }
 
   function stopCam() {
@@ -1400,23 +1502,24 @@ const media = (() => {
 
   // One frame: drawn at most 1280 pixels on its long side, encoded as JPEG, sent in pieces.
   async function sendFrame() {
-    if (encoding || !video || video.readyState < 2 || !conn || conn.buffered() > BACKLOG) return;
+    if (encoding || document.hidden || !video || video.readyState < 2 || !conn || conn.buffered() > BACKLOG) return;
+    const mode = camMode();
     const vw = video.videoWidth, vh = video.videoHeight;
     if (!vw || !vh) return;
     encoding = true;
     try {
-      const k = Math.min(1, CAM_MAX / Math.max(vw, vh));
+      const k = Math.min(1, mode.w / Math.max(vw, vh));
       const w = Math.round(vw * k) & ~1, h = Math.round(vh * k) & ~1;
       let blob;
       if (typeof OffscreenCanvas === 'function') {
         if (!canvas || canvas.width !== w || canvas.height !== h) canvas = new OffscreenCanvas(w, h);
         canvas.getContext('2d').drawImage(video, 0, 0, w, h);
-        blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: CAM_QUALITY });
+        blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: mode.q });
       } else {
         if (!canvas) canvas = document.createElement('canvas');
         if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
         canvas.getContext('2d').drawImage(video, 0, 0, w, h);
-        blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', CAM_QUALITY));
+        blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', mode.q));
       }
       if (!blob || !camStream) return;
       const bytes = new Uint8Array(await blob.arrayBuffer());
@@ -1547,24 +1650,31 @@ const media = (() => {
   camBox.addEventListener('change', () => toggle('camera', camBox.checked));
   micSel.addEventListener('change', () => { if (on.mic) { stopMic(); toggle('mic', true); } });
   camSel.addEventListener('change', () => { if (on.camera) { stopCam(); toggle('camera', true); } });
+  $('media-cam-q').addEventListener('change', () => { if (on.camera) { stopCam(); toggle('camera', true); } });
   if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) navigator.mediaDevices.addEventListener('devicechange', fillDevices);
   return { setHost, onHost, stopAll };
 })();
 
 // Digits get grouped as they are typed; a pasted link stays as it is.
-$('code').addEventListener('input', (e) => { if (/^[\d ]*$/.test(e.target.value)) e.target.value = formatCode(e.target.value); });
-$('form').addEventListener('submit', (e) => { e.preventDefault(); start($('code').value); });
+const formatOtp = (s) => s.replace(/\D/g, '').slice(0, 6).replace(/(\d{3})(?=\d)/, '$1 ');
+$('code').addEventListener('input', (e) => {
+  if (/^[\d ]*$/.test(e.target.value)) e.target.value = perm ? formatOtp(e.target.value) : formatCode(e.target.value);
+});
+$('form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const v = $('code').value;
+  // On the permanent link's card digits are a code; anything else is another link.
+  if (perm && /^[\d\s]*$/.test(v)) submitOtp(v); else start(v);
+});
 
-if (!servedByHost) {
-  // GitHub Pages: only a link from anywhere works here.
-  $('hint').textContent = 'Open the link from the RDC window on the computer, or paste it here';
-  $('code').setAttribute('inputmode', 'url');
-  $('code').placeholder = 'Link from the RDC window';
-  $('code').classList.add('link');
-}
+paintJoin(); // GitHub Pages: only a link from anywhere works there
 
 function startFromHash() {
   const e = parseEntry(location.hash);
+  if (e.perm) {
+    if (!(perm && e.key === key)) startPermanent(e.key);
+    return;
+  }
   if (e.code.length !== 9 || (e.code === code && e.key === key && wantConnected)) return;
   $('code').value = e.key ? location.hash.slice(1) : formatCode(e.code);
   start(location.hash);

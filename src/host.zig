@@ -20,6 +20,8 @@ const ws = @import("net/ws.zig");
 const http = @import("net/http.zig");
 const dtls = @import("net/dtls.zig");
 const signal = @import("net/signal.zig");
+const totp = @import("core/totp.zig");
+const qr = @import("core/qr.zig");
 const webrtc = @import("net/webrtc.zig");
 const proto = @import("core/proto.zig");
 const keymap = @import("core/keymap.zig");
@@ -69,7 +71,17 @@ pub const Options = struct {
     remote: bool = true,
     /// The page the link from anywhere opens; for testing, any copy of web/ served over https or localhost.
     remote_url: []const u8 = "https://anods.github.io/RDC/",
+    /// Started by the OS at login: the window stays hidden (the platform layer reads the flag itself).
+    login: bool = false,
 };
+
+/// How long a browser that entered an authenticator code may reconnect without a new one.
+const resume_us: u64 = 12 * std.time.us_per_hour;
+const max_resume = 8;
+const Resume = struct { token: [16]u8 = @splat(0), expires_us: u64 = 0 };
+
+/// Where an offer came from: the link with the code, or the permanent link.
+const Port = struct { host: *Host, permanent: bool };
 
 pub fn log(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
@@ -203,6 +215,8 @@ const Viewer = struct {
     link: Link,
     peer: Peer,
     h264: bool,
+    /// Came through the permanent link.
+    permanent: bool = false,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
     queue: [queue_cap]*Msg = undefined,
@@ -417,6 +431,15 @@ pub const Host = struct {
     media_owner: ?*Viewer = null,
     media_mic: bool = false,
     media_cam: bool = false,
+    /// Permanent access (core/totp.zig; under mutex): null — off.
+    perm: ?totp.Identity = null,
+    perm_signal: ?*signal.Signal = null,
+    port_code: Port = undefined,
+    port_perm: Port = undefined,
+    /// The time step of the last authenticator code that let someone in: a code works once.
+    otp_last_step: u64 = 0,
+    otp_guard: totp.Guard = .{},
+    resumes: [max_resume]Resume = @splat(.{}),
 
     fn lock(h: *Host) void {
         h.mutex.lockUncancelable(h.io);
@@ -428,6 +451,8 @@ pub const Host = struct {
     fn create(gpa: std.mem.Allocator, io: Io, opts: Options) !*Host {
         const h = try gpa.create(Host);
         h.* = .{ .gpa = gpa, .io = io, .opts = opts, .code = newCode(io), .salt = newSalt(io), .updater = update.Updater.init(gpa, io, opts.update_url, opts.ui) };
+        h.port_code = .{ .host = h, .permanent = false };
+        h.port_perm = .{ .host = h, .permanent = true };
         if (plat.rdc_lan_ipv4(&h.ip, h.ip.len) == 0) {
             h.ip_len = std.mem.indexOfScalar(u8, &h.ip, 0) orelse 0;
         } else {
@@ -601,7 +626,7 @@ pub const Host = struct {
                 const parsed = ws.parse(r.buffered(), max_ws_payload) catch return;
                 const p = parsed orelse break;
                 if (!p.frame.fin or p.frame.opcode == .continuation) return;
-                if (!h.onMessage(.{ .ws = stream }, peer, &viewer, p.frame.opcode, p.frame.payload)) return;
+                if (!h.onMessage(.{ .ws = stream }, peer, &viewer, p.frame.opcode, p.frame.payload, false)) return;
                 r.toss(p.used);
             }
             if (r.bufferedLen() == r.buffer.len) return;
@@ -610,14 +635,14 @@ pub const Host = struct {
     }
 
     /// One message from a viewer, whatever the link. false — end the connection.
-    fn onMessage(h: *Host, link: Link, peer: Peer, viewer: *?*Viewer, opcode: ws.Opcode, payload: []const u8) bool {
+    fn onMessage(h: *Host, link: Link, peer: Peer, viewer: *?*Viewer, opcode: ws.Opcode, payload: []const u8, permanent: bool) bool {
         if (viewer.*) |v| v.last_us.store(nowUs(h.io), .monotonic);
         switch (opcode) {
             .text => {
                 const msg = payload;
                 const t = proto.jsonString(msg, "t") orelse return true;
                 if (std.mem.eql(u8, t, "hello")) {
-                    if (viewer.* == null) viewer.* = h.admit(link, peer, msg) orelse return false;
+                    if (viewer.* == null) viewer.* = h.admit(link, peer, msg, permanent) orelse return false;
                 } else if (std.mem.eql(u8, t, "ping")) {
                     const v = viewer.* orelse return true;
                     var cx: f64 = 0.5;
@@ -655,15 +680,26 @@ pub const Host = struct {
         }
     }
 
-    fn admit(h: *Host, link: Link, peer: Peer, hello: []const u8) ?*Viewer {
+    fn admit(h: *Host, link: Link, peer: Peer, hello: []const u8, permanent: bool) ?*Viewer {
         const now = nowUs(h.io);
+        var resume_text: [32]u8 = undefined;
+        var resume_len: usize = 0;
         h.lock();
-        if (now < h.locked_until_us) {
+        if (permanent) {
+            var buf: [96]u8 = undefined;
+            if (h.admitPermanentLocked(hello, now, &resume_text, &buf)) |refusal| {
+                h.unlock();
+                log("permanent link, {s}: {s}", .{ peer.str(), refusal });
+                h.sendError(link, refusal);
+                return null;
+            }
+            resume_len = resume_text.len;
+        } else if (now < h.locked_until_us) {
             h.unlock();
             h.sendError(link, "Too many wrong attempts — wait half a minute");
             return null;
         }
-        if (!h.code.matches(proto.jsonString(hello, "code") orelse "")) {
+        if (!permanent and !h.code.matches(proto.jsonString(hello, "code") orelse "")) {
             h.failed += 1;
             if (h.failed >= 5) h.locked_until_us = now + lockout_us;
             h.unlock();
@@ -671,7 +707,7 @@ pub const Host = struct {
             h.sendError(link, "Wrong code");
             return null;
         }
-        h.failed = 0;
+        if (!permanent) h.failed = 0;
         var slot: ?usize = null;
         for (h.viewers, 0..) |existing, i| {
             if (existing == null) {
@@ -689,7 +725,7 @@ pub const Host = struct {
             return null;
         };
         const can_h264 = plat.rdc_codec_caps() & 1 != 0;
-        v.* = .{ .host = h, .link = link, .peer = peer, .h264 = can_h264 and proto.jsonTrue(hello, "h264") };
+        v.* = .{ .host = h, .link = link, .peer = peer, .h264 = can_h264 and proto.jsonTrue(hello, "h264"), .permanent = permanent };
         if (proto.jsonString(hello, "ai")) |name| v.setAi(name);
         v.last_us.store(now, .monotonic);
         var name_buf: [160]u8 = undefined;
@@ -698,7 +734,7 @@ pub const Host = struct {
         var cy: f64 = 0.5;
         plat.rdc_cursor_pos(&cx, &cy);
         const media = plat.rdc_media_status();
-        const ok = std.fmt.bufPrint(&ok_buf, "{{\"t\":\"ok\",\"w\":{d},\"h\":{d},\"os\":\"{s}\",\"name\":\"{s}\",\"codec\":\"{s}\",\"version\":\"{s}\",\"text\":true,\"cx\":{d:.4},\"cy\":{d:.4},\"mic\":{},\"camera\":{}}}", .{
+        const ok = std.fmt.bufPrint(&ok_buf, "{{\"t\":\"ok\",\"w\":{d},\"h\":{d},\"os\":\"{s}\",\"name\":\"{s}\",\"codec\":\"{s}\",\"version\":\"{s}\",\"text\":true,\"cx\":{d:.4},\"cy\":{d:.4},\"mic\":{},\"camera\":{},\"resume\":\"{s}\"}}", .{
             h.frame_w,
             h.frame_h,
             os_name,
@@ -709,6 +745,7 @@ pub const Host = struct {
             cy,
             media & plat.media_mic != 0,
             media & plat.media_camera != 0,
+            resume_text[0..resume_len],
         }) catch "{\"t\":\"ok\"}";
         v.pushText(ok);
         v.writer = std.Thread.spawn(.{}, Viewer.writerMain, .{v}) catch {
@@ -721,7 +758,7 @@ pub const Host = struct {
         h.updateCodecsLocked();
         h.unlock();
 
-        const over: []const u8 = if (link == .rtc) ", WebRTC" else "";
+        const over: []const u8 = if (permanent) ", WebRTC, permanent link" else if (link == .rtc) ", WebRTC" else "";
         if (v.ai_len > 0) {
             log("AI agent {s} connected from {s}{s}", .{ v.ai(), peer.str(), over });
         } else {
@@ -732,6 +769,49 @@ pub const Host = struct {
         h.updateStatus();
         h.broadcastViewers();
         return v;
+    }
+
+    /// The permanent link: the browser shows either an authenticator code or the token an earlier
+    /// code gave it. null — let it in, `resume_text` is its token; otherwise why not. Under the lock.
+    fn admitPermanentLocked(h: *Host, hello: []const u8, now: u64, resume_text: *[32]u8, buf: *[96]u8) ?[]const u8 {
+        const id = h.perm orelse return "Permanent access is off on the computer";
+        if (proto.jsonString(hello, "resume")) |text| {
+            var token: [16]u8 = undefined;
+            if (text.len == 32) {
+                if (std.fmt.hexToBytes(&token, text)) |_| {
+                    for (&h.resumes) |*r| {
+                        if (r.expires_us > now and std.crypto.timing_safe.eql([16]u8, r.token, token)) {
+                            resume_text.* = text[0..32].*;
+                            return null;
+                        }
+                    }
+                } else |_| {}
+            }
+            return "Enter a new code from your authenticator app";
+        }
+        const wait = h.otp_guard.waitUs(now);
+        if (wait > 0) {
+            const minutes = (wait + 59 * std.time.us_per_s) / std.time.us_per_min;
+            if (wait <= totp.Guard.burst_us) return "Too many wrong codes — wait half a minute";
+            return std.fmt.bufPrint(buf, "Too many wrong codes — the permanent link is locked for {d} min", .{minutes}) catch "Too many wrong codes";
+        }
+        switch (totp.verify(&id.secret, proto.jsonString(hello, "otp") orelse "", @divFloor(realMs(h.io), 1000), h.otp_last_step)) {
+            .ok => |step| h.otp_last_step = step,
+            .used => return "This code was used already — wait for the next one",
+            .wrong => {
+                h.otp_guard.failed(now);
+                return "Wrong code";
+            },
+        }
+        // A token for reconnecting, in place of the oldest one.
+        var slot = &h.resumes[0];
+        for (&h.resumes) |*r| {
+            if (r.expires_us < slot.expires_us) slot = r;
+        }
+        h.io.random(&slot.token);
+        slot.expires_us = now + resume_us;
+        resume_text.* = std.fmt.bytesToHex(slot.token, .lower);
+        return null;
     }
 
     fn removeViewer(h: *Host, v: *Viewer) void {
@@ -1081,11 +1161,106 @@ pub const Host = struct {
         const bye = std.fmt.bufPrint(&out, "{{\"t\":\"bye\",\"msg\":\"{s}\"}}", .{reason}) catch "{\"t\":\"bye\"}";
         h.lock();
         defer h.unlock();
+        h.resumes = @splat(.{}); // out means out: the next visit needs a new authenticator code
         for (h.viewers) |maybe| {
             const v = maybe orelse continue;
             v.pushText(bye);
             v.finish();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Permanent access (docs/PLAN.md, section 6): a link that never changes and asks for a code
+    // from an authenticator app. Off until the person turns it on in Settings.
+
+    /// The seed kept between runs, made on first use. null — no place to keep it, or another RDC
+    /// on this computer serves the permanent link already.
+    fn loadIdentity(h: *Host) ?totp.Identity {
+        var seed: [totp.seed_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        const n = plat.rdc_seed_load(&seed, seed.len);
+        if (n == -2) {
+            log("permanent access: another RDC on this computer serves the permanent link", .{});
+            return null;
+        }
+        if (n != seed.len) return h.newIdentity();
+        return totp.Identity.fromSeed(&seed);
+    }
+
+    fn newIdentity(h: *Host) ?totp.Identity {
+        var seed: [totp.seed_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &seed);
+        h.io.random(&seed);
+        if (plat.rdc_seed_save(&seed, seed.len) != 0) {
+            log("permanent access is off: its key cannot be saved", .{});
+            return null;
+        }
+        return totp.Identity.fromSeed(&seed);
+    }
+
+    /// Turns permanent access on or off, or (fresh) replaces its link and authenticator key.
+    fn setPermanent(h: *Host, on: bool, fresh: bool) void {
+        const id: ?totp.Identity = if (!on or !h.opts.remote) null else if (fresh) h.newIdentity() else h.loadIdentity();
+        h.lock();
+        const was_on = h.perm != null;
+        h.perm = id;
+        if (fresh or id == null) {
+            h.resumes = @splat(.{});
+            h.otp_last_step = 0;
+            h.otp_guard = .{};
+        }
+        h.unlock();
+        // Off: the brokers stay connected, listening where no link leads.
+        var nowhere: [signal.salt_len]u8 = undefined;
+        h.io.random(&nowhere);
+        const keys = signal.derive(totp.link_name, if (id) |i| &i.link_key else &nowhere);
+        if (h.perm_signal) |s| {
+            s.setKeys(keys);
+        } else if (id != null) {
+            h.perm_signal = signal.Signal.start(h.gpa, h.io, keys, onSignal, &h.port_perm, logLine) catch |e| blk: {
+                log("permanent access is off: {t}", .{e});
+                break :blk null;
+            };
+        }
+        if (fresh or id == null) h.kickPermanent(if (id == null) "Permanent access was turned off on the computer" else "The permanent link was replaced on the computer");
+        if (was_on != (id != null) or fresh) log("permanent access: {s}", .{if (id == null) "off" else if (fresh) "new link and key" else "on"});
+        h.refreshPermanent();
+    }
+
+    fn kickPermanent(h: *Host, reason: []const u8) void {
+        var out: [200]u8 = undefined;
+        const bye = std.fmt.bufPrint(&out, "{{\"t\":\"bye\",\"msg\":\"{s}\"}}", .{reason}) catch "{\"t\":\"bye\"}";
+        h.lock();
+        defer h.unlock();
+        for (h.viewers) |maybe| {
+            const v = maybe orelse continue;
+            if (!v.permanent) continue;
+            v.pushText(bye);
+            v.finish();
+        }
+    }
+
+    /// Settings: the permanent link, and the two QR codes — the link for the phone's camera, the
+    /// key for the authenticator app.
+    fn refreshPermanent(h: *Host) void {
+        if (!h.opts.ui) return;
+        h.lock();
+        const maybe = h.perm;
+        h.unlock();
+        const id = maybe orelse return plat.rdc_app_set_permanent(0, "", null, 0, null, 0, "");
+        var link_buf: [max_remote_url_len + 4 + signal.salt_text_len + 1]u8 = undefined;
+        var key: [signal.salt_text_len]u8 = undefined;
+        _ = std.base64.url_safe_no_pad.Encoder.encode(&key, &id.link_key);
+        const link = std.fmt.bufPrint(link_buf[0 .. link_buf.len - 1], "{s}#{s}-{s}", .{ h.opts.remote_url, totp.link_name, &key }) catch unreachable;
+        link_buf[link.len] = 0;
+        var uri_buf: [totp.max_uri]u8 = undefined;
+        const uri = totp.uri(&uri_buf, &id.secret, h.name[0..h.name_len]);
+        var text_buf: [totp.grouped_len + 1]u8 = undefined;
+        const text = totp.grouped(text_buf[0..totp.grouped_len], &id.secret);
+        text_buf[text.len] = 0;
+        const link_qr = qr.encode(link) catch return;
+        const auth_qr = qr.encode(uri) catch return;
+        plat.rdc_app_set_permanent(1, link_buf[0..link.len :0].ptr, &link_qr.modules, link_qr.size, &auth_qr.modules, auth_qr.size, text_buf[0..text.len :0].ptr);
     }
 
     fn renewCode(h: *Host) void {
@@ -1110,10 +1285,11 @@ pub const Host = struct {
             log("connections from anywhere are off: no DTLS certificate ({t})", .{e});
             return;
         };
-        h.signal = signal.Signal.start(h.gpa, h.io, signal.derive(&h.code.digits, &h.salt), onSignal, h, logLine) catch |e| {
+        h.signal = signal.Signal.start(h.gpa, h.io, signal.derive(&h.code.digits, &h.salt), onSignal, &h.port_code, logLine) catch |e| {
             log("connections from anywhere are off: {t}", .{e});
             return;
         };
+        if (plat.rdc_pref_bool("permanent", 0) != 0) h.setPermanent(true, false);
     }
 
     fn logLine(msg: []const u8) void {
@@ -1123,7 +1299,8 @@ pub const Host = struct {
     /// A message from a browser through a broker (on a broker thread): an offer or a late candidate.
     /// Its timestamp must be within a minute of our clock: a recorded message sent again is refused.
     fn onSignal(ctx: *anyopaque, text: []const u8) void {
-        const h: *Host = @ptrCast(@alignCast(ctx));
+        const port: *Port = @ptrCast(@alignCast(ctx));
+        const h = port.host;
         const SignalMsg = struct { t: []const u8 = "", id: []const u8 = "", ts: i64 = 0, sdp: []const u8 = "", c: []const u8 = "" };
         const parsed = std.json.parseFromSlice(SignalMsg, h.gpa, text, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
@@ -1135,44 +1312,48 @@ pub const Host = struct {
         if (!is_offer and !std.mem.eql(u8, m.t, "cand")) return;
         const skew = signal.skewMs(m.ts, realMs(h.io));
         if (!signal.fresh(skew)) {
-            if (is_offer) h.onStaleOffer(m.id, m.ts, skew);
+            if (is_offer) h.onStaleOffer(port, m.id, m.ts, skew);
             return;
         }
-        if (is_offer) return h.onOffer(m.id, m.ts, m.sdp);
+        if (is_offer) return h.onOffer(port, m.id, m.ts, m.sdp);
         h.lock();
         defer h.unlock();
         for (h.rtc) |maybe| {
             const c = maybe orelse continue;
-            if (std.mem.eql(u8, c.id(), m.id)) c.session.addCandidate(m.c);
+            if (c.permanent == port.permanent and std.mem.eql(u8, c.id(), m.id)) c.session.addCandidate(m.c);
         }
     }
 
     /// An offer whose clock is more than a minute off ours: a replay, or a device set to the wrong
     /// time. A replay of an offer we took stays unanswered; otherwise the browser hears why, now and then.
-    fn onStaleOffer(h: *Host, id: []const u8, ts: i64, skew_ms: i64) void {
+    fn onStaleOffer(h: *Host, port: *const Port, id: []const u8, ts: i64, skew_ms: i64) void {
         const now = nowUs(h.io);
         h.lock();
         const reply = !h.guard.seen(id) and now -| h.last_clock_reply_us >= clock_reply_every_us;
         if (reply) h.last_clock_reply_us = now;
         h.unlock();
         if (!reply) return;
-        if (ts == 0) return h.signalError(id, ts, "This page is out of date — reload it");
+        if (ts == 0) return h.signalError(port.permanent, id, ts, "This page is out of date — reload it");
         const minutes = (@abs(skew_ms) + 30_000) / 60_000;
         const side: []const u8 = if (skew_ms > 0) "behind" else "ahead of";
         log("a browser's offer was refused: its clock is {d} min {s} this computer's", .{ minutes, side });
         var buf: [160]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "The clock on this device is {d} min {s} the computer's — turn on automatic date and time on both", .{ minutes, side }) catch return;
-        h.signalError(id, ts, msg);
+        h.signalError(port.permanent, id, ts, msg);
     }
 
-    fn onOffer(h: *Host, id: []const u8, ts: i64, offer: []const u8) void {
+    fn onOffer(h: *Host, port: *const Port, id: []const u8, ts: i64, offer: []const u8) void {
         // The reply to a refused offer goes out after the lock: publishing is network I/O.
-        const refusal = h.startSession(id, ts, offer) orelse return;
-        h.signalError(id, ts, refusal);
+        const refusal = h.startSession(port.permanent, id, ts, offer) orelse return;
+        h.signalError(port.permanent, id, ts, refusal);
+    }
+
+    fn signalFor(h: *Host, permanent: bool) ?*signal.Signal {
+        return if (permanent) h.perm_signal else h.signal;
     }
 
     /// null — started or a repeat; otherwise why the offer was refused.
-    fn startSession(h: *Host, id: []const u8, ts: i64, offer: []const u8) ?[]const u8 {
+    fn startSession(h: *Host, permanent: bool, id: []const u8, ts: i64, offer: []const u8) ?[]const u8 {
         const now = nowUs(h.io);
         h.lock();
         defer h.unlock();
@@ -1182,7 +1363,7 @@ pub const Host = struct {
         } else return "The computer has too many connections — try again in a minute";
         if (!h.guard.allowStart(now)) return "Too many connection attempts — try again in a few seconds";
         const conn = h.gpa.create(RtcConn) catch return null;
-        conn.* = .{ .host = h, .session = undefined, .id_buf = @splat(0), .id_len = id.len, .offer_ts = ts };
+        conn.* = .{ .host = h, .session = undefined, .id_buf = @splat(0), .id_len = id.len, .offer_ts = ts, .permanent = permanent };
         @memcpy(conn.id_buf[0..id.len], id);
         // The session thread may call back at once; its callbacks wait for this lock.
         conn.session = webrtc.Session.start(h.gpa, h.io, &h.identity, offer, h.lanIp(), .{
@@ -1200,8 +1381,8 @@ pub const Host = struct {
     }
 
     /// `ts` — the offer's own timestamp: every reply carries it back.
-    fn signalError(h: *Host, id: []const u8, ts: i64, msg: []const u8) void {
-        const s = h.signal orelse return;
+    fn signalError(h: *Host, permanent: bool, id: []const u8, ts: i64, msg: []const u8) void {
+        const s = h.signalFor(permanent) orelse return;
         var buf: [320]u8 = undefined;
         const json = std.fmt.bufPrint(&buf, "{{\"t\":\"err\",\"id\":\"{s}\",\"ts\":{d},\"msg\":\"{s}\"}}", .{ id, ts, msg }) catch return;
         s.send(json);
@@ -1221,12 +1402,12 @@ pub const Host = struct {
             else => w.writeByte(ch) catch return,
         };
         w.writeAll("\"}") catch return;
-        if (c.host.signal) |sig| sig.send(w.buffered());
+        if (c.host.signalFor(c.permanent)) |sig| sig.send(w.buffered());
     }
 
     fn rtcMessage(ctx: *anyopaque, s: *webrtc.Session, binary: bool, data: []const u8) void {
         const c: *RtcConn = @ptrCast(@alignCast(ctx));
-        if (!c.host.onMessage(.{ .rtc = s }, Peer.fromText(s.peer()), &c.viewer, if (binary) .binary else .text, data)) {
+        if (!c.host.onMessage(.{ .rtc = s }, Peer.fromText(s.peer()), &c.viewer, if (binary) .binary else .text, data, c.permanent)) {
             s.closeAfter(1000);
         }
     }
@@ -1360,6 +1541,7 @@ pub const Host = struct {
                 plat.rdc_app_set_permissions(plat.rdc_screen_access(0), plat.rdc_input_access(0));
             }
             if (h.signal) |s| s.keepalive();
+            if (h.perm_signal) |s| s.keepalive();
             h.watchRemote();
             h.updater.tick(h.viewerCount());
         }
@@ -1375,6 +1557,8 @@ const RtcConn = struct {
     id_len: usize,
     /// The offer's timestamp: the replies carry it back, and the browser checks it on its own clock.
     offer_ts: i64,
+    /// The offer came through the permanent link: the browser must show an authenticator code.
+    permanent: bool = false,
 
     fn id(c: *const RtcConn) []const u8 {
         return c.id_buf[0..c.id_len];
@@ -1397,6 +1581,7 @@ fn applyInput(in: proto.Input) void {
 fn onReady(ctx: ?*anyopaque) callconv(.c) void {
     const h: *Host = @ptrCast(@alignCast(ctx orelse return));
     h.refreshUi(true);
+    h.refreshPermanent();
     h.updater.publish();
 }
 
@@ -1411,6 +1596,11 @@ fn onAction(ctx: ?*anyopaque, action: c_int) callconv(.c) void {
         plat.action_stop_media => h.stopMedia("The person at the computer stopped the phone's microphone and camera"),
         plat.action_media_install, plat.action_media_remove => h.installMedia(action == plat.action_media_install),
         plat.action_new_code => h.renewCode(),
+        plat.action_permanent_on, plat.action_permanent_off => {
+            plat.rdc_set_pref_bool("permanent", @intFromBool(action == plat.action_permanent_on));
+            h.setPermanent(action == plat.action_permanent_on, false);
+        },
+        plat.action_permanent_reset => h.setPermanent(true, true),
         plat.action_check_update => h.updater.checkNow(),
         plat.action_install_update => {
             h.kickAll("The computer is updating RDC — reconnect in a minute");
