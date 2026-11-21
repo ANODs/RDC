@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Smoke test of the Linux host, run by .github/workflows/linux.yml under Xvfb.
 
-  ci_smoke.py <host log> [<out dir>] [--window]
+  ci_smoke.py <host log> [<out dir>] [--window | --displays]
 
 --window: the host shows its GTK window on the same screen, which may redraw on its own (a hover,
 a status line), so a still screen there is only reported, not required.
+--displays: the X screen is split into two XRandR monitors side by side (xrandr --setmonitor);
+checks the display list in "ok", that a move past the right edge of the first monitor puts the
+pointer on the second and the picture follows it ("display" message), and the switch by hand.
 
 Reads the code and port from the host's log, connects as a viewer does over the local network
 (a WebSocket on /ws, then {"t":"hello","code":…} — see src/core/proto.zig and wsLink/connect in
@@ -124,6 +127,8 @@ def xdotool(*args):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     window = "--window" in sys.argv[1:]
+    if "--displays" in sys.argv[1:]:
+        return check_displays(args)
     if not args:
         fail("usage: ci_smoke.py <host log> [<out dir>] [--window]")
     out_dir = args[1] if len(args) > 1 else "."
@@ -207,6 +212,61 @@ def main():
         out.write(moved[-1][10:])
     print("frame after the move: %d" % len(moved))
 
+    ws.send(8, struct.pack("!H", 1000))
+    print("PASS")
+
+
+def check_displays(args):
+    port, code = wait_code(args[0])
+    print("host on port %d, code %s" % (port, code))
+    ws = WebSocket(port)
+    ws.send_json({"t": "hello", "code": code, "h264": False, "displays": True, "agent": "ci_smoke.py"})
+
+    def wait_text(kind, seconds):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            m = ws.recv(0.25)
+            if m and m[0] == 1:
+                msg = json.loads(m[1])
+                if msg.get("t") == kind:
+                    return msg
+        fail("no %s message in %d s" % (kind, seconds))
+
+    def pointer():
+        loc = dict(kv.split("=", 1) for kv in xdotool("getmouselocation", "--shell").split())
+        return int(loc["X"]), int(loc["Y"])
+
+    ok = wait_text("ok", 15)
+    ds = ok.get("displays") or []
+    print("displays:", [(d["id"], d["name"], d["x"], d["y"], d["w"], d["h"]) for d in ds], "shown", ok.get("display"))
+    if len(ds) != 2:
+        fail("expected two displays, got %d" % len(ds))
+    left, right = sorted(ds, key=lambda d: d["x"])
+    if ok["display"] != left["id"]:
+        ws.send_json({"t": "display", "id": left["id"]})
+        wait_text("display", 5)
+        ws.send_json({"t": "shown", "id": left["id"]})
+    # Past the right edge of the left monitor: onto the right one, and the picture follows.
+    ws.send(2, struct.pack("<Bff", 1, 0.5, 0.5))
+    time.sleep(0.3)
+    ws.send(2, struct.pack("<Bff", 1, 1.25, 0.5))
+    m = wait_text("display", 5)
+    x, y = pointer()
+    print("crossed: pointer at %d,%d; display %r" % (x, y, {k: m.get(k) for k in ("id", "index", "count", "w", "h")}))
+    if m["id"] != right["id"] or m["index"] != 2 or m["count"] != 2:
+        fail("the picture did not follow onto the right monitor")
+    if x < right["x"]:
+        fail("the pointer did not cross: %d,%d" % (x, y))
+    ws.send_json({"t": "shown", "id": right["id"]})
+    # By hand, back to the left one: the pointer goes to its middle.
+    ws.send_json({"t": "display", "id": left["id"]})
+    m = wait_text("display", 5)
+    time.sleep(0.3)
+    x, y = pointer()
+    print("by hand: pointer at %d,%d; display %r" % (x, y, {k: m.get(k) for k in ("id", "index", "w", "h")}))
+    cx, cy = left["x"] + (left["w"] - 1) / 2, left["y"] + (left["h"] - 1) / 2
+    if m["id"] != left["id"] or abs(x - cx) > 1 or abs(y - cy) > 1:
+        fail("the switch by hand did not go to the middle of the left monitor")
     ws.send(8, struct.pack("!H", 1000))
     print("PASS")
 

@@ -55,7 +55,10 @@ let jpegBusy = false;
 let jpegNext = null;
 let swapCtrl = false;
 const pressed = new Set();
-const stats = { frames: 0, bytes: 0, t0: performance.now(), rtt: 0 };
+// The computer's displays (docs/PLAN.md, section 6 "Multiple displays"): the host shows one at a
+// time, the one its pointer is on. Input is normalized to the display shown here.
+const disp = { list: [], id: 0 };
+const stats = { frames: 0, total: 0, bytes: 0, t0: performance.now(), rtt: 0 };
 
 // ---------------------------------------------------------------- connection
 
@@ -78,14 +81,13 @@ function paintJoin() {
   const c = $('code');
   c.classList.toggle('link', !perm && !servedByHost);
   if (perm) {
-    $('hint').textContent = 'Enter the 6-digit code from your authenticator app';
+    $('hint').textContent = 'Code from your authenticator app';
     c.placeholder = '123 456';
     c.setAttribute('inputmode', 'numeric');
     c.setAttribute('autocomplete', 'one-time-code');
   } else {
-    $('hint').textContent = servedByHost ? 'Enter the code from the RDC window on the computer'
-                                         : 'Open the link from the RDC window on the computer, or paste it here';
-    c.placeholder = servedByHost ? '123 456 789' : 'Link from the RDC window';
+    $('hint').textContent = servedByHost ? 'Code from the RDC window' : 'Link from the RDC window';
+    c.placeholder = servedByHost ? '123 456 789' : 'Paste the link';
     c.setAttribute('inputmode', servedByHost ? 'numeric' : 'url');
     c.setAttribute('autocomplete', 'off');
   }
@@ -225,7 +227,7 @@ function connect() {
   let c = null;
   const handlers = {
     open() {
-      const hello = { t: 'hello', h264: canH264 && !forceJpeg, agent: navigator.userAgent };
+      const hello = { t: 'hello', h264: canH264 && !forceJpeg, agent: navigator.userAgent, displays: true };
       if (!perm) hello.code = code;
       else if (resume) hello.resume = resume;
       else hello.otp = otp;
@@ -692,6 +694,9 @@ function onControl(m) {
                                          : '⌘ on this Mac acts as Ctrl on the computer';
       $('swap').classList.toggle('on', swapCtrl);
       setSize(m.w, m.h);
+      disp.list = m.displays || [];
+      disp.id = m.display || 0;
+      paintDisplays();
       tp.lastLocal = 0;
       syncCursor(m);
       document.body.classList.add('live');
@@ -704,6 +709,9 @@ function onControl(m) {
       break;
     case 'size':
       setSize(m.w, m.h);
+      break;
+    case 'display':
+      onDisplay(m);
       break;
     case 'pong':
       stats.rtt = performance.now() - m.ts;
@@ -738,6 +746,48 @@ function onControl(m) {
   }
 }
 
+// The host now shows another display. Input already on its way was meant for the old one, so
+// it goes out first; then "shown" tells the host that from here on it is normalized to the new one.
+function onDisplay(m) {
+  const from = rectOf(disp.id);
+  if (movePending) { sendMove(movePending[0], movePending[1]); movePending = null; }
+  disp.list = m.displays || disp.list;
+  disp.id = m.id;
+  send(JSON.stringify({ t: 'shown', id: m.id }));
+  // The touchpad cursor stays where it is on the desktop.
+  const to = rectOf(m.id);
+  if (from && to) [tp.x, tp.y] = rebase(from, to, tp.x, tp.y, true);
+  setSize(m.w, m.h);
+  paintDisplays();
+}
+
+const rectOf = (id) => disp.list.find((d) => d.id === id) || null;
+// A point normalized to display `from` → normalized to `to`, through desktop coordinates.
+function rebase(from, to, x, y, clamp) {
+  const gx = from.x + x * (from.w - 1), gy = from.y + y * (from.h - 1);
+  const nx = (gx - to.x) / Math.max(1, to.w - 1), ny = (gy - to.y) / Math.max(1, to.h - 1);
+  return clamp ? [clamp01(nx), clamp01(ny)] : [nx, ny];
+}
+
+function paintDisplays() {
+  const b = $('disp');
+  const n = disp.list.length;
+  const i = disp.list.findIndex((d) => d.id === disp.id);
+  b.style.display = n > 1 ? '' : 'none';
+  b.textContent = `Display ${i + 1}/${n}`;
+  b.title = (i >= 0 ? disp.list[i].name + ' — ' : '') + 'click to show the next display';
+}
+
+// By hand: the host moves its pointer to the middle of that display and shows it.
+function chooseDisplay(id) { send(JSON.stringify({ t: 'display', id })); }
+$('disp').addEventListener('click', () => {
+  const n = disp.list.length;
+  if (n < 2) return;
+  const i = disp.list.findIndex((d) => d.id === disp.id);
+  chooseDisplay(disp.list[(i + 1) % n].id);
+  canvas.focus();
+});
+
 $('ai-stop').onclick = () => { send(JSON.stringify({ t: 'stop_ai' })); $('ai').style.display = 'none'; };
 
 // ---------------------------------------------------------------- picture
@@ -762,6 +812,7 @@ function draw(img, w, h) {
   if (canvas.width !== w || canvas.height !== h) setSize(w, h);
   ctx2d.drawImage(img, 0, 0);
   stats.frames++;
+  stats.total++;
   if (!gotFrame) { gotFrame = true; $('veil').style.display = 'none'; $('veil').textContent = 'Reconnecting…'; }
 }
 
@@ -844,6 +895,20 @@ function norm(e) {
   return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height];
 }
 
+// A mouse drag: the picture and display it started on. While a button is held the picture keeps
+// the pointer (pointer capture), so moves past its edge go out as values below 0 or above 1 and
+// the host carries them onto the next display; if the host then switches the picture, the same
+// spot on this screen still means the same spot on the computer's desktop.
+let drag = null;
+function pos(e) {
+  if (!drag) return norm(e);
+  const r = drag.box;
+  const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+  if (drag.id === disp.id) return [x, y];
+  const from = rectOf(drag.id), to = rectOf(disp.id);
+  return from && to ? rebase(from, to, x, y, false) : norm(e);
+}
+
 function sendMove(x, y) {
   const b = new DataView(new ArrayBuffer(9));
   b.setUint8(0, MSG.MOVE); b.setFloat32(1, x, true); b.setFloat32(5, y, true);
@@ -851,6 +916,7 @@ function sendMove(x, y) {
 }
 
 function sendButton(btn, down, x, y) {
+  if (down) held.add(btn); else held.delete(btn);
   const b = new DataView(new ArrayBuffer(11));
   b.setUint8(0, MSG.BUTTON); b.setUint8(1, btn); b.setUint8(2, down ? 1 : 0);
   b.setFloat32(3, x, true); b.setFloat32(7, y, true);
@@ -865,6 +931,8 @@ function sendKey(usage, down) {
 
 function releaseAll() {
   pressed.clear();
+  held.clear();
+  drag = null;
   osk.reset();
   send(new Uint8Array([MSG.RELEASE_ALL]));
 }
@@ -892,6 +960,18 @@ const DOUBLE_TAP_MS = 250;   // window for the second tap
 const tp = { x: 0.5, y: 0.5, lastLocal: 0, touches: new Map(), mode: 'none', start: null, moved: false, pendingTap: false, tapTimer: 0, scrollAt: null };
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const held = new Set(); // mouse buttons held down on the computer
+
+// How far the touchpad cursor may go, normalized to the shown display: the picture, or, during a
+// drag, the box around all displays.
+function tpLimits() {
+  const cur = rectOf(disp.id);
+  if (!held.size || !cur || disp.list.length < 2) return [0, 1, 0, 1];
+  let [l, t, r, b] = [Infinity, Infinity, -Infinity, -Infinity];
+  for (const d of disp.list) { l = Math.min(l, d.x); t = Math.min(t, d.y); r = Math.max(r, d.x + d.w - 1); b = Math.max(b, d.y + d.h - 1); }
+  const nx = (g) => (g - cur.x) / Math.max(1, cur.w - 1), ny = (g) => (g - cur.y) / Math.max(1, cur.h - 1);
+  return [nx(l), nx(r), ny(t), ny(b)];
+}
 
 function click(btn) {
   sendMove(tp.x, tp.y);
@@ -942,8 +1022,10 @@ function touchMove(e) {
     // Slow is more precise, fast goes farther: like pointer acceleration on a touchpad.
     const speed = Math.hypot(dx, dy) / dt;
     const gain = Math.min(2.6, Math.max(0.6, 0.6 + speed * 1.2));
-    tp.x = clamp01(tp.x + (dx * gain) / r.width);
-    tp.y = clamp01(tp.y + (dy * gain) / r.height);
+    // While a button is held (a drag), the cursor may run past the picture onto the next display.
+    const [x0, x1, y0, y1] = tpLimits();
+    tp.x = Math.min(x1, Math.max(x0, tp.x + (dx * gain) / r.width));
+    tp.y = Math.min(y1, Math.max(y0, tp.y + (dy * gain) / r.height));
     tp.lastLocal = performance.now();
     movePending = [tp.x, tp.y];
   } else if (tp.mode === 'scroll') {
@@ -989,7 +1071,7 @@ const onUi = (e) => !!(e.target.closest && e.target.closest('#bar, #handle, #ai,
 stage.addEventListener('pointermove', (e) => {
   if (e.pointerType === 'touch') return touchMove(e);
   if (e.target !== canvas) return;
-  movePending = norm(e);
+  movePending = pos(e);
 });
 stage.addEventListener('pointerdown', (e) => {
   if (onUi(e)) return;
@@ -998,7 +1080,9 @@ stage.addEventListener('pointerdown', (e) => {
   canvas.focus();
   try { canvas.setPointerCapture(e.pointerId); } catch (_) {} // later events of this pointer target the picture
   if (e.pointerType === 'touch') return touchDown(e);
-  const [x, y] = norm(e);
+  if (!drag) drag = { box: canvas.getBoundingClientRect(), id: disp.id, buttons: 0 };
+  drag.buttons |= 1 << buttonOf(e);
+  const [x, y] = pos(e);
   movePending = null;
   sendMove(x, y);
   sendButton(buttonOf(e), true, x, y);
@@ -1007,8 +1091,10 @@ stage.addEventListener('pointerup', (e) => {
   if (e.pointerType === 'touch') return touchUp(e);
   if (e.target !== canvas) return;
   e.preventDefault();
-  const [x, y] = norm(e);
+  const [x, y] = pos(e);
+  if (movePending) { sendMove(movePending[0], movePending[1]); movePending = null; }
   sendButton(buttonOf(e), false, x, y);
+  if (drag && !(drag.buttons &= ~(1 << buttonOf(e)))) drag = null;
 });
 stage.addEventListener('pointercancel', (e) => {
   if (e.pointerType !== 'touch') return;
@@ -1095,7 +1181,8 @@ function leave() {
 }
 $('leave').addEventListener('click', leave);
 document.addEventListener('fullscreenchange', () => {
-  $('full').textContent = document.fullscreenElement ? 'Exit full screen' : 'Full screen';
+  $('full').title = document.fullscreenElement ? 'Exit full screen' : 'Full screen';
+  $('full').setAttribute('aria-label', $('full').title);
   fit();
 });
 window.addEventListener('resize', fit);
@@ -1722,7 +1809,8 @@ const media = (() => {
   function paint() {
     const live = on.mic || on.camera;
     btn.classList.toggle('on', live);
-    btn.textContent = live ? (on.mic && on.camera ? 'Mic and camera on' : on.mic ? 'Mic on' : 'Camera on') : 'Camera and mic';
+    btn.title = live ? (on.mic && on.camera ? 'Microphone and camera are on' : on.mic ? 'Microphone is on' : 'Camera is on') : 'Microphone and camera';
+    btn.setAttribute('aria-label', btn.title);
   }
 
   function say(text) { note.textContent = text || ''; }
@@ -1756,7 +1844,7 @@ const media = (() => {
     micBox.checked = on.mic;
     camBox.checked = on.camera;
     if (m.msg) say(m.msg);
-    else if (on.mic || on.camera) say(`Live: on the computer, pick "RDC ${on.mic ? 'Microphone' : 'Camera'}" in any app`);
+    else if (on.mic || on.camera) say(`On the computer, pick "RDC ${on.mic ? 'Microphone' : 'Camera'}" in any app.`);
     else say('');
     paint();
   }
@@ -1775,11 +1863,14 @@ const media = (() => {
     micBox.disabled = !secure || !can.mic;
     camBox.disabled = !secure || !can.camera;
     const mac = m.os === 'macos';
-    if (!secure) say('The camera and microphone work only on a secure page: open the link from anywhere (the second link in the RDC window), or http://localhost on the computer itself');
-    else if (!can.mic && !can.camera) say(mac ? 'On the computer, click "Enable phone microphone" in the RDC window first. A phone camera is not available on a Mac.'
+    // What this computer's system never takes is not offered at all.
+    $('media-cam-row').hidden = $('media-q-row').hidden = mac;
+    $('media-mic-row').hidden = m.os === 'windows';
+    if (!secure) say('Open the "From anywhere" link from the RDC window: browsers give the microphone and camera only to secure pages.');
+    else if (!can.mic && !can.camera) say(mac ? 'Turn on "Phone microphone" in RDC Settings on the Mac first.'
                                                : 'On the computer, click "Enable phone camera" in the RDC window first. A phone microphone is not available on Windows.');
-    else if (!can.mic) say(mac ? 'Microphone: in the RDC window on the computer, click "Enable phone microphone"' : 'A phone microphone is not available on a Windows computer');
-    else if (!can.camera) say(mac ? 'A phone camera is not available on a Mac: it needs a signed camera extension' : 'Camera: in the RDC window on the computer, click "Enable phone camera"');
+    else if (!can.mic) say(mac ? 'Microphone: turn on "Phone microphone" in RDC Settings on the Mac.' : 'A phone microphone is not available on a Windows computer');
+    else if (!can.camera) say(mac ? '' : 'Camera: in the RDC window on the computer, click "Enable phone camera"');
     else say('');
     paint();
   }
@@ -1849,8 +1940,25 @@ startFromHash();
     if (!(x >= 0 && y >= 0 && x < width && y < height)) return null;
     return [x / Math.max(1, width - 1), y / Math.max(1, height - 1)];
   };
+  const displayInfo = () => {
+    const i = disp.list.findIndex((d) => d.id === disp.id);
+    return {
+      display: i + 1,
+      displays: disp.list.map((d, k) => ({ number: k + 1, name: d.name, width: d.pw || d.w, height: d.ph || d.h, primary: !!d.primary })),
+    };
+  };
+  const shot = (max_width) => {
+    const { width, height } = size();
+    const k = Math.min(1, (max_width || 1280) / width);
+    const c = document.createElement('canvas');
+    c.width = Math.round(width * k);
+    c.height = Math.round(height * k);
+    c.getContext('2d').drawImage(canvas, 0, 0, c.width, c.height);
+    const where = disp.list.length > 1 ? { display: `display ${displayInfo().display} of ${disp.list.length}` } : {};
+    return { screen: { width, height }, ...where, image: { width: c.width, height: c.height, dataUrl: c.toDataURL('image/jpeg', 0.7) } };
+  };
   const status = () => (live()
-    ? { connected: true, computer: host.name || 'computer', os: host.os, ...size(), path: via || 'this network' }
+    ? { connected: true, computer: host.name || 'computer', os: host.os, ...size(), ...(disp.list.length ? displayInfo() : {}), path: via || 'this network' }
     : { connected: false, waitingFor: perm && $('join').style.display !== 'none' ? 'authenticator code' : null, message: $('err').textContent || null });
 
   // Key names: KeyboardEvent.code values (KeyA, Enter, ArrowLeft…) or short ones (a, enter, ctrl, cmd…).
@@ -1876,13 +1984,13 @@ startFromHash();
   const tools = [
     {
       name: 'rdc_connect',
-      description: 'Connect this page to a computer that runs RDC. link: a link from the RDC window on that computer (https://anods.github.io/RDC/#<code>-<key>, or a permanent link #my-<key>). A permanent link also needs code: the current 6-digit code from the user\'s authenticator app — ask the user for it. Returns the status; the person at the computer can stop an AI agent at any time.',
+      description: 'Connect this page to a computer that runs RDC. link: a link from the RDC window on that computer (https://rdc.timoshkin.dev/#<code>-<key>, or a permanent link #my-<key>). A permanent link also needs code: the current 6-digit code from the user\'s authenticator app — ask the user for it. Returns the status; the person at the computer can stop an AI agent at any time.',
       inputSchema: { type: 'object', properties: { link: { type: 'string' }, code: { type: 'string', description: '6-digit authenticator code, for a permanent link' } } },
       annotations: { consequentialHint: true },
       async execute({ link, code } = {}) {
         if (link) {
           const e = parseEntry(link);
-          if (!e.perm && e.code.length !== 9) return { error: 'Not an RDC link: it looks like https://anods.github.io/RDC/#123456789-<key> and comes from the RDC window on the computer.' };
+          if (!e.perm && e.code.length !== 9) return { error: 'Not an RDC link: it looks like https://rdc.timoshkin.dev/#123456789-<key> and comes from the RDC window on the computer.' };
           location.hash = '#' + (e.perm ? 'my-' + e.key : e.code + (e.key ? '-' + e.key : ''));
           await sleep(300);
         }
@@ -1901,7 +2009,7 @@ startFromHash();
     },
     {
       name: 'rdc_status',
-      description: 'Whether this page is connected to a computer, its name, OS and screen size in pixels.',
+      description: 'Whether this page is connected to a computer, its name, OS, screen size in pixels and, with several displays, which one is shown (display) and the list (displays).',
       inputSchema: { type: 'object', properties: {} },
       annotations: { readOnlyHint: true },
       async execute() { return status(); },
@@ -1913,13 +2021,26 @@ startFromHash();
       annotations: { readOnlyHint: true },
       async execute({ max_width } = {}) {
         if (!live()) return notLive();
-        const { width, height } = size();
-        const k = Math.min(1, (max_width || 1280) / width);
-        const c = document.createElement('canvas');
-        c.width = Math.round(width * k);
-        c.height = Math.round(height * k);
-        c.getContext('2d').drawImage(canvas, 0, 0, c.width, c.height);
-        return { screen: { width, height }, image: { width: c.width, height: c.height, dataUrl: c.toDataURL('image/jpeg', 0.7) } };
+        return shot(max_width);
+      },
+    },
+    {
+      name: 'rdc_display',
+      description: 'Show another display of a computer with several: display is its number, 1-based (rdc_status lists them). The pointer moves to the middle of that display; returns a screenshot of it. The picture also follows the pointer by itself when it goes onto another display.',
+      inputSchema: { type: 'object', properties: { display: { type: 'number', description: 'Display number, 1-based' } }, required: ['display'] },
+      async execute({ display }) {
+        if (!live()) return notLive();
+        const n = disp.list.length;
+        const d = disp.list[Math.round(display) - 1];
+        if (!d) return { error: n > 1 ? `There are ${n} displays: pass 1 to ${n}.` : 'This computer has one display.' };
+        if (d.id !== disp.id) {
+          chooseDisplay(d.id);
+          for (let i = 0; i < 50 && disp.id !== d.id; i++) await sleep(100);
+          if (disp.id !== d.id) return { error: 'The computer did not switch displays.' };
+          const seen = stats.total;
+          for (let i = 0; i < 20 && stats.total === seen; i++) await sleep(100);
+        }
+        return shot();
       },
     },
     {

@@ -22,7 +22,7 @@ const usage =
     \\  --web-dir DIR   for development: viewer page from disk (DIR is the web folder)
     \\  --update-url U  for testing: updates from U instead of GitHub releases
     \\  --no-remote     no link from anywhere: no public signaling brokers, no WebRTC
-    \\  --remote-url U  for testing: the page the link from anywhere opens (default https://anods.github.io/RDC/)
+    \\  --remote-url U  for testing: the page the link from anywhere opens (default https://rdc.timoshkin.dev/)
     \\  --relay URL|off the relay for browsers that cannot connect directly (default: Settings, or RDC's own)
     \\
     \\MCP options (stdio by default; Claude Code, Codex and Claude Desktop start it this way):

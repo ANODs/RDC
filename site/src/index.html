@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="{{@lang}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{{title}}</title>
+<meta name="description" content="{{description}}">
+<meta name="robots" content="index,follow,max-image-preview:large">
+<meta name="theme-color" content="#0b0b0d">
+<meta name="color-scheme" content="dark">
+<meta name="rdc-version" content="{{@version}}">
+<link rel="canonical" href="{{@url}}">
+{{@alternates}}
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="RDC">
+<meta property="og:title" content="{{title}}">
+<meta property="og:description" content="{{description}}">
+<meta property="og:url" content="{{@url}}">
+<meta property="og:locale" content="{{@og_locale}}">
+<meta property="og:image" content="{{@base}}icon.png">
+<meta name="twitter:card" content="summary">
+<link rel="icon" type="image/png" href="../icon.png">
+<link rel="apple-touch-icon" href="../icon.png">
+<script type="application/ld+json">{{@jsonld}}</script>
+<script>document.documentElement.classList.add('js')</script>
+<style>{{@inc:styles.css}}</style>
+</head>
+<body>
+
+<svg class="sprite" aria-hidden="true">
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><ellipse cx="12" cy="12" rx="3.7" ry="8.5"/></symbol>
+  <symbol id="i-go" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
+  <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M3.5 9.5a12.5 12.5 0 0 1 17 0M6.6 13a8 8 0 0 1 10.8 0M9.6 16.4a3.6 3.6 0 0 1 4.8 0M12 19.5h.01"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2.6"/><path d="M15.5 5.5v-.4a2.6 2.6 0 0 0-2.6-2.6H7.1a2.6 2.6 0 0 0-2.6 2.6v5.8a2.6 2.6 0 0 0 2.6 2.6h.4"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-open" viewBox="0 0 24 24"><path d="M8 16L18 6M10 6h8v8"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.27 13.86A7.5 7.5 0 1 1 13.49 4.65M14.2 4.2l5.4.4-.4 5.4"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><path d="M4 7.5h2.6M11.4 7.5H20M4 16.5h8.6M17.4 16.5H20"/><circle cx="9" cy="7.5" r="2.4"/><circle cx="15" cy="16.5" r="2.4"/></symbol>
+  <symbol id="i-browser" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="3"/><path d="M3 9h18M6.5 6.8h.01M9.3 6.8h.01"/></symbol>
+  <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9-1.9 5.1-1.9-5.1-5.1-1.9 5.1-1.9zM18.5 16.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15.5" r="4"/><path d="M11 12.5l8.5-8.5M16 7.5l2.5 2.5M13.5 10l1.8 1.8"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="9.5" rx="2.6"/><path d="M8.5 10.5v-3a3.5 3.5 0 0 1 7 0v3"/></symbol>
+</svg>
+
+<header class="nav" id="nav">
+  <a class="brand" href="{{@home}}" aria-label="RDC"><img src="../icon.png" alt="" width="26" height="26"><span>RDC</span></a>
+  <div class="nav-r">
+    <div class="seg" role="group" aria-label="{{lang_label}}">
+      <a href="../en/" data-lang="en" lang="en"{{@cur_en}}>EN</a>
+      <a href="../ru/" data-lang="ru" lang="ru"{{@cur_ru}}>RU</a>
+      <a href="../zh/" data-lang="zh" lang="zh"{{@cur_zh}}>中文</a>
+    </div>
+    <a class="nav-link" href="{{@repo_url}}" rel="noopener">GitHub</a>
+    <a class="nav-link" href="#connect">{{nav_connect}}</a>
+    <a class="btn btn-p btn-s" href="#download">{{nav_download}}</a>
+  </div>
+</header>
+
+<main>
+
+<section class="hero" id="top">
+  <div class="aura" aria-hidden="true"></div>
+  <div class="copy">
+    <p class="eyebrow r" style="--i:0">{{eyebrow}}</p>
+    <h1><span class="r" style="--i:1">{{h1_a}}</span> <span class="r dim" style="--i:2">{{h1_b}}</span></h1>
+    <p class="sub r" style="--i:3">{{sub}}</p>
+    <div class="cta r" style="--i:4">
+      <a class="btn btn-p" id="cta" href="#download" data-mac="{{cta_mac}}" data-win="{{cta_win}}" data-linux="{{cta_linux}}">{{cta_any}}</a>
+      <a class="btn btn-g" href="{{@repo_url}}" rel="noopener">GitHub</a>
+    </div>
+    <form class="join r" style="--i:5" id="connect" autocomplete="off">
+      <input id="join-link" inputmode="url" placeholder="{{join_ph}}" aria-label="{{join_ph}}" autocapitalize="off" spellcheck="false">
+      <button type="submit" aria-label="{{nav_connect}}"><svg><use href="#i-go"/></svg></button>
+    </form>
+    <p class="join-err" id="join-err" data-bad="{{join_bad}}" hidden></p>
+    <p class="meta r" style="--i:6"><span id="cta-meta" data-mb="{{mb}}">v{{@version}} · macOS · Windows · Linux</span><a id="cta-all" href="#download" hidden>{{all_platforms}}</a></p>
+  </div>
+
+  <div class="stage r" style="--i:7" id="stage">
+    <!-- the RDC window as the app draws it (src/platform/macos/shim.m): the buttons work -->
+    <div class="win" id="demo" data-state="idle" role="group" aria-label="{{demo_label}}">
+      <div class="win-bar"><i></i><i></i><i></i><button type="button" class="ic" tabindex="-1" aria-hidden="true"><svg><use href="#i-gear"/></svg></button></div>
+      <div class="status" aria-live="polite"><i class="dot"></i><span id="st-label" data-idle="{{st_idle}}" data-live="{{st_live}}">{{st_idle}}</span></div>
+      <div class="code"><span id="demo-code">482 913 057</span><button type="button" class="ic" id="demo-new" aria-label="{{demo_new}}"><svg><use href="#i-refresh"/></svg></button></div>
+      <div class="links">
+        <div class="lrow"><svg><use href="#i-wifi"/></svg><div><b>{{demo_lan}}</b><span id="demo-lan">192.168.1.24:7700</span></div>
+          <button type="button" class="ic" data-copy aria-label="{{demo_copy}}"><svg><use href="#i-copy"/></svg></button><button type="button" class="ic" data-open aria-label="{{demo_open}}"><svg><use href="#i-open"/></svg></button></div>
+        <div class="lrow"><svg><use href="#i-globe"/></svg><div><b>{{demo_any}}</b><span>anods.github.io/RDC</span></div>
+          <button type="button" class="ic" data-copy aria-label="{{demo_copy}}"><svg><use href="#i-copy"/></svg></button><button type="button" class="ic" data-open aria-label="{{demo_open}}"><svg><use href="#i-open"/></svg></button></div>
+      </div>
+      <button type="button" class="kick" id="demo-kick">{{demo_kick}}</button>
+    </div>
+    <!-- and the phone that opened the link -->
+    <div class="phone" aria-hidden="true">
+      <div class="ph-screen">
+        <div class="ph-bar"><b>MacBook</b><i></i><i></i><i class="red"></i></div>
+        <div class="ph-desk"><span></span><span></span><span></span><em></em></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="sec" id="what">
+  <div class="wrap">
+    <div class="nums">
+      <div class="rv" style="--i:0"><b><span data-size="mac" data-mb="{{mb}}" data-bare>1.3</span></b><span>{{num_size}}</span></div>
+      <div class="rv" style="--i:1"><b>0</b><span>{{num_phone}}</span></div>
+      <div class="rv" style="--i:2"><b>11</b><span>{{num_tools}}</span></div>
+      <div class="rv" style="--i:3"><b>0</b><span>{{num_accounts}}</span></div>
+    </div>
+    <div class="feats">
+      <article class="feat rv" style="--i:0"><svg><use href="#i-globe"/></svg><h3>{{f_any_h}}</h3><p>{{f_any_p}}</p></article>
+      <article class="feat rv" style="--i:1"><svg><use href="#i-browser"/></svg><h3>{{f_browser_h}}</h3><p>{{f_browser_p}}</p></article>
+      <article class="feat rv" style="--i:2"><svg><use href="#i-spark"/></svg><h3>{{f_ai_h}}</h3><p>{{f_ai_p}}</p></article>
+      <article class="feat rv" style="--i:3"><svg><use href="#i-mic"/></svg><h3>{{f_mic_h}}</h3><p>{{f_mic_p}}</p></article>
+      <article class="feat rv" style="--i:4"><svg><use href="#i-key"/></svg><h3>{{f_perm_h}}</h3><p>{{f_perm_p}}</p></article>
+      <article class="feat rv" style="--i:5"><svg><use href="#i-lock"/></svg><h3>{{f_safe_h}}</h3><p>{{f_safe_p}}</p></article>
+    </div>
+  </div>
+</section>
+
+<section class="sec" id="how">
+  <div class="wrap">
+    <h2 class="rv">{{how_h}}</h2>
+    <ol class="steps">
+      <li class="rv" style="--i:0"><b>1</b><h3>{{how_1_h}}</h3><p>{{how_1_p}}</p></li>
+      <li class="rv" style="--i:1"><b>2</b><h3>{{how_2_h}}</h3><p>{{how_2_p}}</p></li>
+      <li class="rv" style="--i:2"><b>3</b><h3>{{how_3_h}}</h3><p>{{how_3_p}}</p></li>
+    </ol>
+  </div>
+</section>
+
+<section class="sec" id="agents">
+  <div class="wrap">
+    <div class="ag">
+      <div class="rv">
+        <h2>{{ag_h}}</h2>
+        <p class="lead">{{ag_sub}}</p>
+      </div>
+      <div class="term rv" style="--i:1">
+        <div class="seg" id="ag-tabs" role="group" aria-label="{{ag_h}}">
+          <button type="button" data-a="code" aria-pressed="true">Claude Code</button>
+          <button type="button" data-a="desktop">Claude Desktop</button>
+          <button type="button" data-a="codex">Codex</button>
+          <button type="button" data-a="any">MCP</button>
+        </div>
+        <div class="ag-p on" data-a="code">
+          <div class="cmd"><code>claude plugin marketplace add ANODs/RDC</code><button type="button" class="ic" data-copy-text="claude plugin marketplace add ANODs/RDC" aria-label="{{demo_copy}}"><svg><use href="#i-copy"/></svg></button></div>
+          <div class="cmd"><code>claude plugin install rdc@rdc</code><button type="button" class="ic" data-copy-text="claude plugin install rdc@rdc" aria-label="{{demo_copy}}"><svg><use href="#i-copy"/></svg></button></div>
+        </div>
+        <div class="ag-p" data-a="desktop">
+          <p>{{ag_desktop}}</p>
+          <a class="btn btn-g btn-s" data-dl="mcp" href="{{@file_mcp}}">rdc-mcp.mcpb</a>
+        </div>
+        <div class="ag-p" data-a="codex">
+          <div class="cmd"><code>codex plugin marketplace add ANODs/RDC</code><button type="button" class="ic" data-copy-text="codex plugin marketplace add ANODs/RDC" aria-label="{{demo_copy}}"><svg><use href="#i-copy"/></svg></button></div>
+          <p>{{ag_codex}}</p>
+        </div>
+        <div class="ag-p" data-a="any">
+          <div class="cmd"><code>rdc mcp</code><button type="button" class="ic" data-copy-text="rdc mcp" aria-label="{{demo_copy}}"><svg><use href="#i-copy"/></svg></button></div>
+          <div class="cmd"><code>rdc mcp --http --tunnel</code><button type="button" class="ic" data-copy-text="rdc mcp --http --tunnel" aria-label="{{demo_copy}}"><svg><use href="#i-copy"/></svg></button></div>
+          <p>{{ag_any}}</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="sec" id="download">
+  <div class="wrap">
+    <div class="dl-head">
+      <div class="rv">
+        <h2>{{dl_title}}</h2>
+        <p class="lead">{{dl_sub}}</p>
+      </div>
+      <div class="count rv" id="count" style="--i:1" hidden>
+        <b id="count-n" data-count="total">0</b>
+        <span>{{dl_count}}</span>
+      </div>
+    </div>
+
+    <div class="plats">
+      <article class="plat rv" data-os="mac" style="--i:0">
+        <span class="tag">{{dl_yours}}</span>
+        <h3>macOS</h3>
+        <p class="arch">14.4+ · Apple Silicon · .zip</p>
+        <p class="note">{{dl_mac_note}}</p>
+        <div class="plat-b">
+          <a class="btn btn-g" data-dl="mac" href="{{@file_mac}}">{{dl_get}}</a>
+          <span class="nums-s"><span data-size="mac" data-mb="{{mb}}"></span><span data-count="mac"></span></span>
+        </div>
+      </article>
+      <article class="plat rv" data-os="win" style="--i:1">
+        <span class="tag">{{dl_yours}}</span>
+        <h3>Windows</h3>
+        <p class="arch">10, 11 · x64 · .exe</p>
+        <p class="note">{{dl_win_note}}</p>
+        <div class="plat-b">
+          <a class="btn btn-g" data-dl="win" href="{{@file_win}}">{{dl_get}}</a>
+          <span class="nums-s"><span data-size="win" data-mb="{{mb}}"></span><span data-count="win"></span></span>
+        </div>
+      </article>
+      <article class="plat rv" data-os="linux" style="--i:2">
+        <span class="tag">{{dl_yours}}</span>
+        <h3>Linux</h3>
+        <p class="arch">x64 · X11</p>
+        <p class="note">{{dl_linux_note}}</p>
+        <div class="plat-b">
+          <a class="btn btn-g" data-dl="linux" href="{{@file_linux}}">{{dl_get}}</a>
+          <span class="nums-s"><span data-size="linux" data-mb="{{mb}}"></span><span data-count="linux"></span></span>
+        </div>
+      </article>
+      <article class="plat rv" data-os="phone" style="--i:3">
+        <span class="tag">{{dl_yours}}</span>
+        <h3>{{dl_phone_h}}</h3>
+        <p class="arch">iOS · Android</p>
+        <p class="note">{{dl_phone_note}}</p>
+        <div class="plat-b">
+          <a class="btn btn-g" href="#connect">{{nav_connect}}</a>
+        </div>
+      </article>
+    </div>
+
+    <div class="dl-foot rv">
+      <details>
+        <summary>{{dl_first_run}}</summary>
+        <p>{{dl_first_mac}}</p>
+        <p>{{dl_first_win}}</p>
+        <p>{{dl_first_linux}}</p>
+      </details>
+      <a href="{{@repo_url}}/releases" rel="noopener">{{dl_older}} <span data-ver>v{{@version}}</span></a>
+    </div>
+  </div>
+</section>
+
+<section class="sec" id="stats" hidden data-views="{{stats_views}}" data-uniques="{{stats_uniques}}" data-empty="{{stats_empty}}">
+  <div class="wrap">
+    <h2 class="rv">{{stats_h}}</h2>
+    <div class="sx rv" style="--i:1">
+      <div class="sx-top">
+        <div class="sx-nums">
+          <div><span><i class="sw"></i>{{stats_views}}</span><b id="sx-views">0</b></div>
+          <div><span><i class="sw sw2"></i>{{stats_uniques}}</span><b id="sx-uniques">0</b></div>
+          <div><span>{{stats_downloads}}</span><b id="sx-dl">0</b></div>
+        </div>
+        <div class="sx-per">
+          <div class="seg" id="period" role="group" aria-label="{{stats_days}}">
+            <button type="button" data-d="7">7</button>
+            <button type="button" data-d="30" aria-pressed="true">30</button>
+            <button type="button" data-d="90">90</button>
+          </div>
+          <span>{{stats_days}}</span>
+        </div>
+      </div>
+      <div class="chart" id="chart"></div>
+      <div class="sx-lists">
+        <div><h3>{{stats_country}}</h3><div class="rows" data-dim="country"></div></div>
+        <div><h3>{{stats_ref}}</h3><div class="rows" data-dim="ref"></div></div>
+        <div><h3>{{stats_os}}</h3><div class="rows" data-dim="os"></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="RDC"><img src="../icon.png" alt="" width="22" height="22"><span>RDC</span></a>
+    <nav class="foot-r">
+      <div class="seg" role="group" aria-label="{{lang_label}}">
+        <a href="../en/" data-lang="en" lang="en"{{@cur_en}}>EN</a>
+        <a href="../ru/" data-lang="ru" lang="ru"{{@cur_ru}}>RU</a>
+        <a href="../zh/" data-lang="zh" lang="zh"{{@cur_zh}}>中文</a>
+      </div>
+      <a href="{{@repo_url}}" rel="noopener">GitHub</a>
+      <a href="{{@repo_url}}/blob/main/LICENSE" rel="noopener">Apache 2.0</a>
+      <span>{{foot_by}} <a href="https://timoshkin.dev" rel="noopener author">timoshkin.dev</a></span>
+    </nav>
+  </div>
+</footer>
+
+<!-- the viewer itself (web/index.html), opened over the page by the field in the hero -->
+<div class="view" id="view" hidden>
+  <iframe id="view-frame" title="RDC" allow="fullscreen; microphone; camera; clipboard-read; clipboard-write; keyboard-lock"></iframe>
+  <button type="button" class="view-x" id="view-x" aria-label="{{view_close}}"><svg><use href="#i-x"/></svg></button>
+</div>
+
+<script id="rdc" type="application/json">{{@data}}</script>
+<script>{{@inc:app.js}}</script>
+</body>
+</html>

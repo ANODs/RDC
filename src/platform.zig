@@ -39,6 +39,22 @@ pub extern fn rdc_screen_access(prompt: c_int) c_int;
 pub extern fn rdc_input_access(prompt: c_int) c_int;
 pub extern fn rdc_open_privacy(which: c_int) void;
 
+pub const max_displays = 8;
+/// rdc_display in platform.h.
+pub const Display = extern struct {
+    id: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    pw: i32,
+    ph: i32,
+    primary: i32,
+    name: [64]u8,
+};
+pub extern fn rdc_displays(out: [*]Display, max: c_int) c_int;
+pub extern fn rdc_capture_display(id: u32) c_int;
+
 pub extern fn rdc_capture_start(max_width: c_int, fps: c_int, cb: FrameCallback, ctx: ?*anyopaque) c_int;
 pub extern fn rdc_codec_caps() c_int;
 pub extern fn rdc_capture_stop() void;
@@ -46,13 +62,13 @@ pub extern fn rdc_set_codecs(h264: c_int, jpeg: c_int) void;
 pub extern fn rdc_request_keyframe() void;
 pub extern fn rdc_set_bitrate(bits_per_second: c_int) void;
 
-pub extern fn rdc_mouse_move(nx: f64, ny: f64) void;
-pub extern fn rdc_mouse_button(button: c_int, down: c_int, nx: f64, ny: f64) void;
+pub extern fn rdc_mouse_move(x: f64, y: f64) void;
+pub extern fn rdc_mouse_button(button: c_int, down: c_int, x: f64, y: f64) void;
 pub extern fn rdc_scroll(dx: f64, dy: f64) void;
 pub extern fn rdc_key(keycode: c_int, down: c_int) void;
 pub extern fn rdc_release_all() void;
 pub extern fn rdc_text(utf8: [*]const u8, len: usize) void;
-pub extern fn rdc_cursor_pos(nx: *f64, ny: *f64) void;
+pub extern fn rdc_cursor_pos(x: *f64, y: *f64) void;
 pub extern fn rdc_read_file(path: [*:0]const u8, len: *usize) ?[*]u8;
 
 pub extern fn rdc_jpeg_scale(jpeg: [*]const u8, len: usize, crop_x: c_int, crop_y: c_int, crop_w: c_int, crop_h: c_int, max_w: c_int, max_h: c_int, quality: c_int, out_len: *usize, out_w: *c_int, out_h: *c_int) ?[*]u8;

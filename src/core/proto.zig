@@ -11,11 +11,20 @@
 //!   pong, err, bye, viewers {n, ai: [names]} (who is connected, sent to everyone on every change),
 //!   media {mic, camera, msg} — which of the viewer's devices the host takes now, and why not.
 //!   `mic` and `camera` in ok say whether this computer has the capture devices for them.
-//! Viewer → host, text — JSON: hello {code, h264, ai}, ping {ts}, stop_ai, media {mic, camera}.
+//!   Several displays (core/displays.zig): ok also has displays [{id, name, x, y, w, h, pw, ph,
+//!   primary}] (x, y, w, h — desktop coordinates, pw, ph — pixels) and display (the id shown);
+//!   display {id, index (1-based), count, name, displays, w, h} comes right before the first
+//!   frame of another display, and when displays are added or removed. `size` comes as before.
+//! Viewer → host, text — JSON: hello {code, h264, ai, displays}, ping {ts}, stop_ai, media {mic,
+//!   camera}, shown {id}, display {id}.
 //!   `ai` names the AI agent behind this viewer (rdc mcp); stop_ai disconnects all AI agents;
-//!   media asks the host to take (or drop) this viewer's microphone and camera.
+//!   media asks the host to take (or drop) this viewer's microphone and camera. A viewer that
+//!   says displays:true answers every display message with shown {id}: its input before that is
+//!   normalized to the old display, after it to the new one (an older viewer's input follows the
+//!   switch at once). display {id} asks the host to show that display and move its pointer there.
 //! Viewer → host, binary — input (all numbers little-endian):
-//!   1 move  f32 x, f32 y (0..1)        2 button u8 btn, u8 down, f32 x, f32 y
+//!   1 move  f32 x, f32 y (0..1 on the display shown; beyond — onto the next display)
+//!   2 button u8 btn, u8 down, f32 x, f32 y
 //!   3 wheel f32 dx, f32 dy (pixels)    4 key u16 hid, u8 down
 //!   5 release_all                      6 text: UTF-8 to type (the rest of the message)
 //!   16 keyframe

@@ -6,3 +6,5 @@ third_party/steamworks/
 .DS_Store
 relay/.wrangler/
 relay/node_modules/
+_site/
+site/worker/.wrangler/

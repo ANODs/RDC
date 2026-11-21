@@ -8,6 +8,7 @@ Lightweight, low-latency cross-platform remote desktop written in Zig.
 
 - Your Mac's screen in any browser on the same network: open the link or enter the code.
 - From anywhere — a phone on mobile data, another network: the RDC window shows a second link that opens the viewer from [GitHub Pages](https://anods.github.io/RDC/). The page finds the computer through public MQTT brokers, with the handshake sealed by a key from the link, and connects to it directly over WebRTC. When both networks block a direct path (strict NAT on mobile data or a VPN), the session goes through a relay on Cloudflare instead — sealed end to end, so the relay sees only noise. Nothing to install on the phone. The relay is RDC's own by default; you can [deploy your own](relay/README.md) in a couple of minutes and pick it in Settings.
+- Several displays: the viewer shows one at a time, full size — the one the pointer is on. Drag a window past the edge of the picture and it goes onto the next display, and the picture follows; the toolbar's **Display 1/2** button switches by hand. AI agents get the list and a `display` tool.
 - Full mouse and keyboard control. On phones, a touchpad mode: tap for left click, double tap for right click, two fingers to scroll. Esc on the viewer's keyboard ends the session; the Esc of the on-screen keyboard is the one that goes to the computer.
 - Your phone as the computer's microphone or camera: the viewer's **Camera and mic** button lends them, and on the computer they are ordinary devices, "RDC Microphone" and "RDC Camera", that any app can pick — see [below](#phone-as-a-microphone-and-camera).
 - Permanent access (macOS, off by default): a link of your own that never changes and asks for a code from an authenticator app — with start at login and keep-awake, your Mac is reachable when no one is at it. See [below](#permanent-access).
@@ -42,7 +43,7 @@ The device that opened the viewer — a phone, a laptop — can lend its microph
 
 | Computer | Microphone | Camera |
 |---|---|---|
-| macOS 14.4+ | "RDC Microphone": **Enable phone microphone** in the RDC window, once, with the administrator password (sound pauses for a second). Remove it in Settings, or `rdc mic remove`. | Not available: macOS takes cameras only from an extension signed with a paid Apple developer account. |
+| macOS 14.4+ | "RDC Microphone": turn on **Phone microphone** in RDC Settings, once, with the administrator password (sound pauses for a second). Turn it off there to remove it, or `rdc mic remove`. | Not available: macOS takes cameras only from an extension signed with a paid Apple developer account. |
 | Windows 11 | Not available: Windows has no way to add a microphone without a kernel driver. | "RDC Camera": registered by RDC when it starts as administrator, or with **Enable phone camera** in its window. Built, not yet run on a PC. |
 | Windows 10 | Not available. | Not available: the virtual camera API came with Windows 11. |
 

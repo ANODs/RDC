@@ -6,6 +6,7 @@ test {
     _ = @import("core/totp.zig");
     _ = @import("core/qr.zig");
     _ = @import("core/jpeg.zig");
+    _ = @import("core/displays.zig");
     _ = @import("net/ws.zig");
     _ = @import("net/http.zig");
     _ = @import("net/stun.zig");

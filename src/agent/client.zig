@@ -12,6 +12,7 @@ const ws = @import("../net/ws.zig");
 const proto = @import("../core/proto.zig");
 const signal = @import("../net/signal.zig");
 const relay = @import("../net/relay.zig");
+const displays = @import("../core/displays.zig");
 
 pub const default_port: u16 = 7700;
 const max_frame_bytes = 32 * 1024 * 1024;
@@ -64,6 +65,12 @@ pub const Session = struct {
     frame_seq: u64 = 0,
     cursor_x: f64 = 0.5,
     cursor_y: f64 = 0.5,
+    /// The host's displays (RDC 0.7+; empty from older hosts) and the one it shows.
+    display_list: [displays.max]displays.Display = undefined,
+    display_count: usize = 0,
+    display_id: u32 = 0,
+    /// frame_seq when the host last switched displays: later frames are of the new one.
+    display_seq: u64 = 0,
     ok: bool = false,
     closed: bool = false,
     reason_buf: [200]u8 = undefined,
@@ -232,6 +239,41 @@ pub const Session = struct {
         return s.frame_seq;
     }
 
+    pub const Displays = struct {
+        list: [displays.max]displays.Display = undefined,
+        count: usize = 0,
+        /// Index of the shown display in list; null when the host does not say.
+        shown: ?usize = null,
+        /// frame_seq when the host switched to it.
+        since_seq: u64 = 0,
+    };
+
+    pub fn displayState(s: *Session) Displays {
+        s.lock();
+        defer s.unlock();
+        var d: Displays = .{ .count = s.display_count, .since_seq = s.display_seq };
+        @memcpy(d.list[0..s.display_count], s.display_list[0..s.display_count]);
+        d.shown = displays.indexOf(s.display_list[0..s.display_count], s.display_id);
+        return d;
+    }
+
+    /// Asks the host to show display `id` (it moves its pointer there).
+    pub fn chooseDisplay(s: *Session, id: u32) Error!void {
+        var buf: [48]u8 = undefined;
+        try s.sendText(std.fmt.bufPrint(&buf, "{{\"t\":\"display\",\"id\":{d}}}", .{id}) catch unreachable);
+    }
+
+    /// Waits until the host shows display `id` and a frame of it has come.
+    pub fn waitDisplay(s: *Session, id: u32, timeout_ms: i64) bool {
+        s.lock();
+        defer s.unlock();
+        const deadline = deadlineIn(s.io, timeout_ms);
+        while (!s.closed and (s.display_id != id or s.frame_seq <= s.display_seq)) {
+            s.cond.waitTimeout(s.io, &s.mutex, deadline) catch return false;
+        }
+        return !s.closed;
+    }
+
     pub fn cursor(s: *Session) [2]f64 {
         s.lock();
         defer s.unlock();
@@ -395,8 +437,25 @@ pub const Session = struct {
             if (num(o, "h")) |h| s.frame_h = @intFromFloat(@max(0, h));
             if (num(o, "cx")) |x| s.cursor_x = x;
             if (num(o, "cy")) |y| s.cursor_y = y;
+            s.readDisplays(o);
+            if (num(o, "display")) |id| s.display_id = @intFromFloat(@max(0, id));
             s.ok = true;
             s.cond.broadcast(s.io);
+        } else if (std.mem.eql(u8, t, "display")) {
+            // The host switched displays: from now on our input is normalized to the new one.
+            const id: u32 = if (num(o, "id")) |v| @intFromFloat(@max(0, v)) else 0;
+            {
+                s.lock();
+                defer s.unlock();
+                s.readDisplays(o);
+                s.display_id = id;
+                s.display_seq = s.frame_seq;
+                if (num(o, "w")) |w| s.frame_w = @intFromFloat(@max(0, w));
+                if (num(o, "h")) |h| s.frame_h = @intFromFloat(@max(0, h));
+                s.cond.broadcast(s.io);
+            }
+            var buf: [48]u8 = undefined;
+            s.sendText(std.fmt.bufPrint(&buf, "{{\"t\":\"shown\",\"id\":{d}}}", .{id}) catch unreachable) catch {};
         } else if (std.mem.eql(u8, t, "size")) {
             s.lock();
             defer s.unlock();
@@ -427,6 +486,29 @@ pub const Session = struct {
             return "bye";
         }
         return null;
+    }
+
+    /// "displays":[{id, name, x, y, w, h, pw, ph, primary}] of ok and display (lock held).
+    fn readDisplays(s: *Session, o: std.json.ObjectMap) void {
+        const v = o.get("displays") orelse return;
+        if (v != .array) return;
+        var n: usize = 0;
+        for (v.array.items) |item| {
+            if (n == displays.max) break;
+            if (item != .object) continue;
+            const e = item.object;
+            var d: displays.Display = .{
+                .id = @intFromFloat(@max(0, num(e, "id") orelse continue)),
+                .rect = .{ .x = num(e, "x") orelse 0, .y = num(e, "y") orelse 0, .w = @max(1, num(e, "w") orelse 1), .h = @max(1, num(e, "h") orelse 1) },
+                .pw = @intFromFloat(@max(0, num(e, "pw") orelse num(e, "w") orelse 0)),
+                .ph = @intFromFloat(@max(0, num(e, "ph") orelse num(e, "h") orelse 0)),
+                .primary = if (e.get("primary")) |p| p == .bool and p.bool else false,
+            };
+            d.setName(str(e, "name") orelse "Display");
+            s.display_list[n] = d;
+            n += 1;
+        }
+        s.display_count = n;
     }
 
     fn pingMain(s: *Session) void {
@@ -587,7 +669,7 @@ fn login(s: *Session, target: Target, agent: []const u8, failure: *Failure) Erro
     }
     var label_buf: [64]u8 = undefined;
     var hello_buf: [256]u8 = undefined;
-    const hello = std.fmt.bufPrint(&hello_buf, "{{\"t\":\"hello\",\"{s}\":\"{s}\",\"h264\":false,\"ai\":\"{s}\",\"agent\":\"RDC MCP\"}}", .{
+    const hello = std.fmt.bufPrint(&hello_buf, "{{\"t\":\"hello\",\"{s}\":\"{s}\",\"h264\":false,\"ai\":\"{s}\",\"agent\":\"RDC MCP\",\"displays\":true}}", .{
         if (target.permanent()) "otp" else "code",
         digits[0..nd],
         proto.jsonEscape(&label_buf, agent),

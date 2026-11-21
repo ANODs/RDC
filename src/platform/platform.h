@@ -46,7 +46,28 @@ int rdc_screen_access(int prompt);
 int rdc_input_access(int prompt);
 void rdc_open_privacy(int which);  // 0 — Screen Recording, 1 — Accessibility
 
-// Captures the main display. Returns 0 or a negative error code.
+// Displays (docs/PLAN.md, section 6 "Multiple displays"). Desktop coordinates are the one space
+// all displays share, as the OS lays them out: macOS points (CGDisplayBounds, origin at the top
+// left of the main display), Windows virtual-screen pixels, X11 root-window pixels. They may be
+// negative (a display left of or above the main one).
+#define RDC_MAX_DISPLAYS 8
+typedef struct {
+    uint32_t id;         // non-zero, stable while the display stays connected
+    int32_t x, y, w, h;  // the display's rectangle in desktop coordinates
+    int32_t pw, ph;      // its size in pixels (twice w, h on a Retina display)
+    int32_t primary;     // 1 — the main display (menu bar, taskbar)
+    char name[64];       // UTF-8, for people: "DELL U2720Q", "Built-in Retina Display"
+} rdc_display;
+// The displays now, at most max of them; returns how many were written. Cheap enough to call
+// every second. Mirrors of another display are left out. 0 — the screen cannot be reached.
+int rdc_displays(rdc_display *out, int max);
+// Which display capture shows (0 — the main one). Before rdc_capture_start: the display it will
+// capture. While capture runs: switches to it and returns once frames of the old display have
+// stopped, so the next frame (a keyframe) comes from the new one, with its own size.
+// 0 or a negative error (no such display — capture stays where it was).
+int rdc_capture_display(uint32_t id);
+
+// Captures the display chosen by rdc_capture_display. Returns 0 or a negative error code.
 // Do not call from the main thread: waits up to 10 s for the capture thread to start.
 int rdc_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx);
 int rdc_codec_caps(void);  // codecs the platform supports: bit 0 — H.264, bit 1 — JPEG
@@ -55,14 +76,15 @@ void rdc_set_codecs(int h264, int jpeg);
 void rdc_request_keyframe(void);
 void rdc_set_bitrate(int bits_per_second);
 
-// Input. Coordinates are normalized to the captured frame: 0..1.
-void rdc_mouse_move(double nx, double ny);
-void rdc_mouse_button(int button, int down, double nx, double ny);  // 0 left, 1 middle, 2 right
+// Input. Pointer coordinates are desktop coordinates (see rdc_display): the host maps a viewer's
+// 0..1 onto the display it shows and keeps the result on the desktop (src/core/displays.zig).
+void rdc_mouse_move(double x, double y);
+void rdc_mouse_button(int button, int down, double x, double y);  // 0 left, 1 middle, 2 right
 void rdc_scroll(double dx, double dy);                              // pixels, as in the browser
 void rdc_key(int keycode, int down);  // platform key code: kVK_* on macOS, scan code (0xE0xx — extended) on Windows
 void rdc_release_all(void);
 void rdc_text(const char *utf8, size_t len);  // types Unicode text, whatever the keyboard layout
-void rdc_cursor_pos(double *nx, double *ny);  // current cursor position, 0..1
+void rdc_cursor_pos(double *x, double *y);  // current cursor position, desktop coordinates
 
 // Whole file in a malloc buffer (release with free) or NULL.
 void *rdc_read_file(const char *path, size_t *len);

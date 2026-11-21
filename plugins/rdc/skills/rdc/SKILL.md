@@ -5,7 +5,7 @@ description: Control another computer through RDC. Use when the user wants somet
 
 # Working on another computer through RDC
 
-RDC shows a 9-digit code and links in its window on the computer to control; the person there copies one with **Copy link** and gives it to you. `http://<ip>:7700/#<code>` works on the same network. `https://anods.github.io/RDC/#<code>-<key>` ("From anywhere") works from any network: RDC finds the computer through public servers and meets it on its relay. A permanent link, `…#my-<key>`, never changes and also needs the current 6-digit code from the user's authenticator app — ask the user for it and pass it as `code`.
+RDC shows a 9-digit code and links in its window on the computer to control; the person there copies one with **Copy link** and gives it to you. `http://<ip>:7700/#<code>` works on the same network. `https://rdc.timoshkin.dev/#<code>-<key>` ("From anywhere") works from any network: RDC finds the computer through public servers and meets it on its relay. A permanent link, `…#my-<key>`, never changes and also needs the current 6-digit code from the user's authenticator app — ask the user for it and pass it as `code`.
 
 ## Workflow
 
@@ -21,6 +21,7 @@ RDC shows a 9-digit code and links in its window on the computer to control; the
 - `key` takes names and shortcuts separated by spaces: `enter`, `ctrl+s`, `cmd+space`, `alt+tab`, `down down enter`, `shift+tab`. On a Mac use `cmd`; on Windows use `ctrl` and `win`.
 - `scroll` takes a direction and an amount in wheel notches (3 ≈ a third of a screen).
 - A page or app that is still loading: `wait` (seconds), then look again.
+- Several displays: the picture shows the one the pointer is on (the screenshot says "display 2 of 3"); `devices` lists them, `display` shows another.
 - Confirm with the user before irreversible actions: deleting, sending, paying, closing unsaved work.
 
 ## When something goes wrong

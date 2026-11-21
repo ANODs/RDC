@@ -7,7 +7,7 @@ preview_urls = false
 
 # Pages that may use the relay from a browser, space-separated; RDC itself needs no entry.
 [vars]
-ORIGINS = "https://anods.github.io"
+ORIGINS = "https://anods.github.io https://rdc.timoshkin.dev"
 
 [[durable_objects.bindings]]
 name = "ROOMS"

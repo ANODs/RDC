@@ -28,6 +28,7 @@
   "tools": [
     { "name": "connect", "description": "Connect to a computer by its RDC link or address and code" },
     { "name": "devices", "description": "List the connected computers" },
+    { "name": "display", "description": "Show another display of a computer with several" },
     { "name": "disconnect", "description": "End the session with a computer" },
     { "name": "screenshot", "description": "The current screen, or an enlarged region of it" },
     { "name": "click", "description": "Click at a point: left, right or middle, single or double, with modifiers" },

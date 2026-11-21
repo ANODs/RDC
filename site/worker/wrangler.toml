@@ -1,0 +1,26 @@
+# RDC's site (site/worker/README.md). Deploy: cd site/worker && npx wrangler deploy
+name = "rdc-site"
+main = "src/index.js"
+workers_dev = false
+# the site's own domain: Cloudflare creates the DNS record and the certificate
+routes = [{ pattern = "rdc.timoshkin.dev", custom_domain = true }]
+compatibility_date = "2026-01-01"
+
+[vars]
+REPO = "ANODs/RDC"
+# the page's origin (no path); several are separated by commas
+ALLOWED_ORIGINS = "https://rdc.timoshkin.dev,https://anods.github.io"
+# where GitHub Pages publishes the site
+PAGES_ORIGIN = "https://anods.github.io/RDC"
+
+# secrets, set with `wrangler secret put <NAME>`:
+#   STATS_KEY     the key /stats asks for; without it the statistics are open to everyone
+#   GITHUB_TOKEN  optional, raises GitHub's rate limit for /releases
+
+[[d1_databases]]
+binding = "DB"
+database_name = "rdc-site"
+database_id = "71c3cce5-965a-4fc9-8423-f1f3d9f873b2"
+
+[triggers]
+crons = ["17 3 * * *"]

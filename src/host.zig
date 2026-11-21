@@ -8,7 +8,7 @@
 //!
 //! Threads: accepting connections; one per connection (reading); one per WebRTC
 //! session; one writer per viewer; one per signaling broker; housekeeping
-//! (permissions, status, silence, updates). Frames come from the encoder thread and
+//! (following the pointer across displays, permissions, status, silence, updates). Frames come from the encoder thread and
 //! are handed out to the viewers' queues. A viewer that falls behind skips frames
 //! instead of piling up latency.
 const std = @import("std");
@@ -26,6 +26,7 @@ const webrtc = @import("net/webrtc.zig");
 const relay = @import("net/relay.zig");
 const proto = @import("core/proto.zig");
 const keymap = @import("core/keymap.zig");
+const displays = @import("core/displays.zig");
 const Code = @import("core/code.zig").Code;
 const update = @import("update.zig");
 const web = @import("web");
@@ -56,6 +57,10 @@ const queue_cap = 16;
 const max_frames_queued = 6;
 const max_ws_payload = 16 * 1024;
 const capture_idle_stop_us: u64 = 10_000_000;
+/// How often the host looks at which display the pointer is on.
+const follow_every_ms = 150;
+/// After a viewer sends the pointer to a display by hand, following waits this long.
+const choose_hold_us: u64 = 600_000;
 const lockout_us: u64 = 30_000_000;
 const silence_us: u64 = 30_000_000; // the viewer pings once a second
 /// The H.264 bitrate follows the slowest viewer: down when frames have to be dropped, slowly back up.
@@ -75,7 +80,7 @@ pub const Options = struct {
     /// Connections from anywhere: signaling through public MQTT brokers, then WebRTC.
     remote: bool = true,
     /// The page the link from anywhere opens; for testing, any copy of web/ served over https or localhost.
-    remote_url: []const u8 = "https://anods.github.io/RDC/",
+    remote_url: []const u8 = "https://rdc.timoshkin.dev/",
     /// Started by the OS at login: the window stays hidden (the platform layer reads the flag itself).
     login: bool = false,
     /// --relay URL|off: the relay for this run, in place of the one in Settings.
@@ -245,6 +250,11 @@ const Viewer = struct {
     /// the buffer is allocated on the first piece.
     cam_buf: []u8 = &.{},
     cam: proto.CameraAssembler = .{},
+    /// The display this viewer's input is normalized to: the one it last said it shows
+    /// ({"t":"shown"}), or, for a viewer older than several displays, the one captured now.
+    input_display: std.atomic.Value(u32) = .init(0),
+    /// The viewer says which display it shows (hello "displays":true).
+    knows_displays: bool = false,
 
     fn ai(v: *const Viewer) []const u8 {
         return v.ai_buf[0..v.ai_len];
@@ -460,6 +470,21 @@ pub const Host = struct {
     otp_last_step: u64 = 0,
     otp_guard: totp.Guard = .{},
     resumes: [max_resume]Resume = @splat(.{}),
+    /// Capture runs (set under capture_mutex, read by housekeeping without it).
+    capture_on: std.atomic.Value(bool) = .init(false),
+    /// Displays (core/displays.zig; under disp_mutex): the list and the one captured.
+    disp_mutex: Io.Mutex = .init,
+    display_list: [displays.max]displays.Display = undefined,
+    display_count: usize = 0,
+    shown_id: u32 = 0,
+    /// The pointer was just sent to a display by hand: do not follow it until then.
+    follow_hold_us: std.atomic.Value(u64) = .init(0),
+    /// Capture switched displays: the next frame goes out after this "display" message, which
+    /// lacks only the frame's size (under mutex).
+    announce: bool = false,
+    announce_us: u64 = 0,
+    announce_buf: [1536]u8 = undefined,
+    announce_len: usize = 0,
 
     fn lock(h: *Host) void {
         h.mutex.lockUncancelable(h.io);
@@ -487,6 +512,13 @@ pub const Host = struct {
             @memcpy(h.name[0..fallback.len], fallback);
             h.name_len = fallback.len;
         }
+        _ = h.refreshDisplays();
+        h.disp_mutex.lockUncancelable(io);
+        const list = h.display_list[0..h.display_count];
+        if (displays.primary(list)) |i| h.shown_id = list[i].id;
+        h.disp_mutex.unlock(io);
+        h.logDisplays();
+        _ = plat.rdc_capture_display(h.shown_id);
         return h;
     }
 
@@ -502,7 +534,7 @@ pub const Host = struct {
         return salt;
     }
 
-    /// https://anods.github.io/RDC/#<code>-<key>; under the lock.
+    /// https://rdc.timoshkin.dev/#<code>-<key>; under the lock.
     fn remoteLinkLocked(h: *Host, buf: *[max_remote_link_len]u8) []const u8 {
         var key: [signal.salt_text_len]u8 = undefined;
         _ = std.base64.url_safe_no_pad.Encoder.encode(&key, &h.salt);
@@ -669,12 +701,17 @@ pub const Host = struct {
                     if (viewer.* == null) viewer.* = h.admit(link, peer, msg, permanent) orelse return false;
                 } else if (std.mem.eql(u8, t, "ping")) {
                     const v = viewer.* orelse return true;
-                    var cx: f64 = 0.5;
-                    var cy: f64 = 0.5;
-                    plat.rdc_cursor_pos(&cx, &cy);
+                    const c = h.cursorFor(v.input_display.load(.monotonic));
                     var out: [128]u8 = undefined;
-                    const pong = std.fmt.bufPrint(&out, "{{\"t\":\"pong\",\"ts\":{s},\"cx\":{d:.4},\"cy\":{d:.4}}}", .{ proto.jsonNumber(msg, "ts") orelse "0", cx, cy }) catch return true;
+                    const pong = std.fmt.bufPrint(&out, "{{\"t\":\"pong\",\"ts\":{s},\"cx\":{d:.4},\"cy\":{d:.4}}}", .{ proto.jsonNumber(msg, "ts") orelse "0", c.x, c.y }) catch return true;
                     v.pushText(pong);
+                } else if (std.mem.eql(u8, t, "shown")) {
+                    // The viewer now shows this display: its next input is normalized to it.
+                    const v = viewer.* orelse return true;
+                    if (jsonId(msg)) |id| v.input_display.store(id, .monotonic);
+                } else if (std.mem.eql(u8, t, "display")) {
+                    const v = viewer.* orelse return true;
+                    if (jsonId(msg)) |id| h.chooseDisplay(id, v);
                 } else if (std.mem.eql(u8, t, "stop_ai")) {
                     const v = viewer.* orelse return true;
                     log("viewer {s} stopped the AI agents", .{v.peer.str()});
@@ -689,7 +726,7 @@ pub const Host = struct {
                 const v = viewer.* orelse return false;
                 if (proto.decodeInput(payload)) |in| switch (in) {
                     .audio, .camera => h.onMedia(v, in),
-                    else => applyInput(in),
+                    else => h.applyInput(v, in),
                 };
                 return true;
             },
@@ -751,25 +788,32 @@ pub const Host = struct {
         const can_h264 = plat.rdc_codec_caps() & 1 != 0;
         v.* = .{ .host = h, .link = link, .peer = peer, .h264 = can_h264 and proto.jsonTrue(hello, "h264"), .permanent = permanent };
         if (proto.jsonString(hello, "ai")) |name| v.setAi(name);
+        v.knows_displays = proto.jsonTrue(hello, "displays");
         v.last_us.store(now, .monotonic);
         var name_buf: [160]u8 = undefined;
-        var ok_buf: [512]u8 = undefined;
-        var cx: f64 = 0.5;
-        var cy: f64 = 0.5;
-        plat.rdc_cursor_pos(&cx, &cy);
+        var ok_buf: [2048]u8 = undefined;
+        var list_buf: [1280]u8 = undefined;
+        h.disp_mutex.lockUncancelable(h.io);
+        const list_json = displays.writeJson(h.display_list[0..h.display_count], &list_buf);
+        const shown = h.shown_id;
+        h.disp_mutex.unlock(h.io);
+        v.input_display.store(shown, .monotonic);
+        const c = h.cursorFor(shown);
         const media = plat.rdc_media_status();
-        const ok = std.fmt.bufPrint(&ok_buf, "{{\"t\":\"ok\",\"w\":{d},\"h\":{d},\"os\":\"{s}\",\"name\":\"{s}\",\"codec\":\"{s}\",\"version\":\"{s}\",\"text\":true,\"cx\":{d:.4},\"cy\":{d:.4},\"mic\":{},\"camera\":{},\"resume\":\"{s}\"}}", .{
+        const ok = std.fmt.bufPrint(&ok_buf, "{{\"t\":\"ok\",\"w\":{d},\"h\":{d},\"os\":\"{s}\",\"name\":\"{s}\",\"codec\":\"{s}\",\"version\":\"{s}\",\"text\":true,\"cx\":{d:.4},\"cy\":{d:.4},\"mic\":{},\"camera\":{},\"resume\":\"{s}\",\"displays\":{s},\"display\":{d}}}", .{
             h.frame_w,
             h.frame_h,
             os_name,
             proto.jsonEscape(&name_buf, h.name[0..h.name_len]),
             if (v.h264) "h264" else "jpeg",
             version,
-            cx,
-            cy,
+            c.x,
+            c.y,
             media & plat.media_mic != 0,
             media & plat.media_camera != 0,
             resume_text[0..resume_len],
+            list_json,
+            shown,
         }) catch "{\"t\":\"ok\"}";
         v.pushText(ok);
         v.writer = std.Thread.spawn(.{}, Viewer.writerMain, .{v}) catch {
@@ -926,7 +970,7 @@ pub const Host = struct {
         const mac = builtin.os.tag == .macos;
         var reason: []const u8 = "";
         if (want_mic and !has_mic) reason = if (mac)
-            "RDC Microphone is not enabled on the computer: in the RDC window there, click Enable phone microphone"
+            "RDC Microphone is not enabled on the computer: turn on Phone microphone in RDC Settings there"
         else
             "A phone microphone is not available on a Windows computer";
         if (want_cam and !has_cam) reason = if (mac)
@@ -1111,9 +1155,12 @@ pub const Host = struct {
         h.capture_mutex.lockUncancelable(h.io);
         defer h.capture_mutex.unlock(h.io);
         if (h.capturing) return;
+        // Start on the display the pointer is on.
+        if (h.displayAtCursor()) |id| h.switchDisplayLocked(id, "the pointer is there");
         const rc = plat.rdc_capture_start(h.opts.max_width, h.opts.fps, onFrame, h);
         if (rc == 0) {
             h.capturing = true;
+            h.capture_on.store(true, .monotonic);
             return;
         }
         log("capture did not start ({d})", .{rc});
@@ -1137,10 +1184,225 @@ pub const Host = struct {
         if (!h.capturing or nowUs(h.io) -| idle_since < capture_idle_stop_us) return;
         plat.rdc_capture_stop();
         h.capturing = false;
+        h.capture_on.store(false, .monotonic);
         h.lock();
         h.frame_w = 0;
         h.frame_h = 0;
         h.unlock();
+    }
+
+    // -----------------------------------------------------------------------
+    // Displays (docs/PLAN.md, section 6 "Multiple displays"): one is captured at a time, the one
+    // the pointer is on; a viewer can pick another by hand.
+
+    /// Reads the displays from the platform; true if the list changed.
+    fn refreshDisplays(h: *Host) bool {
+        var raw: [displays.max]plat.Display = undefined;
+        const got = plat.rdc_displays(&raw, raw.len);
+        const n: usize = @intCast(std.math.clamp(got, 0, displays.max));
+        var list: [displays.max]displays.Display = undefined;
+        for (raw[0..n], list[0..n]) |*r, *d| {
+            d.* = .{
+                .id = r.id,
+                .rect = .{ .x = @floatFromInt(r.x), .y = @floatFromInt(r.y), .w = @floatFromInt(@max(1, r.w)), .h = @floatFromInt(@max(1, r.h)) },
+                .pw = @intCast(@max(0, r.pw)),
+                .ph = @intCast(@max(0, r.ph)),
+                .primary = r.primary != 0,
+            };
+            d.setName(std.mem.sliceTo(&r.name, 0));
+        }
+        h.disp_mutex.lockUncancelable(h.io);
+        defer h.disp_mutex.unlock(h.io);
+        if (displays.sameList(h.display_list[0..h.display_count], list[0..n])) return false;
+        @memcpy(h.display_list[0..n], list[0..n]);
+        h.display_count = n;
+        return true;
+    }
+
+    fn logDisplays(h: *Host) void {
+        h.disp_mutex.lockUncancelable(h.io);
+        defer h.disp_mutex.unlock(h.io);
+        if (h.display_count == 0) log("displays: none found", .{});
+        for (h.display_list[0..h.display_count], 1..) |*d, i| {
+            log("display {d} (id {d}): {s}, {d}×{d} pixels at ({d}, {d}) size {d}×{d}{s}", .{
+                i,                                 d.id,                              d.name(),
+                d.pw,                              d.ph,                              @as(i64, @intFromFloat(d.rect.x)),
+                @as(i64, @intFromFloat(d.rect.y)), @as(i64, @intFromFloat(d.rect.w)), @as(i64, @intFromFloat(d.rect.h)),
+                if (d.primary) ", main" else "",
+            });
+        }
+    }
+
+    /// The display under the pointer (or the main one when it is in a gap), or null with no displays.
+    fn displayAtCursor(h: *Host) ?u32 {
+        var x: f64 = 0;
+        var y: f64 = 0;
+        plat.rdc_cursor_pos(&x, &y);
+        h.disp_mutex.lockUncancelable(h.io);
+        defer h.disp_mutex.unlock(h.io);
+        const list = h.display_list[0..h.display_count];
+        const i = displays.at(list, .{ .x = x, .y = y }) orelse displays.indexOf(list, h.shown_id) orelse displays.primary(list) orelse return null;
+        return list[i].id;
+    }
+
+    /// The pointer, normalized to display `id` (or the shown one) and clamped to it.
+    fn cursorFor(h: *Host, id: u32) displays.Point {
+        var x: f64 = 0;
+        var y: f64 = 0;
+        plat.rdc_cursor_pos(&x, &y);
+        h.disp_mutex.lockUncancelable(h.io);
+        defer h.disp_mutex.unlock(h.io);
+        const list = h.display_list[0..h.display_count];
+        const i = displays.indexOf(list, id) orelse displays.indexOf(list, h.shown_id) orelse return .{ .x = 0.5, .y = 0.5 };
+        return displays.toNormalized(list[i].rect, .{ .x = x, .y = y });
+    }
+
+    /// A viewer's 0..1 (or beyond, while it drags past the edge) → desktop coordinates on some display.
+    fn toDesktop(h: *Host, v: *Viewer, nx: f32, ny: f32) ?displays.Point {
+        h.disp_mutex.lockUncancelable(h.io);
+        defer h.disp_mutex.unlock(h.io);
+        const list = h.display_list[0..h.display_count];
+        const i = displays.indexOf(list, v.input_display.load(.monotonic)) orelse
+            displays.indexOf(list, h.shown_id) orelse displays.primary(list) orelse return null;
+        const x = std.math.clamp(@as(f64, nx), -100, 100);
+        const y = std.math.clamp(@as(f64, ny), -100, 100);
+        return displays.clampToUnion(list, displays.toDesktop(list[i].rect, x, y));
+    }
+
+    fn applyInput(h: *Host, v: *Viewer, in: proto.Input) void {
+        switch (in) {
+            .move => |m| if (h.toDesktop(v, m.x, m.y)) |p| plat.rdc_mouse_move(p.x, p.y),
+            .button => |b| if (h.toDesktop(v, b.x, b.y)) |p| plat.rdc_mouse_button(b.button, @intFromBool(b.down), p.x, p.y),
+            .wheel => |w| plat.rdc_scroll(w.dx, w.dy),
+            .key => |k| if (platformKey(k.usage)) |kc| plat.rdc_key(kc, @intFromBool(k.down)),
+            .release_all => plat.rdc_release_all(),
+            .text => |t| plat.rdc_text(t.ptr, t.len),
+            .keyframe => plat.rdc_request_keyframe(),
+            .audio, .camera => {}, // Host.onMedia takes these
+        }
+    }
+
+    fn switchDisplay(h: *Host, id: u32, why: []const u8, force: bool) void {
+        h.capture_mutex.lockUncancelable(h.io);
+        defer h.capture_mutex.unlock(h.io);
+        if (!force and id == h.shown_id) return h.announceDisplay(id);
+        h.switchDisplayLocked(id, why);
+    }
+
+    /// Shows display `id` from now on (capture_mutex held): capture moves there, and viewers
+    /// hear of it right before the first frame from it.
+    fn switchDisplayLocked(h: *Host, id: u32, why: []const u8) void {
+        const rc = plat.rdc_capture_display(id);
+        if (rc != 0) {
+            log("display id {d}: cannot capture it ({d})", .{ id, rc });
+            return;
+        }
+        h.announceDisplay(id);
+        plat.rdc_request_keyframe();
+        h.disp_mutex.lockUncancelable(h.io);
+        defer h.disp_mutex.unlock(h.io);
+        const list = h.display_list[0..h.display_count];
+        if (displays.indexOf(list, id)) |i| {
+            log("showing display {d} of {d}, {s} ({d}×{d}): {s}", .{ i + 1, list.len, list[i].name(), list[i].pw, list[i].ph, why });
+        }
+    }
+
+    /// Makes `id` the shown display and queues the "display" message for viewers.
+    fn announceDisplay(h: *Host, id: u32) void {
+        var prefix: [1536]u8 = undefined;
+        var list_buf: [1280]u8 = undefined;
+        var name_buf: [displays.max_name * 2]u8 = undefined;
+        h.disp_mutex.lockUncancelable(h.io);
+        h.shown_id = id;
+        const list = h.display_list[0..h.display_count];
+        const index = displays.indexOf(list, id);
+        const msg = std.fmt.bufPrint(&prefix, "{{\"t\":\"display\",\"id\":{d},\"index\":{d},\"count\":{d},\"name\":\"{s}\",\"displays\":{s}", .{
+            id,
+            if (index) |i| i + 1 else 0,
+            list.len,
+            if (index) |i| proto.jsonEscape(&name_buf, list[i].name()) else "",
+            displays.writeJson(list, &list_buf),
+        }) catch "";
+        h.disp_mutex.unlock(h.io);
+        if (msg.len == 0) return;
+        h.lock();
+        defer h.unlock();
+        @memcpy(h.announce_buf[0..msg.len], msg);
+        h.announce_len = msg.len;
+        h.announce = true;
+        h.announce_us = nowUs(h.io);
+        for (h.viewers) |maybe| {
+            const v = maybe orelse continue;
+            if (!v.knows_displays) v.input_display.store(id, .monotonic);
+        }
+    }
+
+    /// The "display" message with the size of the frames that follow (under mutex).
+    fn announceLocked(h: *Host, w: c_int, hgt: c_int) void {
+        h.announce = false;
+        var buf: [1600]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{s},\"w\":{d},\"h\":{d}}}", .{ h.announce_buf[0..h.announce_len], w, hgt }) catch return;
+        h.broadcastTextLocked(msg);
+    }
+
+    /// {"t":"display","id":N} from a viewer: the pointer goes to the middle of that display (so
+    /// following agrees) and the picture with it.
+    fn chooseDisplay(h: *Host, id: u32, v: *Viewer) void {
+        const c = blk: {
+            h.disp_mutex.lockUncancelable(h.io);
+            defer h.disp_mutex.unlock(h.io);
+            const list = h.display_list[0..h.display_count];
+            const i = displays.indexOf(list, id) orelse {
+                log("viewer {s} asked for display id {d}, which is not there", .{ v.peer.str(), id });
+                return;
+            };
+            break :blk list[i].rect.centre();
+        };
+        h.follow_hold_us.store(nowUs(h.io) + choose_hold_us, .monotonic);
+        plat.rdc_mouse_move(c.x, c.y);
+        h.switchDisplay(id, if (v.ai_len > 0) "an AI agent chose it" else "a viewer chose it", false);
+    }
+
+    /// Every follow_every_ms: the pointer is clearly on another display — show that one.
+    fn followPointer(h: *Host) void {
+        if (!h.capture_on.load(.monotonic)) return;
+        if (nowUs(h.io) < h.follow_hold_us.load(.monotonic)) return;
+        {
+            h.disp_mutex.lockUncancelable(h.io);
+            defer h.disp_mutex.unlock(h.io);
+            if (h.display_count < 2) return; // one display: nothing to follow
+        }
+        var x: f64 = 0;
+        var y: f64 = 0;
+        plat.rdc_cursor_pos(&x, &y);
+        const target: ?u32 = blk: {
+            h.disp_mutex.lockUncancelable(h.io);
+            defer h.disp_mutex.unlock(h.io);
+            const list = h.display_list[0..h.display_count];
+            const i = displays.follow(list, displays.indexOf(list, h.shown_id), .{ .x = x, .y = y }, displays.follow_margin) orelse break :blk null;
+            break :blk list[i].id;
+        };
+        if (target) |id| h.switchDisplay(id, "the pointer went there", false);
+    }
+
+    /// Every second: displays plugged in, unplugged, moved or resized.
+    fn watchDisplays(h: *Host) void {
+        if (h.refreshDisplays()) {
+            h.logDisplays();
+            const id = blk: {
+                h.disp_mutex.lockUncancelable(h.io);
+                defer h.disp_mutex.unlock(h.io);
+                const list = h.display_list[0..h.display_count];
+                if (displays.indexOf(list, h.shown_id) != null) break :blk h.shown_id;
+                const i = displays.primary(list) orelse break :blk null;
+                break :blk list[i].id;
+            };
+            if (id) |i| h.switchDisplay(i, "the displays changed", true);
+        }
+        // A still screen sends no frame to carry the news: say it with the last known size.
+        h.lock();
+        defer h.unlock();
+        if (h.announce and nowUs(h.io) -| h.announce_us > 1_000_000 and h.frame_w > 0) h.announceLocked(h.frame_w, h.frame_h);
     }
 
     fn onFrame(ctx: ?*anyopaque, codec: c_int, data: [*]const u8, len: usize, keyframe: c_int, ts_us: u64, w: c_int, hgt: c_int) callconv(.c) void {
@@ -1171,6 +1433,7 @@ pub const Host = struct {
                 h.broadcastTextLocked(size);
             } else |_| {}
         }
+        if (h.announce) h.announceLocked(w, hgt);
         for (h.viewers) |maybe| {
             const v = maybe orelse continue;
             if (v.h264 != is_h264) continue;
@@ -1673,8 +1936,15 @@ pub const Host = struct {
 
     fn housekeeping(h: *Host) void {
         var tick: u32 = 0;
-        while (true) : (tick +%= 1) {
-            h.io.sleep(.fromMilliseconds(1000), .awake) catch {};
+        var second_us = nowUs(h.io);
+        while (true) {
+            h.io.sleep(.fromMilliseconds(follow_every_ms), .awake) catch {};
+            h.followPointer();
+            const now = nowUs(h.io);
+            if (now -| second_us < 1_000_000) continue;
+            second_us = now;
+            tick +%= 1;
+            h.watchDisplays();
             h.stopCaptureIfIdle();
             h.adaptBitrate();
             h.dropSilent();
@@ -1717,17 +1987,10 @@ const RtcConn = struct {
     }
 };
 
-fn applyInput(in: proto.Input) void {
-    switch (in) {
-        .move => |m| plat.rdc_mouse_move(m.x, m.y),
-        .button => |b| plat.rdc_mouse_button(b.button, @intFromBool(b.down), b.x, b.y),
-        .wheel => |w| plat.rdc_scroll(w.dx, w.dy),
-        .key => |k| if (platformKey(k.usage)) |kc| plat.rdc_key(kc, @intFromBool(k.down)),
-        .release_all => plat.rdc_release_all(),
-        .text => |t| plat.rdc_text(t.ptr, t.len),
-        .keyframe => plat.rdc_request_keyframe(),
-        .audio, .camera => {}, // Host.onMedia takes these
-    }
+/// The "id" of {"t":"shown","id":N} and {"t":"display","id":N}.
+fn jsonId(msg: []const u8) ?u32 {
+    const text = proto.jsonNumber(msg, "id") orelse return null;
+    return std.fmt.parseInt(u32, text, 10) catch null;
 }
 
 fn onReady(ctx: ?*anyopaque) callconv(.c) void {

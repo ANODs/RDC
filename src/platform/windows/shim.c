@@ -207,21 +207,104 @@ static int cursor_changed(CursorState *last) {
     return changed;
 }
 
-// Neither DXGI nor GDI puts the cursor into the image — we draw it ourselves.
-static void draw_cursor(Frame *f) {
+// Neither DXGI nor GDI puts the cursor into the image — we draw it ourselves. (ox, oy) — where
+// the frame's display starts on the virtual screen.
+static void draw_cursor(Frame *f, int ox, int oy) {
     CURSORINFO ci;
     ci.cbSize = sizeof ci;
     if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return;
     ICONINFO ii;
     if (!GetIconInfo(ci.hCursor, &ii)) return;
-    DrawIconEx(f->dc, ci.ptScreenPos.x - (int)ii.xHotspot, ci.ptScreenPos.y - (int)ii.yHotspot, ci.hCursor, 0, 0, 0,
-               NULL, DI_NORMAL);
+    DrawIconEx(f->dc, ci.ptScreenPos.x - ox - (int)ii.xHotspot, ci.ptScreenPos.y - oy - (int)ii.yHotspot, ci.hCursor, 0,
+               0, 0, NULL, DI_NORMAL);
     if (ii.hbmMask) DeleteObject(ii.hbmMask);
     if (ii.hbmColor) DeleteObject(ii.hbmColor);
 }
 
 // ---------------------------------------------------------------------------
-// DXGI Desktop Duplication: main monitor; frames arrive only when the screen changes.
+// Displays: monitors on the virtual screen. A display's id is the number of its GDI device
+// (\\.\DISPLAY2 → 2), which DXGI outputs name too.
+
+typedef struct {
+    rdc_display list[RDC_MAX_DISPLAYS];
+    wchar_t device[RDC_MAX_DISPLAYS][CCHDEVICENAME];
+    int n;
+} MonitorList;
+
+static uint32_t device_number(const wchar_t *device) {
+    const wchar_t *p = device + wcslen(device);
+    while (p > device && p[-1] >= L'0' && p[-1] <= L'9') p--;
+    return (uint32_t)wcstoul(p, NULL, 10);
+}
+
+static BOOL CALLBACK monitor_enum(HMONITOR mon, HDC dc, LPRECT rc, LPARAM arg) {
+    MonitorList *ml = (MonitorList *)arg;
+    if (ml->n >= RDC_MAX_DISPLAYS) return FALSE;
+    MONITORINFOEXW mi;
+    mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoW(mon, (MONITORINFO *)&mi)) return TRUE;
+    rdc_display *d = &ml->list[ml->n];
+    memset(d, 0, sizeof *d);
+    d->id = device_number(mi.szDevice);
+    if (d->id == 0) d->id = 0x100 + (uint32_t)ml->n;
+    d->x = mi.rcMonitor.left;
+    d->y = mi.rcMonitor.top;
+    d->w = d->pw = mi.rcMonitor.right - mi.rcMonitor.left;
+    d->h = d->ph = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    d->primary = (mi.dwFlags & MONITORINFOF_PRIMARY) ? 1 : 0;
+    DISPLAY_DEVICEW dd;
+    memset(&dd, 0, sizeof dd);
+    dd.cb = sizeof dd;
+    if (EnumDisplayDevicesW(mi.szDevice, 0, &dd, 0) && dd.DeviceString[0]) to_utf8(dd.DeviceString, d->name, sizeof d->name);
+    if (!d->name[0]) snprintf(d->name, sizeof d->name, "Display %u", d->id);
+    wcsncpy(ml->device[ml->n], mi.szDevice, CCHDEVICENAME - 1);
+    ml->device[ml->n][CCHDEVICENAME - 1] = 0;
+    ml->n++;
+    return TRUE;
+}
+
+static void monitors(MonitorList *ml) {
+    memset(ml, 0, sizeof *ml);
+    EnumDisplayMonitors(NULL, NULL, monitor_enum, (LPARAM)ml);
+    if (ml->n == 0) {  // no monitor list (a service session): the main screen as it was
+        rdc_display *d = &ml->list[0];
+        d->id = 1;
+        d->w = d->pw = GetSystemMetrics(SM_CXSCREEN);
+        d->h = d->ph = GetSystemMetrics(SM_CYSCREEN);
+        d->primary = 1;
+        strcpy(d->name, "Display 1");
+        ml->n = d->w > 0 && d->h > 0 ? 1 : 0;
+    }
+}
+
+int rdc_displays(rdc_display *out, int max) {
+    MonitorList ml;
+    monitors(&ml);
+    int n = ml.n < max ? ml.n : max;
+    memcpy(out, ml.list, (size_t)n * sizeof *out);
+    return n;
+}
+
+// The monitor for a display id (0 or gone — the primary one): its rectangle and GDI device name.
+static int monitor_for(uint32_t id, RECT *rect, wchar_t *device) {
+    MonitorList ml;
+    monitors(&ml);
+    int pick = -1;
+    for (int i = 0; i < ml.n; i++) {
+        if (id && ml.list[i].id == id) pick = i;
+        if (pick < 0 && !id && ml.list[i].primary) pick = i;
+    }
+    if (pick < 0 && id) return -1;
+    if (pick < 0) pick = 0;
+    if (ml.n == 0) return -1;
+    rdc_display *d = &ml.list[pick];
+    SetRect(rect, d->x, d->y, d->x + d->w, d->y + d->h);
+    wcscpy(device, ml.device[pick]);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// DXGI Desktop Duplication of one monitor; frames arrive only when the screen changes.
 
 typedef struct {
     ID3D11Device *dev;
@@ -240,19 +323,20 @@ static void dup_close(Dup *d) {
     memset(d, 0, sizeof *d);
 }
 
-static int dup_open(Dup *d, int verbose) {
+// device — the monitor's GDI name (\\.\DISPLAY2); "" — the main monitor, the one at (0, 0).
+static int dup_open(Dup *d, int verbose, const wchar_t *device) {
     memset(d, 0, sizeof *d);
     IDXGIFactory1 *factory = NULL;
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory))) return -1;
     IDXGIAdapter1 *adapter = NULL;
     IDXGIOutput *output = NULL;
-    // Main monitor — the one whose desktop starts at (0, 0).
     for (UINT i = 0; !output && IDXGIFactory1_EnumAdapters1(factory, i, &adapter) == S_OK; i++) {
         IDXGIOutput *o = NULL;
         for (UINT j = 0; IDXGIAdapter1_EnumOutputs(adapter, j, &o) == S_OK; j++) {
             DXGI_OUTPUT_DESC od;
-            if (SUCCEEDED(IDXGIOutput_GetDesc(o, &od)) && od.AttachedToDesktop && od.DesktopCoordinates.left == 0 &&
-                od.DesktopCoordinates.top == 0) {
+            if (SUCCEEDED(IDXGIOutput_GetDesc(o, &od)) && od.AttachedToDesktop &&
+                (device[0] ? wcscmp(od.DeviceName, device) == 0
+                           : od.DesktopCoordinates.left == 0 && od.DesktopCoordinates.top == 0)) {
                 output = o;
                 break;
             }
@@ -265,7 +349,7 @@ static int dup_open(Dup *d, int verbose) {
     }
     IDXGIFactory1_Release(factory);
     if (!output) {
-        if (verbose) rlog("DXGI: main monitor not found");
+        if (verbose) rlog("DXGI: monitor not found");
         return -2;
     }
     D3D_FEATURE_LEVEL fl;
@@ -356,13 +440,13 @@ static int dup_copy(Dup *d, Frame *f) {
     return 0;
 }
 
-// GDI: fallback capture (virtual machines, remote sessions, old drivers).
-static int gdi_capture(Frame *f) {
-    int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
+// GDI: fallback capture (virtual machines, remote sessions, old drivers) of one monitor.
+static int gdi_capture(Frame *f, const RECT *mon) {
+    int w = mon->right - mon->left, h = mon->bottom - mon->top;
     if (w <= 0 || h <= 0 || frame_ensure(f, w, h) != 0) return -1;
     HDC screen = GetDC(NULL);
     if (!screen) return -1;
-    BOOL ok = BitBlt(f->dc, 0, 0, w, h, screen, 0, 0, SRCCOPY);
+    BOOL ok = BitBlt(f->dc, 0, 0, w, h, screen, mon->left, mon->top, SRCCOPY);
     ReleaseDC(NULL, screen);
     GdiFlush();
     return ok ? 0 : -1;
@@ -620,6 +704,8 @@ done:
 
 static HANDLE g_cap_thread, g_cap_ready;
 static volatile LONG g_cap_run, g_cap_status, g_want_jpeg = 1, g_force_key;
+// The display to capture (0 — the main one) and the one the capture thread shows now.
+static volatile LONG g_cap_want, g_cap_shown = -1;
 static int g_max_width = 1920;
 static uint64_t g_interval_us = 50000;  // JPEG — at most 20 fps
 
@@ -636,6 +722,13 @@ static DWORD WINAPI capture_main(LPVOID arg) {
     uint8_t *prev = NULL;  // previous GDI snapshot: has the screen changed
     size_t prev_len = 0;
     int have_dup = 0;
+    LONG shown = g_cap_want;
+    RECT mon;
+    wchar_t device[CCHDEVICENAME] = L"";
+    if (monitor_for((uint32_t)shown, &mon, device) != 0 && monitor_for(0, &mon, device) != 0) {
+        SetRect(&mon, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        device[0] = 0;
+    }
     if (FAILED(hr)) {
         rlog("capture: WIC unavailable (0x%08lx)", (unsigned long)hr);
         InterlockedExchange(&g_cap_status, -1);
@@ -643,10 +736,10 @@ static DWORD WINAPI capture_main(LPVOID arg) {
         CoUninitialize();
         return 0;
     }
-    have_dup = dup_open(&dup, 1) == 0;
+    have_dup = dup_open(&dup, 1, device) == 0;
     if (have_dup) {
         rlog("capture: DXGI, %dx%d", dup.w, dup.h);
-    } else if (gdi_capture(&work) == 0) {
+    } else if (gdi_capture(&work, &mon) == 0) {
         rlog("capture: GDI, %dx%d", work.w, work.h);
     } else {
         rlog("capture: screen unavailable");
@@ -658,6 +751,7 @@ static DWORD WINAPI capture_main(LPVOID arg) {
         return 0;
     }
     InterlockedExchange(&g_cap_status, 0);
+    InterlockedExchange(&g_cap_shown, shown);
     SetEvent(g_cap_ready);
 
     CursorState cur;
@@ -665,6 +759,25 @@ static DWORD WINAPI capture_main(LPVOID arg) {
     uint64_t last_sent = 0, last_poll = 0, last_retry = rdc_now_us();
     int pending = 1, fresh = !have_dup, failures = 0;  // fresh — work holds a fresh GDI snapshot without the cursor
     while (g_cap_run) {
+        // Another display: duplicate its output from now on (rdc_capture_display waits for this).
+        LONG asked = g_cap_want;
+        if (asked != shown) {
+            RECT r;
+            wchar_t dev[CCHDEVICENAME];
+            if (monitor_for((uint32_t)asked, &r, dev) == 0) {
+                mon = r;
+                wcscpy(device, dev);
+                dup_close(&dup);
+                have_dup = dup_open(&dup, 1, device) == 0;
+                rlog("capture: display %ld, %s %ldx%ld", (long)asked, have_dup ? "DXGI" : "GDI", (long)(r.right - r.left),
+                     (long)(r.bottom - r.top));
+                fresh = 0;
+                pending = 1;
+                last_retry = rdc_now_us();
+            }
+            shown = asked;
+            InterlockedExchange(&g_cap_shown, shown);
+        }
         uint64_t now = rdc_now_us();
         int want = g_want_jpeg != 0;
         if (have_dup) {
@@ -677,7 +790,14 @@ static DWORD WINAPI capture_main(LPVOID arg) {
             if (r < 0) {
                 dup_close(&dup);
                 Sleep(100);
-                have_dup = dup_open(&dup, 0) == 0;
+                // A mode change may have moved the monitor: look it up again.
+                RECT r;
+                wchar_t dev[CCHDEVICENAME];
+                if (monitor_for((uint32_t)shown, &r, dev) == 0) {
+                    mon = r;
+                    wcscpy(device, dev);
+                }
+                have_dup = dup_open(&dup, 0, device) == 0;
                 last_retry = rdc_now_us();
                 pending = 1;
                 if (!have_dup) rlog("capture: DXGI lost, using GDI for now");
@@ -692,14 +812,14 @@ static DWORD WINAPI capture_main(LPVOID arg) {
             last_poll = now;
             if (now - last_retry > 2000000ULL) {
                 last_retry = now;
-                if (dup_open(&dup, 0) == 0) {
+                if (dup_open(&dup, 0, device) == 0) {
                     have_dup = 1;
                     pending = 1;
                     rlog("capture: back to DXGI, %dx%d", dup.w, dup.h);
                     continue;
                 }
             }
-            if (want && gdi_capture(&work) == 0) {
+            if (want && gdi_capture(&work, &mon) == 0) {
                 fresh = 1;
                 size_t len = (size_t)work.stride * work.h;
                 if (prev_len != len || memcmp(prev, work.bits, len) != 0) {
@@ -722,12 +842,12 @@ static DWORD WINAPI capture_main(LPVOID arg) {
         // Frame = clean desktop image + cursor on top.
         int ok;
         if (have_dup)
-            ok = dup.have_image ? dup_copy(&dup, &work) == 0 : gdi_capture(&work) == 0;
+            ok = dup.have_image ? dup_copy(&dup, &work) == 0 : gdi_capture(&work, &mon) == 0;
         else
-            ok = fresh || gdi_capture(&work) == 0;
+            ok = fresh || gdi_capture(&work, &mon) == 0;
         fresh = 0;
         if (ok) {
-            draw_cursor(&work);
+            draw_cursor(&work, mon.left, mon.top);
             GdiFlush();
             ok = jpeg_encode(wic, &work, g_max_width, JPEG_QUALITY, now) == 0;
         }
@@ -775,12 +895,24 @@ int rdc_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx) {
     return status;
 }
 
+int rdc_capture_display(uint32_t id) {
+    RECT r;
+    wchar_t dev[CCHDEVICENAME];
+    if (id && monitor_for(id, &r, dev) != 0) return -1;
+    InterlockedExchange(&g_cap_want, (LONG)id);
+    if (!g_cap_thread) return 0;
+    // The capture thread takes it at the top of its loop; frames after that are the new display's.
+    for (int i = 0; i < 300 && g_cap_shown != (LONG)id; i++) Sleep(5);
+    return g_cap_shown == (LONG)id ? 0 : -5;
+}
+
 void rdc_capture_stop(void) {
     if (!g_cap_thread) return;
     InterlockedExchange(&g_cap_run, 0);
     WaitForSingleObject(g_cap_thread, 5000);
     CloseHandle(g_cap_thread);
     g_cap_thread = NULL;
+    InterlockedExchange(&g_cap_shown, -1);
     rlog("capture stopped");
 }
 
@@ -810,14 +942,18 @@ static void send_mouse(DWORD flags, LONG dx, LONG dy, DWORD data) {
 
 static double clamp01(double v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 
-void rdc_mouse_move(double nx, double ny) {
-    // Without MOUSEEVENTF_VIRTUALDESK, 0..65535 is the main monitor, the one being captured.
-    send_mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, (LONG)(clamp01(nx) * 65535.0 + 0.5),
-               (LONG)(clamp01(ny) * 65535.0 + 0.5), 0);
+// Desktop coordinates are virtual-screen pixels; with MOUSEEVENTF_VIRTUALDESK, 0..65535 spans
+// the whole virtual screen, every monitor.
+void rdc_mouse_move(double x, double y) {
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    double nx = vw > 1 ? clamp01((x - vx) / (vw - 1)) : 0, ny = vh > 1 ? clamp01((y - vy) / (vh - 1)) : 0;
+    send_mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, (LONG)(nx * 65535.0 + 0.5),
+               (LONG)(ny * 65535.0 + 0.5), 0);
 }
 
-void rdc_mouse_button(int button, int down, double nx, double ny) {
-    rdc_mouse_move(nx, ny);
+void rdc_mouse_button(int button, int down, double x, double y) {
+    rdc_mouse_move(x, y);
     DWORD f;
     int bit;
     switch (button) {
@@ -915,12 +1051,11 @@ void rdc_release_all(void) {
     if (buttons & 4) send_mouse(MOUSEEVENTF_MIDDLEUP, 0, 0, 0);
 }
 
-void rdc_cursor_pos(double *nx, double *ny) {
+void rdc_cursor_pos(double *x, double *y) {
     POINT p = {0, 0};
     GetCursorPos(&p);
-    int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
-    *nx = w > 1 ? clamp01((double)p.x / (w - 1)) : 0.5;
-    *ny = h > 1 ? clamp01((double)p.y / (h - 1)) : 0.5;
+    *x = p.x;
+    *y = p.y;
 }
 
 // ---------------------------------------------------------------------------

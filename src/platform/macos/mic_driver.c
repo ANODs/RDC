@@ -1,7 +1,7 @@
 // RDC Microphone: a CoreAudio HAL plug-in (AudioServerPlugIn) with one input-only device that
 // plays the samples RDC.app writes into shared memory (mic_shm.h). Written from Apple's
 // AudioServerPlugIn documentation (CoreAudio/AudioServerPlugIn.h), no code from other drivers.
-// Zig compiles it into RDC.app/Contents/Resources/RDCMicrophone.driver; "Enable phone microphone"
+// Zig compiles it into RDC.app/Contents/Resources/RDCMicrophone.driver; the "Phone microphone" switch in Settings
 // copies the bundle to /Library/Audio/Plug-Ins/HAL and restarts coreaudiod, which loads it.
 //
 // Objects: the plug-in (kAudioObjectPlugInObject), the device (2) and its input stream (3). The

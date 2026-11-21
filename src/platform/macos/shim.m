@@ -111,6 +111,9 @@ static CVPixelBufferRef g_last;      // last complete frame — for new viewers
 static atomic_int g_force_key;
 static uint64_t g_last_jpeg_us;
 static int g_jpeg_pending;
+static int g_switching;              // frames are dropped while the stream moves to another display
+static atomic_uint g_display_id;     // the display to capture; 0 — the main one
+static int g_max_width = 1920;
 static const uint64_t kJpegIntervalUs = 40000;  // JPEG at most 25 fps
 
 static void vt_output(void *refcon, void *frame_refcon, OSStatus status, VTEncodeInfoFlags flags,
@@ -277,7 +280,9 @@ static void encode_jpeg(CVPixelBufferRef pb, uint64_t now) {
     NSNumber *status = info[SCStreamFrameInfoStatus];
     if (!status || status.integerValue != SCFrameStatusComplete) return;  // screen unchanged
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
-    if (!pb) return;
+    if (!pb || g_switching) return;
+    // A frame of the display being left, at its old size: the encoders are made for the new one.
+    if ((int)CVPixelBufferGetWidth(pb) != g_w || (int)CVPixelBufferGetHeight(pb) != g_h) return;
     if (g_last) CVPixelBufferRelease(g_last);
     g_last = CVPixelBufferRetain(pb);
     encode_frame(pb, 0);
@@ -288,12 +293,107 @@ static void encode_jpeg(CVPixelBufferRef pb, uint64_t now) {
 }
 @end
 
+// Displays: the active ones that are not mirrors of another.
+static int active_displays(CGDirectDisplayID *ids, int max) {
+    CGDirectDisplayID all[32];
+    uint32_t n = 0;
+    if (CGGetActiveDisplayList(32, all, &n) != kCGErrorSuccess) return 0;
+    int k = 0;
+    for (uint32_t i = 0; i < n && k < max; i++)
+        if (CGDisplayMirrorsDisplay(all[i]) == kCGNullDirectDisplay) ids[k++] = all[i];
+    return k;
+}
+
+static int display_active(CGDirectDisplayID id) {
+    CGDirectDisplayID ids[RDC_MAX_DISPLAYS];
+    int n = active_displays(ids, RDC_MAX_DISPLAYS);
+    for (int i = 0; i < n; i++)
+        if (ids[i] == id) return 1;
+    return 0;
+}
+
+// The display capture should show: the chosen one while it is there, else the main one.
+static CGDirectDisplayID wanted_display(void) {
+    CGDirectDisplayID id = atomic_load(&g_display_id);
+    return id && display_active(id) ? id : CGMainDisplayID();
+}
+
+// Names come from NSScreen; looked up once per display, they do not change while it is connected.
+static NSMutableDictionary<NSNumber *, NSString *> *g_display_names;
+
+static NSString *display_name(CGDirectDisplayID id, int index) {
+    @synchronized([RDCStreamOutput class]) {
+        if (!g_display_names) g_display_names = [NSMutableDictionary dictionary];
+        NSString *name = g_display_names[@(id)];
+        if (name) return name;
+        for (NSScreen *screen in NSScreen.screens) {
+            NSNumber *num = screen.deviceDescription[@"NSScreenNumber"];
+            if (num && num.unsignedIntValue == id && screen.localizedName.length) name = screen.localizedName;
+        }
+        if (!name) name = CGDisplayIsBuiltin(id) ? @"Built-in display" : [NSString stringWithFormat:@"Display %d", index + 1];
+        g_display_names[@(id)] = name;
+        return name;
+    }
+}
+
+int rdc_displays(rdc_display *out, int max) {
+    @autoreleasepool {
+        CGDirectDisplayID ids[RDC_MAX_DISPLAYS];
+        int n = active_displays(ids, max < RDC_MAX_DISPLAYS ? max : RDC_MAX_DISPLAYS);
+        for (int i = 0; i < n; i++) {
+            rdc_display *d = &out[i];
+            memset(d, 0, sizeof *d);
+            CGRect b = CGDisplayBounds(ids[i]);
+            d->id = ids[i];
+            d->x = (int32_t)lround(b.origin.x);
+            d->y = (int32_t)lround(b.origin.y);
+            d->w = (int32_t)lround(b.size.width);
+            d->h = (int32_t)lround(b.size.height);
+            d->pw = d->w;
+            d->ph = d->h;
+            CGDisplayModeRef mode = CGDisplayCopyDisplayMode(ids[i]);
+            if (mode) {
+                d->pw = (int32_t)CGDisplayModeGetPixelWidth(mode);
+                d->ph = (int32_t)CGDisplayModeGetPixelHeight(mode);
+                CGDisplayModeRelease(mode);
+            }
+            d->primary = CGDisplayIsMain(ids[i]) ? 1 : 0;
+            strlcpy(d->name, display_name(ids[i], i).UTF8String ?: "", sizeof d->name);
+        }
+        return n;
+    }
+}
+
+// The filter and configuration for one display, at most max_width pixels wide.
+static SCStreamConfiguration *stream_config(SCDisplay *display, SCContentFilter *filter, int *out_w, int *out_h) {
+    float scale = filter.pointPixelScale > 0 ? filter.pointPixelScale : 1;
+    int w = (int)(display.width * scale), h = (int)(display.height * scale);
+    if (g_max_width > 0 && w > g_max_width) {
+        h = (int)((double)h * g_max_width / w);
+        w = g_max_width;
+    }
+    w &= ~1;
+    h &= ~1;
+    SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
+    cfg.width = (size_t)w;
+    cfg.height = (size_t)h;
+    cfg.minimumFrameInterval = CMTimeMake(1, g_fps);
+    cfg.pixelFormat = kCVPixelFormatType_32BGRA;
+    cfg.showsCursor = YES;
+    cfg.queueDepth = 6;
+    cfg.colorSpaceName = kCGColorSpaceSRGB;
+    *out_w = w;
+    *out_h = h;
+    return cfg;
+}
+
 int rdc_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx) {
     if (!g_queue) g_queue = dispatch_queue_create("rdc.capture", DISPATCH_QUEUE_SERIAL);
     if (g_stream) return 0;
     g_cb = cb;
     g_cb_ctx = ctx;
     g_fps = fps > 0 ? fps : 60;
+    g_max_width = max_width;
     __block int result = -4;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
 
@@ -304,29 +404,14 @@ int rdc_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx) {
             dispatch_semaphore_signal(done);
             return;
         }
-        CGDirectDisplayID main_id = CGMainDisplayID();
+        CGDirectDisplayID want = wanted_display();
         SCDisplay *display = content.displays.firstObject;
         for (SCDisplay *d in content.displays)
-            if (d.displayID == main_id) display = d;
+            if (d.displayID == want) display = d;
 
         SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
-        float scale = filter.pointPixelScale > 0 ? filter.pointPixelScale : 1;
-        int w = (int)(display.width * scale), h = (int)(display.height * scale);
-        if (max_width > 0 && w > max_width) {
-            h = (int)((double)h * max_width / w);
-            w = max_width;
-        }
-        w &= ~1;
-        h &= ~1;
-
-        SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
-        cfg.width = (size_t)w;
-        cfg.height = (size_t)h;
-        cfg.minimumFrameInterval = CMTimeMake(1, g_fps);
-        cfg.pixelFormat = kCVPixelFormatType_32BGRA;
-        cfg.showsCursor = YES;
-        cfg.queueDepth = 6;
-        cfg.colorSpaceName = kCGColorSpaceSRGB;
+        int w = 0, h = 0;
+        SCStreamConfiguration *cfg = stream_config(display, filter, &w, &h);
 
         dispatch_sync(g_queue, ^{
             g_w = w;
@@ -350,7 +435,7 @@ int rdc_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx) {
                 g_stream = nil;
                 result = -3;
             } else {
-                rlog("capture: %dx%d, up to %d fps", w, h, g_fps);
+                rlog("capture: display %u, %dx%d, up to %d fps", display.displayID, w, h, g_fps);
                 result = 0;
             }
             dispatch_semaphore_signal(done);
@@ -358,6 +443,76 @@ int rdc_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx) {
     }];
 
     if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) != 0) return -5;
+    return result;
+}
+
+int rdc_capture_display(uint32_t id) {
+    CGDirectDisplayID target = id ? id : CGMainDisplayID();
+    if (!display_active(target)) return -1;
+    atomic_store(&g_display_id, target);
+    SCStream *stream = g_stream;
+    if (!stream || !g_queue) return 0;
+    __block int result = -4;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *error) {
+        SCDisplay *display = nil;
+        for (SCDisplay *d in content.displays)
+            if (d.displayID == target) display = d;
+        if (!display) {
+            rlog("capture: display %u is not shareable: %s", target, error ? error.localizedDescription.UTF8String : "not found");
+            result = -2;
+            dispatch_semaphore_signal(done);
+            return;
+        }
+        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+        int w = 0, h = 0;
+        SCStreamConfiguration *cfg = stream_config(display, filter, &w, &h);
+        dispatch_sync(g_queue, ^{ g_switching = 1; });
+        // The running stream moves to the other display: no restart, no new permission prompt.
+        [stream updateContentFilter:filter completionHandler:^(NSError *filter_error) {
+            if (filter_error) {
+                rlog("capture: cannot move to display %u: %s", target, filter_error.localizedDescription.UTF8String);
+                dispatch_sync(g_queue, ^{ g_switching = 0; });
+                result = -3;
+                dispatch_semaphore_signal(done);
+                return;
+            }
+            [stream updateConfiguration:cfg completionHandler:^(NSError *cfg_error) {
+                if (cfg_error) rlog("capture: new size for display %u rejected: %s", target, cfg_error.localizedDescription.UTF8String);
+                dispatch_sync(g_queue, ^{
+                    // Frames still in the encoders go out at the old size, then encoders for the new one.
+                    destroy_session(&g_h264);
+                    destroy_session(&g_jpeg);
+                    if (g_last) CVPixelBufferRelease(g_last);
+                    g_last = NULL;
+                    g_w = w;
+                    g_h = h;
+                    sync_sessions();
+                    atomic_store(&g_force_key, 1);
+                    g_switching = 0;
+                });
+                rlog("capture: display %u, %dx%d", target, w, h);
+                result = 0;
+                dispatch_semaphore_signal(done);
+                // The stream sends frames only when the screen changes, and a still display may not
+                // change for a long time: take its picture once, so viewers see it right away.
+                [SCScreenshotManager captureSampleBufferWithFilter:filter configuration:cfg
+                                                 completionHandler:^(CMSampleBufferRef sb, NSError *shot_error) {
+                    CVPixelBufferRef pb = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
+                    if (!pb) return;
+                    CVPixelBufferRetain(pb);
+                    dispatch_async(g_queue, ^{
+                        if (!g_last && (int)CVPixelBufferGetWidth(pb) == g_w && (int)CVPixelBufferGetHeight(pb) == g_h) {
+                            g_last = CVPixelBufferRetain(pb);
+                            encode_frame(pb, 1);
+                        }
+                        CVPixelBufferRelease(pb);
+                    });
+                }];
+            }];
+        }];
+    }];
+    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0) return -5;
     return result;
 }
 
@@ -430,12 +585,8 @@ static dispatch_queue_t input_queue(void) {
     return g_input_queue;
 }
 
-static CGPoint to_point(double nx, double ny) {
-    CGRect b = CGDisplayBounds(CGMainDisplayID());
-    nx = nx < 0 ? 0 : nx > 1 ? 1 : nx;
-    ny = ny < 0 ? 0 : ny > 1 ? 1 : ny;
-    return CGPointMake(b.origin.x + nx * (b.size.width - 1), b.origin.y + ny * (b.size.height - 1));
-}
+// Desktop coordinates are CG's global ones already (points, origin at the main display's top left).
+static CGPoint to_point(double x, double y) { return CGPointMake(x, y); }
 
 static void post(CGEventRef e) {
     if (!e) return;
@@ -658,15 +809,12 @@ void rdc_release_all(void) {
     });
 }
 
-void rdc_cursor_pos(double *nx, double *ny) {
+void rdc_cursor_pos(double *x, double *y) {
     CGEventRef e = CGEventCreate(NULL);
     CGPoint p = e ? CGEventGetLocation(e) : CGPointZero;
     if (e) CFRelease(e);
-    CGRect b = CGDisplayBounds(CGMainDisplayID());
-    double x = b.size.width > 1 ? (p.x - b.origin.x) / (b.size.width - 1) : 0.5;
-    double y = b.size.height > 1 ? (p.y - b.origin.y) / (b.size.height - 1) : 0.5;
-    *nx = x < 0 ? 0 : x > 1 ? 1 : x;
-    *ny = y < 0 ? 0 : y > 1 ? 1 : y;
+    *x = p.x;
+    *y = p.y;
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,54 +1277,241 @@ void rdc_camera_stop(void) {}
 
 // ---------------------------------------------------------------------------
 // App window
+//
+// One look with the viewer and the site (web/, site/): dark, a translucent background, grouped
+// rows with a symbol, a title and one short line under it. The main window shows the code, the
+// two links and what is happening now; everything set once lives in Settings.
+
+static const CGFloat kMainWidth = 340, kSettingsWidth = 420;
+
+static NSImage *sym(NSString *name, CGFloat size, NSFontWeight weight) {
+    NSImage *i = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
+    return [i imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:size weight:weight]];
+}
+
+static NSButton *icon_button(NSString *symbol, NSString *tip, id target, SEL action) {
+    NSButton *b = [NSButton buttonWithImage:sym(symbol, 13, NSFontWeightMedium) target:target action:action];
+    b.bordered = NO;
+    b.toolTip = tip;
+    b.contentTintColor = NSColor.secondaryLabelColor;
+    [b.widthAnchor constraintEqualToConstant:28].active = YES;
+    [b.heightAnchor constraintEqualToConstant:28].active = YES;
+    return b;
+}
+
+// A copy button answers with a check mark for a moment.
+static void flash_done(NSButton *b) {
+    NSImage *was = b.image;
+    b.image = sym(@"checkmark", 13, NSFontWeightSemibold);
+    b.contentTintColor = NSColor.systemGreenColor;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        b.image = was;
+        b.contentTintColor = NSColor.secondaryLabelColor;
+    });
+}
+
+static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight, NSColor *color) {
+    NSTextField *l = [NSTextField labelWithString:text];
+    l.font = [NSFont systemFontOfSize:size weight:weight];
+    l.textColor = color;
+    l.lineBreakMode = NSLineBreakByTruncatingTail;
+    return l;
+}
+
+static NSButton *push_button(NSString *title, id target, SEL action) {
+    NSButton *b = [NSButton buttonWithTitle:title target:target action:action];
+    b.controlSize = NSControlSizeSmall;
+    b.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+    return b;
+}
+
+static NSSwitch *make_switch(id target, SEL action) {
+    NSSwitch *s = [NSSwitch new];
+    s.controlSize = NSControlSizeSmall;
+    s.target = target;
+    s.action = action;
+    return s;
+}
+
+// A row of a group: a symbol, a title with one line under it, and controls on the right.
+@interface RDCRow : NSStackView
+@property(nonatomic, strong) NSImageView *icon;
+@property(nonatomic, strong) NSTextField *title;
+@property(nonatomic, strong) NSTextField *detail;
+- (void)setDetailText:(NSString *)text;
+@end
+
+@implementation RDCRow
+- (void)setDetailText:(NSString *)text {
+    self.detail.stringValue = text ?: @"";
+    self.detail.toolTip = text.length > 40 ? text : nil;
+    self.detail.hidden = text.length == 0;
+}
+@end
+
+static RDCRow *make_row(NSString *symbol, NSString *title, NSString *detail, NSArray<NSView *> *controls) {
+    RDCRow *r = [RDCRow new];
+    r.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    r.alignment = NSLayoutAttributeCenterY;
+    r.spacing = 10;
+    r.edgeInsets = NSEdgeInsetsMake(8, 12, 8, 10);
+    r.distribution = NSStackViewDistributionFill;  // the text takes the slack: controls sit at the right edge
+    if (symbol) {
+        r.icon = [NSImageView imageViewWithImage:sym(symbol, 14, NSFontWeightRegular)];
+        r.icon.contentTintColor = NSColor.secondaryLabelColor;
+        [r.icon.widthAnchor constraintEqualToConstant:22].active = YES;
+        [r.icon setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+        [r addArrangedSubview:r.icon];
+    }
+    r.title = make_label(title, 13, NSFontWeightMedium, NSColor.labelColor);
+    r.detail = make_label(@"", 11, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    [r setDetailText:detail];
+    NSStackView *text = [NSStackView stackViewWithViews:@[ r.title, r.detail ]];
+    text.orientation = NSUserInterfaceLayoutOrientationVertical;
+    text.alignment = NSLayoutAttributeLeading;
+    text.spacing = 1;
+    for (NSView *v in @[ r.title, r.detail, text ]) {
+        [v setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+        [v setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    }
+    [r addArrangedSubview:text];
+    for (NSView *c in controls) {
+        [c setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+        [r addArrangedSubview:c];
+    }
+    [r.heightAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
+    return r;
+}
+
+// Rows on one rounded plate, as in System Settings. A hidden row takes no room.
+static NSStackView *make_group(NSArray<NSView *> *rows, CGFloat width) {
+    NSStackView *g = [NSStackView stackViewWithViews:rows];
+    g.orientation = NSUserInterfaceLayoutOrientationVertical;
+    g.alignment = NSLayoutAttributeLeading;
+    g.spacing = 0;
+    g.wantsLayer = YES;
+    g.layer.backgroundColor = [NSColor colorWithWhite:1 alpha:0.055].CGColor;
+    g.layer.borderColor = [NSColor colorWithWhite:1 alpha:0.07].CGColor;
+    g.layer.borderWidth = 1;
+    g.layer.cornerRadius = 12;
+    [g.widthAnchor constraintEqualToConstant:width].active = YES;
+    for (NSView *r in rows) [r.widthAnchor constraintEqualToAnchor:g.widthAnchor].active = YES;
+    return g;
+}
+
+static NSTextField *make_header(NSString *text) {
+    NSTextField *l = make_label(text, 12, NSFontWeightSemibold, NSColor.secondaryLabelColor);
+    return l;
+}
+
+// A dark window with a translucent background and the content right under the title bar.
+static NSWindow *make_window(NSString *title, CGFloat width, BOOL miniaturizable, BOOL showTitle) {
+    NSWindowStyleMask mask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskFullSizeContentView;
+    if (miniaturizable) mask |= NSWindowStyleMaskMiniaturizable;
+    NSWindow *w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, width, 300) styleMask:mask backing:NSBackingStoreBuffered defer:NO];
+    w.title = title;
+    w.titlebarAppearsTransparent = YES;
+    w.titleVisibility = showTitle ? NSWindowTitleVisible : NSWindowTitleHidden;
+    w.movableByWindowBackground = YES;
+    w.releasedWhenClosed = NO;
+    NSVisualEffectView *bg = [NSVisualEffectView new];
+    bg.material = NSVisualEffectMaterialUnderWindowBackground;
+    bg.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+    bg.state = NSVisualEffectStateActive;
+    w.contentView = bg;
+    return w;
+}
+
+static void set_content(NSWindow *w, NSStackView *stack) {
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    NSView *bg = w.contentView;
+    [bg addSubview:stack];
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.topAnchor constraintEqualToAnchor:bg.topAnchor],
+        [stack.leadingAnchor constraintEqualToAnchor:bg.leadingAnchor],
+        [stack.trailingAnchor constraintEqualToAnchor:bg.trailingAnchor],
+    ]];
+}
+
+// Each window is as tall as what it shows, with its top edge in place.
+static void fit_window(NSWindow *w) {
+    if (!w) return;
+    NSView *stack = w.contentView.subviews.firstObject;
+    [w.contentView layoutSubtreeIfNeeded];
+    CGFloat want = stack.fittingSize.height;
+    NSRect frame = w.frame;
+    CGFloat have = [w contentRectForFrameRect:frame].size.height;
+    if (fabs(want - have) < 1) return;
+    frame.origin.y -= want - have;
+    frame.size.height += want - have;
+    [w setFrame:frame display:YES animate:w.visible];
+}
+
+static NSString *bare_link(NSString *link) {
+    for (NSString *p in @[ @"https://", @"http://" ])
+        if ([link hasPrefix:p]) return [link substringFromIndex:p.length];
+    return link;
+}
+
+static void copy_text(NSString *s) {
+    if (s.length == 0) return;
+    [NSPasteboard.generalPasteboard clearContents];
+    [NSPasteboard.generalPasteboard setString:s forType:NSPasteboardTypeString];
+}
 
 @interface RDCAppDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic, strong) NSWindow *window;
-@property(nonatomic, strong) NSTextField *codeLabel;
-@property(nonatomic, strong) NSTextField *linkLabel;
-@property(nonatomic, strong) NSTextField *remoteCaption;
-@property(nonatomic, strong) NSTextField *remoteLabel;
-@property(nonatomic, strong) NSStackView *remoteButtons;
+@property(nonatomic, strong) NSView *statusDot;
 @property(nonatomic, strong) NSTextField *statusLabel;
-@property(nonatomic, strong) NSTextField *permLabel;
-@property(nonatomic, strong) NSButton *screenButton;
-@property(nonatomic, strong) NSButton *inputButton;
-@property(nonatomic, strong) NSButton *settingsButton;
+@property(nonatomic, strong) NSTextField *codeLabel;
+@property(nonatomic, strong) RDCRow *lanRow;
+@property(nonatomic, strong) RDCRow *remoteRow;
+@property(nonatomic, strong) NSButton *remoteCopy;
+@property(nonatomic, strong) NSButton *remoteOpen;
+@property(nonatomic, strong) NSStackView *permGroup;
+@property(nonatomic, strong) RDCRow *screenRow;
+@property(nonatomic, strong) RDCRow *inputRow;
+@property(nonatomic, strong) NSStackView *mediaGroup;
+@property(nonatomic, strong) RDCRow *mediaRow;
 @property(nonatomic, strong) NSButton *kickButton;
+@property(nonatomic, strong) NSButton *settingsButton;
 @property(nonatomic) BOOL aiActive;
+@property(nonatomic) BOOL remoteOff;
+@property(nonatomic) BOOL connected;
+@property(nonatomic) BOOL screenOk, inputOk;
+@property(nonatomic, copy) NSString *peers;
 @property(nonatomic, copy) NSString *link;
 @property(nonatomic, copy) NSString *remoteLink;
+
 @property(nonatomic, strong) NSWindow *settingsWindow;
-@property(nonatomic, strong) NSTextField *setVersion;
-@property(nonatomic, strong) NSButton *setAuto;
-@property(nonatomic, strong) NSTextField *setStatus;
-@property(nonatomic, strong) NSButton *setCheck;
-@property(nonatomic, strong) NSButton *setInstall;
-@property(nonatomic, strong) NSButton *setRemoveMic;
-@property(nonatomic, strong) NSTextField *mediaLabel;
-@property(nonatomic, strong) NSButton *mediaStopButton;
-@property(nonatomic, strong) NSTextField *micCaption;
-@property(nonatomic, strong) NSButton *micButton;
+@property(nonatomic, strong) NSSwitch *setPermanent;
+@property(nonatomic, strong) RDCRow *permSetupRow;
+@property(nonatomic, strong) NSSwitch *setLogin;
+@property(nonatomic, strong) NSSwitch *setAwake;
+@property(nonatomic, strong) RDCRow *micRow;
+@property(nonatomic, strong) NSSwitch *setMic;
+@property(nonatomic, strong) NSButton *micUpdate;
 @property(nonatomic) BOOL micBusy;
 @property(nonatomic) int mediaStatus;
-@property(nonatomic, strong) NSButton *setPermanent;
-@property(nonatomic, strong) NSStackView *permBox;
+@property(nonatomic, strong) RDCRow *relayRow;
+@property(nonatomic, strong) NSPopUpButton *setRelay;
+@property(nonatomic, strong) NSView *relayUrlRow;
+@property(nonatomic, strong) NSTextField *setRelayUrl;
+@property(nonatomic, strong) NSSwitch *setAuto;
+@property(nonatomic, strong) RDCRow *versionRow;
+@property(nonatomic, strong) NSButton *setCheck;
+@property(nonatomic, strong) NSButton *setInstall;
+
 @property(nonatomic, strong) NSWindow *permWindow;
-@property(nonatomic, strong) NSButton *permSetup;
 @property(nonatomic, strong) NSImageView *permLinkQR;
-@property(nonatomic, strong) NSTextField *permLinkLabel;
 @property(nonatomic, strong) NSImageView *permAuthQR;
 @property(nonatomic, strong) NSTextField *permKeyLabel;
 @property(nonatomic, strong) NSButton *permShow;
-@property(nonatomic, strong) NSButton *setLogin;
-@property(nonatomic, strong) NSButton *setAwake;
-@property(nonatomic, strong) NSPopUpButton *setRelay;
-@property(nonatomic, strong) NSTextField *setRelayUrl;
-@property(nonatomic, strong) NSTextField *setRelayNote;
 @property(nonatomic) BOOL permRevealed;
 @property(nonatomic, strong) id activity;
 - (void)refreshSettings;
 - (void)refreshMedia;
+- (void)refreshMain;
 @end
 
 // Settings window state (written from any thread, drawn on the main one).
@@ -1195,6 +1530,10 @@ static rdc_action_cb g_on_action;
 static void *g_app_ctx;
 static RDCAppDelegate *g_app;
 
+static void act(int action) {
+    if (g_on_action) g_on_action(g_app_ctx, action);
+}
+
 // A QR code as an image: black on white whatever the theme, with the quiet zone scanners need.
 static NSImage *qr_image(const uint8_t *modules, int size, CGFloat side) {
     if (!modules || size <= 0) return nil;
@@ -1205,31 +1544,13 @@ static NSImage *qr_image(const uint8_t *modules, int size, CGFloat side) {
                        const uint8_t *m = data.bytes;
                        CGFloat cell = r.size.width / (size + 8);
                        [NSColor.whiteColor setFill];
-                       NSRectFill(r);
+                       [[NSBezierPath bezierPathWithRoundedRect:r xRadius:r.size.width * 0.06 yRadius:r.size.width * 0.06] fill];
                        [NSColor.blackColor setFill];
                        for (int y = 0; y < size; y++)
                            for (int x = 0; x < size; x++)
                                if (m[y * size + x]) NSRectFill(NSMakeRect((x + 4) * cell, (y + 4) * cell, cell + 0.5, cell + 0.5));
                        return YES;
                    }];
-}
-
-static NSTextField *make_note(NSString *text) {
-    NSTextField *l = [NSTextField wrappingLabelWithString:text];
-    l.font = [NSFont systemFontOfSize:11];
-    l.textColor = NSColor.secondaryLabelColor;
-    l.alignment = NSTextAlignmentCenter;
-    l.selectable = NO;
-    [l.widthAnchor constraintEqualToConstant:400].active = YES;
-    return l;
-}
-
-static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight, NSColor *color) {
-    NSTextField *l = [NSTextField labelWithString:text];
-    l.font = [NSFont systemFontOfSize:size weight:weight];
-    l.textColor = color;
-    l.alignment = NSTextAlignmentCenter;
-    return l;
 }
 
 @implementation RDCAppDelegate
@@ -1245,94 +1566,97 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     [appMenu addItem:[NSMenuItem separatorItem]];
     [appMenu addItemWithTitle:@"Quit RDC" action:@selector(terminate:) keyEquivalent:@"q"];
     appItem.submenu = appMenu;
+    NSMenuItem *editItem = [NSMenuItem new];
+    [bar addItem:editItem];
+    NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+    [editMenu addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
+    [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
+    [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
+    [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
+    editItem.submenu = editMenu;
     NSApp.mainMenu = bar;
 
-    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 440, 450)
-                                              styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                                                        NSWindowStyleMaskMiniaturizable
-                                                backing:NSBackingStoreBuffered
-                                                  defer:NO];
-    self.window.title = @"RDC";
-    self.window.releasedWhenClosed = NO;
+    const CGFloat inner = kMainWidth - 40;
+    self.window = make_window(@"RDC", kMainWidth, YES, NO);
 
-    NSTextField *caption = make_label(@"Connection code", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
-    self.codeLabel = make_label(@"— — —", 40, NSFontWeightSemibold, NSColor.labelColor);
-    self.codeLabel.font = [NSFont monospacedDigitSystemFontOfSize:40 weight:NSFontWeightSemibold];
-    self.codeLabel.selectable = YES;
-    NSTextField *linkCaption = make_label(@"Browser link on this network", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
-    self.linkLabel = make_label(@"", 14, NSFontWeightRegular, NSColor.linkColor);
-    self.linkLabel.selectable = YES;
-    self.linkLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    // The title bar: the traffic lights on the left, Settings on the right.
+    self.settingsButton = icon_button(@"gearshape", @"Settings (⌘,)", self, @selector(showSettings:));
+    NSView *spring = [NSView new];
+    [spring setContentHuggingPriority:1 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    NSStackView *top = [NSStackView stackViewWithViews:@[ spring, self.settingsButton ]];
+    [top.widthAnchor constraintEqualToConstant:inner + 12].active = YES;
 
-    NSButton *copy = [NSButton buttonWithTitle:@"Copy link" target:self action:@selector(copyLink:)];
-    NSButton *open = [NSButton buttonWithTitle:@"Open in browser" target:self action:@selector(openLink:)];
-    NSStackView *linkButtons = [NSStackView stackViewWithViews:@[ copy, open ]];
-    linkButtons.spacing = 8;
+    // What is happening: a dot and a few words.
+    self.statusDot = [NSView new];
+    self.statusDot.wantsLayer = YES;
+    self.statusDot.layer.cornerRadius = 4;
+    [self.statusDot.widthAnchor constraintEqualToConstant:8].active = YES;
+    [self.statusDot.heightAnchor constraintEqualToConstant:8].active = YES;
+    self.statusLabel = make_label(@"Starting…", 13, NSFontWeightMedium, NSColor.secondaryLabelColor);
+    NSStackView *status = [NSStackView stackViewWithViews:@[ self.statusDot, self.statusLabel ]];
+    status.spacing = 7;
+    [self.statusLabel.widthAnchor constraintLessThanOrEqualToConstant:inner - 20].active = YES;
 
-    // The link from anywhere: GitHub Pages finds this computer through public brokers and connects over WebRTC.
-    self.remoteCaption = make_label(@"", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
-    self.remoteLabel = make_label(@"", 13, NSFontWeightRegular, NSColor.linkColor);
-    self.remoteLabel.selectable = YES;
-    self.remoteLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    NSButton *copyRemote = [NSButton buttonWithTitle:@"Copy link" target:self action:@selector(copyRemoteLink:)];
-    NSButton *openRemote = [NSButton buttonWithTitle:@"Open in browser" target:self action:@selector(openRemoteLink:)];
-    self.remoteButtons = [NSStackView stackViewWithViews:@[ copyRemote, openRemote ]];
-    self.remoteButtons.spacing = 8;
-    self.remoteCaption.hidden = YES;
-    self.remoteLabel.hidden = YES;
-    self.remoteButtons.hidden = YES;
+    // The code, with "new code" beside it; a blank of the same width keeps the digits centered.
+    self.codeLabel = make_label(@"— — —", 34, NSFontWeightSemibold, NSColor.labelColor);
+    self.codeLabel.font = [NSFont monospacedSystemFontOfSize:34 weight:NSFontWeightSemibold];
+    // A click copies it: there is nothing else to do with a code.
+    self.codeLabel.toolTip = @"Click to copy";
+    [self.codeLabel addGestureRecognizer:[[NSClickGestureRecognizer alloc] initWithTarget:self action:@selector(copyCode:)]];
+    NSButton *renew = icon_button(@"arrow.clockwise", @"New code — the old one and its links stop working", self, @selector(newCode:));
+    NSView *balance = [NSView new];
+    [balance.widthAnchor constraintEqualToConstant:28].active = YES;
+    NSStackView *code = [NSStackView stackViewWithViews:@[ balance, self.codeLabel, renew ]];
+    code.spacing = 6;
 
-    self.statusLabel = make_label(@"Starting…", 13, NSFontWeightMedium, NSColor.labelColor);
-    self.permLabel = make_label(@"", 12, NSFontWeightRegular, NSColor.systemOrangeColor);
-    self.permLabel.hidden = YES;
-    self.screenButton = [NSButton buttonWithTitle:@"Allow screen recording" target:self action:@selector(askScreen:)];
-    self.inputButton = [NSButton buttonWithTitle:@"Allow control" target:self action:@selector(askInput:)];
-    self.screenButton.hidden = YES;
-    self.inputButton.hidden = YES;
-    NSStackView *permButtons = [NSStackView stackViewWithViews:@[ self.screenButton, self.inputButton ]];
-    permButtons.spacing = 8;
+    // The two links.
+    NSButton *copyLan = icon_button(@"doc.on.doc", @"Copy link", self, @selector(copyLink:));
+    NSButton *openLan = icon_button(@"arrow.up.right", @"Open in browser", self, @selector(openLink:));
+    self.lanRow = make_row(@"wifi", @"This network", @"", @[ copyLan, openLan ]);
+    self.lanRow.detail.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    self.remoteCopy = icon_button(@"doc.on.doc", @"Copy link", self, @selector(copyRemoteLink:));
+    self.remoteOpen = icon_button(@"arrow.up.right", @"Open in browser", self, @selector(openRemoteLink:));
+    self.remoteRow = make_row(@"globe", @"From anywhere", @"Connecting…", @[ self.remoteCopy, self.remoteOpen ]);
+    self.remoteRow.detail.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    self.remoteRow.toolTip = @"Works from mobile data and other networks";
+    NSStackView *links = make_group(@[ self.lanRow, self.remoteRow ], inner);
 
-    // The viewer's phone as a microphone of this Mac: what is live now, and the driver's state.
-    self.mediaLabel = make_label(@"", 13, NSFontWeightMedium, NSColor.systemGreenColor);
-    self.mediaLabel.hidden = YES;
-    self.mediaStopButton = [NSButton buttonWithTitle:@"Stop phone microphone" target:self action:@selector(stopMedia:)];
-    self.mediaStopButton.hidden = YES;
-    self.micCaption = make_label(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
-    self.micCaption.lineBreakMode = NSLineBreakByWordWrapping;  // a paragraph, not a one-line label
-    self.micCaption.cell.wraps = YES;
-    self.micCaption.cell.scrollable = NO;
-    self.micCaption.usesSingleLineMode = NO;
-    self.micCaption.maximumNumberOfLines = 0;
-    self.micCaption.preferredMaxLayoutWidth = 390;
-    self.micButton = [NSButton buttonWithTitle:@"Enable phone microphone" target:self action:@selector(enableMic:)];
-    self.micButton.hidden = YES;
+    // Missing permissions: one orange row each, with the button that fixes it.
+    self.screenRow = make_row(@"rectangle.dashed", @"Screen Recording", @"Needed to show the screen",
+                              @[ push_button(@"Allow…", self, @selector(askScreen:)) ]);
+    self.inputRow = make_row(@"cursorarrow.click", @"Accessibility", @"Needed for mouse and keyboard",
+                             @[ push_button(@"Allow…", self, @selector(askInput:)) ]);
+    for (RDCRow *r in @[ self.screenRow, self.inputRow ]) r.icon.contentTintColor = NSColor.systemOrangeColor;
+    self.permGroup = make_group(@[ self.screenRow, self.inputRow ], inner);
+    self.permGroup.hidden = YES;
 
-    self.kickButton = [NSButton buttonWithTitle:@"Disconnect all" target:self action:@selector(disconnectAll:)];
-    NSButton *renew = [NSButton buttonWithTitle:@"New code" target:self action:@selector(newCode:)];
-    self.settingsButton = [NSButton buttonWithTitle:@"Settings…" target:self action:@selector(showSettings:)];
-    NSStackView *sessionButtons = [NSStackView stackViewWithViews:@[ renew, self.kickButton, self.settingsButton ]];
-    sessionButtons.spacing = 8;
+    // A viewer's microphone, live on this Mac.
+    self.mediaRow = make_row(@"mic.fill", @"Phone microphone", @"", @[ push_button(@"Stop", self, @selector(stopMedia:)) ]);
+    self.mediaRow.icon.contentTintColor = NSColor.systemGreenColor;
+    self.mediaGroup = make_group(@[ self.mediaRow ], inner);
+    self.mediaGroup.hidden = YES;
+
+    // Ending the session: there only while someone is connected.
+    self.kickButton = [NSButton buttonWithTitle:@"Disconnect" target:self action:@selector(disconnectAll:)];
+    self.kickButton.controlSize = NSControlSizeLarge;
+    self.kickButton.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    [self.kickButton.widthAnchor constraintEqualToConstant:inner].active = YES;
+    self.kickButton.hidden = YES;
 
     NSStackView *stack = [NSStackView stackViewWithViews:@[
-        caption, self.codeLabel, linkCaption, self.linkLabel, linkButtons, self.remoteCaption, self.remoteLabel,
-        self.remoteButtons, self.statusLabel, self.permLabel, permButtons, self.mediaLabel, self.mediaStopButton,
-        self.micCaption, self.micButton, sessionButtons
+        top, status, code, links, self.permGroup, self.mediaGroup, self.kickButton
     ]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeCenterX;
-    stack.spacing = 10;
-    stack.edgeInsets = NSEdgeInsetsMake(24, 24, 24, 24);
-    [stack setCustomSpacing:2 afterView:caption];
-    [stack setCustomSpacing:18 afterView:self.codeLabel];
-    [stack setCustomSpacing:2 afterView:linkCaption];
-    [stack setCustomSpacing:18 afterView:linkButtons];
-    [stack setCustomSpacing:2 afterView:self.remoteCaption];
-    [stack setCustomSpacing:18 afterView:self.remoteButtons];
-    [self.linkLabel.widthAnchor constraintLessThanOrEqualToConstant:390].active = YES;
-    [self.remoteLabel.widthAnchor constraintLessThanOrEqualToConstant:390].active = YES;
-    [self.micCaption.widthAnchor constraintLessThanOrEqualToConstant:390].active = YES;
-    self.window.contentView = stack;
+    stack.spacing = 12;
+    stack.edgeInsets = NSEdgeInsetsMake(6, 20, 22, 20);
+    [stack setCustomSpacing:2 afterView:top];
+    [stack setCustomSpacing:4 afterView:status];
+    [stack setCustomSpacing:18 afterView:code];
+    set_content(self.window, stack);
     [self refreshMedia];
+    [self refreshMain];
+    fit_window(self.window);
     [self.window center];
     // Waiting for connections in the background is this app's work: no App Nap.
     self.activity = [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
@@ -1353,52 +1677,39 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     return YES;
 }
 
-// The window grows and shrinks with what it shows, keeping its top edge in place.
-- (void)fitWindow {
-    NSView *stack = self.window.contentView;
-    CGFloat want = MAX(450, stack.fittingSize.height);
-    NSRect frame = self.window.frame;
-    CGFloat have = [self.window contentRectForFrameRect:frame].size.height;
-    if (fabs(want - have) < 2) return;
-    frame.origin.y -= want - have;
-    frame.size.height += want - have;
-    [self.window setFrame:frame display:YES animate:NO];
+// The dot, the words beside it, the permission rows and the Disconnect button.
+- (void)refreshMain {
+    BOOL missing = !self.screenOk || !self.inputOk;
+    NSColor *dot = self.aiActive ? NSColor.systemRedColor
+                 : self.connected ? NSColor.systemGreenColor
+                 : missing ? NSColor.systemOrangeColor
+                           : NSColor.tertiaryLabelColor;
+    self.statusDot.layer.backgroundColor = dot.CGColor;
+    NSString *text = self.connected ? self.peers : missing ? @"Needs permissions" : @"Ready to connect";
+    self.statusLabel.stringValue = text ?: @"";
+    self.statusLabel.textColor = self.connected ? NSColor.labelColor : NSColor.secondaryLabelColor;
+    self.statusLabel.toolTip = self.connected ? self.peers : nil;
+    self.screenRow.hidden = self.screenOk;
+    self.inputRow.hidden = self.inputOk;
+    self.permGroup.hidden = !missing;
+    self.kickButton.hidden = !self.connected;
+    self.kickButton.title = self.aiActive ? @"Stop AI Agent" : @"Disconnect";
+    self.kickButton.bezelColor = self.aiActive ? NSColor.systemRedColor : nil;
+    self.settingsButton.image = sym(g_set_can_install ? @"arrow.down.circle.fill" : @"gearshape", 13, NSFontWeightMedium);
+    self.settingsButton.contentTintColor = g_set_can_install ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
+    self.settingsButton.toolTip = g_set_can_install ? @"Update available" : @"Settings (⌘,)";
+    fit_window(self.window);
 }
 
 - (void)refreshMedia {
-    int status = rdc_media_status();
-    self.mediaStatus = status;
-    NSString *text;
-    NSString *button = nil;
-    if (status & RDC_MEDIA_MIC) {
-        text = @"Phone microphone is ready: a phone connected to RDC can be this Mac's microphone — pick "
-               @"\"RDC Microphone\" in any app. There is no phone camera on a Mac: it needs Apple's signed camera extension.";
-        if (status & RDC_MEDIA_MIC_OUTDATED) button = @"Update phone microphone";
-    } else if (status & RDC_MEDIA_MIC_INSTALLED) {
-        text = @"Phone microphone is installed, but the audio system has not loaded it — restart the Mac.";
-        button = (status & RDC_MEDIA_MIC_OUTDATED) ? @"Update phone microphone" : @"Reinstall phone microphone";
-    } else {
-        text = @"Phone microphone is off. Enable it, and a phone connected to RDC can be this Mac's microphone "
-               @"(\"RDC Microphone\" in any app). It asks for the administrator password once; sound pauses for a second.";
-        button = @"Enable phone microphone";
-    }
-    self.micCaption.stringValue = text;
-    self.micButton.hidden = button == nil;
-    if (button) self.micButton.title = button;
-    self.micButton.enabled = !self.micBusy;
+    self.mediaStatus = rdc_media_status();
     [self refreshSettings];
-    [self fitWindow];
-}
-
-- (void)enableMic:(id)sender {
-    [self installMic:YES];
 }
 
 - (void)installMic:(BOOL)install {
     if (self.micBusy) return;
     self.micBusy = YES;
-    self.micButton.enabled = NO;
-    self.setRemoveMic.enabled = NO;
+    [self refreshSettings];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         int rc = rdc_mic_install(install);
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1407,40 +1718,53 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
             if (rc < 0) {
                 NSAlert *alert = [NSAlert new];
                 alert.messageText = install ? @"Could not install RDC Microphone" : @"Could not remove RDC Microphone";
-                alert.informativeText = @"Details are in the log: ~/Library/Logs/RDC/rdc.log";
+                alert.informativeText = @"Details are in ~/Library/Logs/RDC/rdc.log";
                 [alert runModal];
             }
         });
     });
 }
 
+- (void)toggleMic:(NSSwitch *)sender {
+    [self installMic:sender.state == NSControlStateValueOn];
+}
+
+- (void)updateMic:(id)sender {
+    [self installMic:YES];
+}
+
 - (void)stopMedia:(id)sender {
-    if (g_on_action) g_on_action(g_app_ctx, RDC_ACTION_STOP_MEDIA);
+    act(RDC_ACTION_STOP_MEDIA);
 }
 
-- (void)removeMic:(id)sender {
-    [self installMic:NO];
-}
-
-// With "start at login" on, RDC is there to be reached: closing the window leaves it running.
+// With "open at login" on, RDC is there to be reached: closing the window leaves it running.
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)app {
     return !autostart_on();
 }
 
-- (void)copyLink:(id)sender {
-    if (!self.link) return;
-    [NSPasteboard.generalPasteboard clearContents];
-    [NSPasteboard.generalPasteboard setString:self.link forType:NSPasteboardTypeString];
+- (void)copyCode:(id)sender {
+    NSString *code = self.codeLabel.stringValue;
+    if (![code hasPrefix:@"—"]) {
+        copy_text([code stringByReplacingOccurrencesOfString:@" " withString:@""]);
+        self.codeLabel.textColor = NSColor.systemGreenColor;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            self.codeLabel.textColor = NSColor.labelColor;
+        });
+    }
+}
+
+- (void)copyLink:(NSButton *)sender {
+    copy_text(self.link);
+    flash_done(sender);
 }
 
 - (void)openLink:(id)sender {
-    if (self.link) [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:self.link]];
+    if (self.link.length) [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:self.link]];
 }
 
-- (void)copyRemoteLink:(id)sender {
-    if (self.remoteLink.length == 0) return;
-    [NSPasteboard.generalPasteboard clearContents];
-    [NSPasteboard.generalPasteboard setString:self.remoteLink forType:NSPasteboardTypeString];
+- (void)copyRemoteLink:(NSButton *)sender {
+    copy_text(self.remoteLink);
+    flash_done(sender);
 }
 
 - (void)openRemoteLink:(id)sender {
@@ -1456,171 +1780,185 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
 }
 
 - (void)disconnectAll:(id)sender {
-    if (g_on_action) g_on_action(g_app_ctx, self.aiActive ? RDC_ACTION_STOP_AI : RDC_ACTION_DISCONNECT_ALL);
+    act(self.aiActive ? RDC_ACTION_STOP_AI : RDC_ACTION_DISCONNECT_ALL);
 }
 
 - (void)newCode:(id)sender {
-    if (g_on_action) g_on_action(g_app_ctx, RDC_ACTION_NEW_CODE);
+    act(RDC_ACTION_NEW_CODE);
 }
 
 - (void)showSettings:(id)sender {
     if (!self.settingsWindow) {
-        NSWindow *w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 440, 230)
-                                                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
-                                                    backing:NSBackingStoreBuffered
-                                                      defer:NO];
-        w.title = @"RDC Settings";
-        w.releasedWhenClosed = NO;
-        self.setVersion = make_label(@"", 15, NSFontWeightSemibold, NSColor.labelColor);
-        self.setAuto = [NSButton checkboxWithTitle:@"Update automatically" target:self action:@selector(toggleAuto:)];
-        NSTextField *hint = make_label(@"New versions are downloaded from GitHub releases (ANODs/RDC),\n"
-                                       @"verified by signature and installed when no one is connected.",
-                                       11, NSFontWeightRegular, NSColor.secondaryLabelColor);
-        hint.maximumNumberOfLines = 3;
-        self.setStatus = make_label(@"", 13, NSFontWeightRegular, NSColor.labelColor);
-        self.setStatus.maximumNumberOfLines = 3;
-        self.setCheck = [NSButton buttonWithTitle:@"Check for updates" target:self action:@selector(checkUpdate:)];
-        self.setInstall = [NSButton buttonWithTitle:@"Update and restart" target:self action:@selector(installUpdate:)];
-        self.setInstall.keyEquivalent = @"\r";
-        NSStackView *buttons = [NSStackView stackViewWithViews:@[ self.setCheck, self.setInstall ]];
-        buttons.spacing = 8;
-        self.setRemoveMic = [NSButton buttonWithTitle:@"Remove phone microphone" target:self action:@selector(removeMic:)];
-        self.setRemoveMic.hidden = YES;
-        // Permanent access, start at login, staying awake: all off until switched on here.
-        NSBox *line = [NSBox new];
-        line.boxType = NSBoxSeparator;
-        self.setPermanent = [NSButton checkboxWithTitle:@"Permanent access"
-                                                 target:self
-                                                 action:@selector(togglePermanent:)];
-        NSTextField *permHint = make_note(@"A link of your own that never changes. Whoever opens it must enter the current 6-digit code "
-                                          @"from your authenticator app (Google Authenticator and the like), so the link alone lets no one in.");
-        NSTextField *step1 = make_note(@"1. Open the link on your phone — point its camera at this code — and keep it: "
-                                       @"add the page to the home screen.");
-        self.permLinkQR = [NSImageView new];
-        [self.permLinkQR.widthAnchor constraintEqualToConstant:170].active = YES;
-        [self.permLinkQR.heightAnchor constraintEqualToConstant:170].active = YES;
-        self.permLinkLabel = make_label(@"", 11, NSFontWeightRegular, NSColor.linkColor);
-        self.permLinkLabel.selectable = YES;
-        self.permLinkLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        [self.permLinkLabel.widthAnchor constraintLessThanOrEqualToConstant:400].active = YES;
-        NSButton *copyPerm = [NSButton buttonWithTitle:@"Copy link" target:self action:@selector(copyPermanentLink:)];
-        NSTextField *step2 = make_note(@"2. Add this computer to the authenticator app: in the app, scan the second code. "
-                                       @"Anyone who sees it can make the codes, so it is shown only when you ask.");
-        self.permShow = [NSButton buttonWithTitle:@"Show the code for the authenticator app" target:self action:@selector(revealPermanent:)];
-        self.permAuthQR = [NSImageView new];
-        [self.permAuthQR.widthAnchor constraintEqualToConstant:190].active = YES;
-        [self.permAuthQR.heightAnchor constraintEqualToConstant:190].active = YES;
-        self.permKeyLabel = make_label(@"", 11, NSFontWeightRegular, NSColor.labelColor);
-        self.permKeyLabel.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-        self.permKeyLabel.selectable = YES;
-        NSButton *resetPerm = [NSButton buttonWithTitle:@"New link and key…" target:self action:@selector(resetPermanent:)];
-        self.permBox = [NSStackView stackViewWithViews:@[
-            step1, self.permLinkQR, self.permLinkLabel, copyPerm, step2, self.permShow, self.permAuthQR, self.permKeyLabel, resetPerm
-        ]];
-        self.permBox.orientation = NSUserInterfaceLayoutOrientationVertical;
-        self.permBox.alignment = NSLayoutAttributeCenterX;
-        self.permBox.spacing = 10;
-        self.permBox.edgeInsets = NSEdgeInsetsMake(20, 20, 20, 20);
-        [self.permBox setCustomSpacing:20 afterView:copyPerm];
-        [self.permBox setCustomSpacing:20 afterView:self.permKeyLabel];
-        self.permWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 440, 400)
-                                                      styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
-                                                        backing:NSBackingStoreBuffered
-                                                          defer:NO];
-        self.permWindow.title = @"Permanent access";
-        self.permWindow.releasedWhenClosed = NO;
-        self.permWindow.contentView = self.permBox;
-        self.permSetup = [NSButton buttonWithTitle:@"Set up the phone…" target:self action:@selector(showPermanent:)];
-        self.setLogin = [NSButton checkboxWithTitle:@"Start RDC at login"
-                                             target:self
-                                             action:@selector(toggleLogin:)];
-        NSTextField *loginHint = make_note(@"RDC starts hidden when you log in and keeps running when its window is closed.");
-        self.setAwake = [NSButton checkboxWithTitle:@"Keep this Mac awake" target:self action:@selector(toggleAwake:)];
-        NSTextField *awakeHint = make_note(@"A sleeping computer cannot be reached. The display may still turn off; a MacBook with its lid closed sleeps anyway.");
+        const CGFloat inner = kSettingsWidth - 40;
+        NSWindow *w = make_window(@"Settings", kSettingsWidth, NO, YES);
+
+        // Reaching this Mac when no one is at it.
+        self.setPermanent = make_switch(self, @selector(togglePermanent:));
+        RDCRow *perm = make_row(@"key", @"Permanent access", @"Your own link, opened with authenticator codes", @[ self.setPermanent ]);
+        self.permSetupRow = make_row(@"qrcode", @"Phone", @"Scan the link and add the code to your authenticator",
+                                     @[ push_button(@"Set Up…", self, @selector(showPermanent:)) ]);
+        self.setLogin = make_switch(self, @selector(toggleLogin:));
+        RDCRow *login = make_row(@"power", @"Open at login", @"Starts hidden and keeps running when closed", @[ self.setLogin ]);
+        self.setAwake = make_switch(self, @selector(toggleAwake:));
+        RDCRow *awake = make_row(@"moon.zzz", @"Keep Mac awake", @"A sleeping Mac can't be reached", @[ self.setAwake ]);
+        NSStackView *access = make_group(@[ perm, self.permSetupRow, login, awake ], inner);
+
+        // The viewer's phone as this Mac's microphone.
+        self.setMic = make_switch(self, @selector(toggleMic:));
+        self.micUpdate = push_button(@"Update", self, @selector(updateMic:));
+        self.micRow = make_row(@"mic", @"Phone microphone", @"", @[ self.micUpdate, self.setMic ]);
+        NSStackView *mic = make_group(@[ self.micRow ], inner);
+
         // The relay: the way through when a phone and this Mac cannot connect directly.
-        NSBox *line2 = [NSBox new];
-        line2.boxType = NSBoxSeparator;
-        NSTextField *relayTitle = make_label(@"Relay — when a phone cannot connect directly", 13, NSFontWeightRegular, NSColor.labelColor);
         self.setRelay = [NSPopUpButton new];
-        [self.setRelay addItemsWithTitles:@[ @"RDC's relay", @"My own relay", @"Off" ]];
+        self.setRelay.controlSize = NSControlSizeSmall;
+        self.setRelay.font = [NSFont systemFontOfSize:12];
+        [self.setRelay addItemsWithTitles:@[ @"RDC's", @"My own", @"Off" ]];
         self.setRelay.target = self;
         self.setRelay.action = @selector(relayChosen:);
+        self.relayRow = make_row(@"arrow.triangle.branch", @"Relay", @"", @[ self.setRelay ]);
         self.setRelayUrl = [NSTextField textFieldWithString:@""];
-        self.setRelayUrl.placeholderString = @"https://rdc-relay.<your-name>.workers.dev";
+        self.setRelayUrl.placeholderString = @"https://rdc-relay.<you>.workers.dev";
+        self.setRelayUrl.controlSize = NSControlSizeSmall;
+        self.setRelayUrl.font = [NSFont systemFontOfSize:12];
+        self.setRelayUrl.bezelStyle = NSTextFieldRoundedBezel;
         self.setRelayUrl.target = self;
         self.setRelayUrl.action = @selector(relayUrlEntered:);
-        [self.setRelayUrl.widthAnchor constraintEqualToConstant:360].active = YES;
-        self.setRelayNote = make_note(@"");
-        NSButton *relayHow = [NSButton buttonWithTitle:@"How to set up your own relay…" target:self action:@selector(relayHowTo:)];
-        relayHow.bezelStyle = NSBezelStyleInline;
-        NSStackView *stack = [NSStackView stackViewWithViews:@[
-            self.setVersion, self.setAuto, hint, self.setStatus, buttons, self.setRemoveMic, line, self.setPermanent, permHint,
-            self.permSetup, self.setLogin, loginHint, self.setAwake, awakeHint, line2, relayTitle, self.setRelay, self.setRelayUrl,
-            self.setRelayNote, relayHow
-        ]];
+        NSButton *relayHow = icon_button(@"questionmark.circle", @"How to set up your own relay", self, @selector(relayHowTo:));
+        NSStackView *urlRow = [NSStackView stackViewWithViews:@[ self.setRelayUrl, relayHow ]];
+        urlRow.spacing = 6;
+        urlRow.edgeInsets = NSEdgeInsetsMake(0, 44, 10, 10);
+        self.relayUrlRow = urlRow;
+        NSStackView *relay = make_group(@[ self.relayRow, urlRow ], inner);
+
+        // Updates.
+        self.setAuto = make_switch(self, @selector(toggleAuto:));
+        RDCRow *autoRow = make_row(@"arrow.down.circle", @"Automatic updates", @"Signed, installed when no one is connected", @[ self.setAuto ]);
+        self.setCheck = push_button(@"Check", self, @selector(checkUpdate:));
+        self.setInstall = push_button(@"Update", self, @selector(installUpdate:));
+        self.setInstall.keyEquivalent = @"\r";
+        self.versionRow = make_row(@"info.circle", @"RDC", @"", @[ self.setCheck, self.setInstall ]);
+        NSStackView *updates = make_group(@[ autoRow, self.versionRow ], inner);
+
+        NSTextField *h1 = make_header(@"Access"), *h2 = make_header(@"Phone"), *h3 = make_header(@"Connection"), *h4 = make_header(@"Updates");
+        NSStackView *stack = [NSStackView stackViewWithViews:@[ h1, access, h2, mic, h3, relay, h4, updates ]];
         stack.orientation = NSUserInterfaceLayoutOrientationVertical;
-        stack.alignment = NSLayoutAttributeCenterX;
-        stack.spacing = 12;
-        stack.edgeInsets = NSEdgeInsetsMake(20, 20, 20, 20);
-        [stack setCustomSpacing:4 afterView:self.setPermanent];
-        [stack setCustomSpacing:4 afterView:self.setLogin];
-        [stack setCustomSpacing:4 afterView:self.setAwake];
-        [line.widthAnchor constraintEqualToConstant:400].active = YES;
-        [line2.widthAnchor constraintEqualToConstant:400].active = YES;
-        [stack setCustomSpacing:4 afterView:relayTitle];
-        [hint.widthAnchor constraintLessThanOrEqualToConstant:400].active = YES;
-        [self.setStatus.widthAnchor constraintLessThanOrEqualToConstant:400].active = YES;
-        w.contentView = stack;
-        [w center];
+        stack.alignment = NSLayoutAttributeLeading;
+        stack.spacing = 8;
+        stack.edgeInsets = NSEdgeInsetsMake(40, 20, 22, 20);
+        for (NSView *g in @[ access, mic, relay ]) [stack setCustomSpacing:20 afterView:g];
+        for (NSView *h in @[ h1, h2, h3, h4 ]) [h.leadingAnchor constraintEqualToAnchor:stack.leadingAnchor constant:24].active = YES;
+        set_content(w, stack);
         self.settingsWindow = w;
+        [self refreshSettings];
+        fit_window(w);
+        [w center];
     }
     [self refreshSettings];
     [self.settingsWindow makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 }
 
+- (void)buildPermanentWindow {
+    NSWindow *w = make_window(@"Permanent Access", 360, NO, YES);
+
+    NSTextField *s1 = make_label(@"1  Open your link on the phone", 13, NSFontWeightSemibold, NSColor.labelColor);
+    NSTextField *s1d = make_label(@"Point the camera here, then add the page to the Home Screen", 11, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    self.permLinkQR = [NSImageView new];
+    [self.permLinkQR.widthAnchor constraintEqualToConstant:176].active = YES;
+    [self.permLinkQR.heightAnchor constraintEqualToConstant:176].active = YES;
+    NSButton *copy = push_button(@"Copy Link", self, @selector(copyPermanentLink:));
+
+    NSTextField *s2 = make_label(@"2  Add RDC to your authenticator", 13, NSFontWeightSemibold, NSColor.labelColor);
+    NSTextField *s2d = make_label(@"Google Authenticator, 1Password or any other", 11, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    self.permShow = push_button(@"Show Code…", self, @selector(revealPermanent:));
+    self.permShow.image = sym(@"touchid", 12, NSFontWeightRegular);
+    self.permShow.imagePosition = NSImageLeading;
+    self.permAuthQR = [NSImageView new];
+    [self.permAuthQR.widthAnchor constraintEqualToConstant:176].active = YES;
+    [self.permAuthQR.heightAnchor constraintEqualToConstant:176].active = YES;
+    self.permKeyLabel = make_label(@"", 11, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    self.permKeyLabel.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    self.permKeyLabel.selectable = YES;
+    self.permKeyLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    [self.permKeyLabel.widthAnchor constraintLessThanOrEqualToConstant:300].active = YES;
+
+    NSButton *reset = [NSButton buttonWithTitle:@"New Link and Key…" target:self action:@selector(resetPermanent:)];
+    reset.bordered = NO;
+    reset.font = [NSFont systemFontOfSize:12];
+    reset.contentTintColor = NSColor.systemRedColor;
+
+    NSStackView *stack = [NSStackView stackViewWithViews:@[
+        s1, s1d, self.permLinkQR, copy, s2, s2d, self.permShow, self.permAuthQR, self.permKeyLabel, reset
+    ]];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeCenterX;
+    stack.spacing = 10;
+    stack.edgeInsets = NSEdgeInsetsMake(44, 24, 18, 24);
+    [stack setCustomSpacing:2 afterView:s1];
+    [stack setCustomSpacing:2 afterView:s2];
+    [stack setCustomSpacing:26 afterView:copy];
+    [stack setCustomSpacing:20 afterView:self.permKeyLabel];
+    [stack setCustomSpacing:20 afterView:self.permShow];
+    set_content(w, stack);
+    self.permWindow = w;
+}
+
 - (void)refreshSettings {
-    NSString *version = g_set_version.length ? g_set_version : @"—";
-    self.settingsButton.title = g_set_can_install ? @"Update available…" : @"Settings…";
+    [self refreshMain];
     if (!self.settingsWindow) return;
-    self.setVersion.stringValue = [NSString stringWithFormat:@"RDC %@", version];
+    // Access
+    if (!g_perm_on) self.permRevealed = NO;
+    self.setPermanent.state = g_perm_on ? NSControlStateValueOn : NSControlStateValueOff;
+    // The permanent link is a link from anywhere: without those connections there is none.
+    self.setPermanent.enabled = !self.remoteOff;
+    [(RDCRow *)self.setPermanent.superview setDetailText:self.remoteOff ? @"Needs connections from anywhere (started with --no-remote)"
+                                                                        : @"Your own link, opened with authenticator codes"];
+    self.permSetupRow.hidden = !g_perm_on;
+    if (!g_perm_on) [self.permWindow orderOut:nil];
+    self.setLogin.state = autostart_on() ? NSControlStateValueOn : NSControlStateValueOff;
+    self.setAwake.state = rdc_pref_bool("keep_awake", 0) ? NSControlStateValueOn : NSControlStateValueOff;
+    // Phone microphone
+    int st = self.mediaStatus;
+    BOOL installed = (st & RDC_MEDIA_MIC_INSTALLED) != 0;
+    self.setMic.state = installed ? NSControlStateValueOn : NSControlStateValueOff;
+    self.setMic.enabled = !self.micBusy;
+    self.micUpdate.hidden = !(st & RDC_MEDIA_MIC_OUTDATED);
+    self.micUpdate.enabled = !self.micBusy;
+    [self.micRow setDetailText:self.micBusy ? @"Working…"
+                               : (st & RDC_MEDIA_MIC) ? @"Pick “RDC Microphone” in any app"
+                               : installed ? @"Restart the Mac to finish"
+                                           : @"Asks for the administrator password once"];
+    // Relay
+    [self refreshRelay];
+    // Updates
+    NSString *version = g_set_version.length ? g_set_version : @"—";
+    self.versionRow.title.stringValue = [NSString stringWithFormat:@"RDC %@", version];
+    [self.versionRow setDetailText:g_set_status];
     self.setAuto.state = g_set_auto ? NSControlStateValueOn : NSControlStateValueOff;
-    self.setStatus.stringValue = g_set_status;
+    self.setCheck.hidden = g_set_can_install;
     self.setCheck.enabled = !g_set_busy;
     self.setInstall.hidden = !g_set_can_install;
     self.setInstall.enabled = g_set_can_install && !g_set_busy;
-    self.setRemoveMic.hidden = !(self.mediaStatus & RDC_MEDIA_MIC_INSTALLED);
-    self.setRemoveMic.enabled = !self.micBusy;
-    if (!g_perm_on) self.permRevealed = NO;
-    self.setPermanent.state = g_perm_on ? NSControlStateValueOn : NSControlStateValueOff;
-    self.permSetup.hidden = !g_perm_on;
-    if (!g_perm_on) [self.permWindow orderOut:nil];
-    self.permLinkQR.image = g_perm_link_qr;
-    self.permLinkLabel.stringValue = g_perm_link;
-    self.permShow.hidden = self.permRevealed;
-    self.permAuthQR.hidden = !self.permRevealed;
-    self.permKeyLabel.hidden = !self.permRevealed;
-    self.permAuthQR.image = self.permRevealed ? g_perm_auth_qr : nil;
-    self.permKeyLabel.stringValue = self.permRevealed ? [@"Or type the key: " stringByAppendingString:g_perm_key] : @"";
-    self.setLogin.state = autostart_on() ? NSControlStateValueOn : NSControlStateValueOff;
-    self.setAwake.state = rdc_pref_bool("keep_awake", 0) ? NSControlStateValueOn : NSControlStateValueOff;
-    [self refreshRelay];
-    // Each window is as tall as what it shows, with its top edge in place.
-    for (NSWindow *w in @[ self.settingsWindow, self.permWindow ]) {
-        [w.contentView layoutSubtreeIfNeeded];
-        CGFloat want = w.contentView.fittingSize.height;
-        NSRect frame = w.frame;
-        CGFloat have = [w contentRectForFrameRect:frame].size.height;
-        if (fabs(want - have) < 2) continue;
-        frame.origin.y -= want - have;
-        frame.size.height += want - have;
-        [w setFrame:frame display:YES animate:NO];
+    // The setup window
+    if (self.permWindow) {
+        self.permLinkQR.image = g_perm_link_qr;
+        self.permLinkQR.toolTip = g_perm_link;
+        self.permShow.hidden = self.permRevealed;
+        self.permAuthQR.hidden = !self.permRevealed;
+        self.permKeyLabel.hidden = !self.permRevealed;
+        self.permAuthQR.image = self.permRevealed ? g_perm_auth_qr : nil;
+        self.permKeyLabel.stringValue = self.permRevealed ? g_perm_key : @"";
     }
+    fit_window(self.settingsWindow);
+    fit_window(self.permWindow);
 }
 
 - (void)showPermanent:(id)sender {
+    if (!self.permWindow) [self buildPermanentWindow];
     self.permRevealed = NO;  // every visit asks again before the key is shown
     [self refreshSettings];
+    fit_window(self.permWindow);
     [self.permWindow center];
     [self.permWindow makeKeyAndOrderFront:nil];
 }
@@ -1633,13 +1971,12 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     BOOL off = [v isEqualToString:@"off"], own = v.length > 0 && !off;
     if (self.setRelay.indexOfSelectedItem != 1 || own) [self.setRelay selectItemAtIndex:off ? 2 : own ? 1 : 0];
     BOOL ownShown = self.setRelay.indexOfSelectedItem == 1;
-    self.setRelayUrl.hidden = !ownShown;
-    if (own && ![self.setRelayUrl.stringValue isEqualToString:v] && self.window.firstResponder != self.setRelayUrl.currentEditor)
+    self.relayUrlRow.hidden = !ownShown;
+    if (own && ![self.setRelayUrl.stringValue isEqualToString:v] && self.settingsWindow.firstResponder != self.setRelayUrl.currentEditor)
         self.setRelayUrl.stringValue = v;
-    self.setRelayNote.stringValue =
-        off ? @"Only direct connections. A phone on mobile data may not reach this Mac."
-        : ownShown ? @"Your own Cloudflare Worker: it sees only sealed bytes. Press Return to use the address."
-                   : @"If a direct connection fails, the phone and this Mac meet on RDC's Cloudflare Worker. It passes sealed bytes and cannot see the screen.";
+    [self.relayRow setDetailText:off ? @"Direct connections only"
+                                 : ownShown ? (own ? @"Your Cloudflare Worker" : @"Enter its address and press Return")
+                                            : @"When a phone can't connect directly"];
 }
 
 - (void)relayChosen:(NSPopUpButton *)sender {
@@ -1651,7 +1988,7 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
         return;
     }
     rdc_set_pref_string("relay", i == 2 ? "off" : "");
-    if (g_on_action) g_on_action(g_app_ctx, RDC_ACTION_RELAY_CHANGED);
+    act(RDC_ACTION_RELAY_CHANGED);
     [self refreshSettings];
 }
 
@@ -1660,11 +1997,11 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     while ([v hasSuffix:@"/"]) v = [v substringToIndex:v.length - 1];
     if (![v hasPrefix:@"https://"] || v.length < 12 || [v substringFromIndex:8].length == 0 ||
         [[v substringFromIndex:8] rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"/?#@ "]].location != NSNotFound) {
-        self.setRelayNote.stringValue = @"That does not look like a relay address: it starts with https:// and has no path.";
+        [self.relayRow setDetailText:@"Needs https:// and no path"];
         return;
     }
     sender.stringValue = v;
-    self.setRelayNote.stringValue = @"Checking…";
+    [self.relayRow setDetailText:@"Checking…"];
     // The relay answers {"rdc_relay":1} at its root.
     NSURL *u = [NSURL URLWithString:[v stringByAppendingString:@"/"]];
     [[NSURLSession.sharedSession dataTaskWithURL:u
@@ -1672,14 +2009,14 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
                                    BOOL ok = data && [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] containsString:@"rdc_relay"];
                                    dispatch_async(dispatch_get_main_queue(), ^{
                                        if (!ok) {
-                                           self.setRelayNote.stringValue = err ? [@"Cannot reach it: " stringByAppendingString:err.localizedDescription]
-                                                                                : @"Something answers there, but it is not an RDC relay.";
+                                           [self.relayRow setDetailText:err ? [@"Can't reach it: " stringByAppendingString:err.localizedDescription]
+                                                                             : @"That is not an RDC relay"];
                                            return;
                                        }
                                        rdc_set_pref_string("relay", v.UTF8String);
-                                       if (g_on_action) g_on_action(g_app_ctx, RDC_ACTION_RELAY_CHANGED);
+                                       act(RDC_ACTION_RELAY_CHANGED);
                                        [self refreshSettings];
-                                       self.setRelayNote.stringValue = @"Your relay answers. RDC uses it from now on.";
+                                       [self.relayRow setDetailText:@"Your relay answers — in use"];
                                    });
                                }] resume];
 }
@@ -1688,14 +2025,26 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"https://github.com/ANODs/RDC/tree/main/relay#readme"]];
 }
 
-- (void)togglePermanent:(NSButton *)sender {
-    if (g_on_action) g_on_action(g_app_ctx, sender.state == NSControlStateValueOn ? RDC_ACTION_PERMANENT_ON : RDC_ACTION_PERMANENT_OFF);
+- (void)togglePermanent:(NSSwitch *)sender {
+    BOOL on = sender.state == NSControlStateValueOn;
+    // The key file is held by whichever RDC opened it first: a second copy (a build next to the
+    // installed app) cannot serve the link, and says so instead of the switch just jumping back.
+    if (on && seed_open() == -2) {
+        sender.state = NSControlStateValueOff;
+        NSAlert *alert = [NSAlert new];
+        alert.messageText = @"Another RDC on this Mac has permanent access";
+        alert.informativeText = @"Quit the other copy of RDC, then turn it on here.";
+        [alert beginSheetModalForWindow:self.settingsWindow completionHandler:nil];
+        return;
+    }
+    act(on ? RDC_ACTION_PERMANENT_ON : RDC_ACTION_PERMANENT_OFF);
 }
 
-- (void)copyPermanentLink:(id)sender {
-    if (g_perm_link.length == 0) return;
-    [NSPasteboard.generalPasteboard clearContents];
-    [NSPasteboard.generalPasteboard setString:g_perm_link forType:NSPasteboardTypeString];
+- (void)copyPermanentLink:(NSButton *)sender {
+    copy_text(g_perm_link);
+    NSString *was = sender.title;
+    sender.title = @"Copied";
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ sender.title = was; });
 }
 
 // The authenticator key is as good as the codes: it appears only for the person at this Mac —
@@ -1720,35 +2069,35 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
 - (void)resetPermanent:(id)sender {
     NSAlert *alert = [NSAlert new];
     alert.messageText = @"Make a new link and key?";
-    alert.informativeText = @"The old link and the entry in the authenticator app stop working. You will set both up again.";
-    [alert addButtonWithTitle:@"New link and key"];
+    alert.informativeText = @"The old link and the authenticator entry stop working.";
+    [alert addButtonWithTitle:@"New Link and Key"];
     [alert addButtonWithTitle:@"Cancel"];
     if ([alert runModal] != NSAlertFirstButtonReturn) return;
     self.permRevealed = NO;
-    if (g_on_action) g_on_action(g_app_ctx, RDC_ACTION_PERMANENT_RESET);
+    act(RDC_ACTION_PERMANENT_RESET);
 }
 
-- (void)toggleLogin:(NSButton *)sender {
+- (void)toggleLogin:(NSSwitch *)sender {
     autostart_set(sender.state == NSControlStateValueOn);
     [self refreshSettings];
 }
 
-- (void)toggleAwake:(NSButton *)sender {
+- (void)toggleAwake:(NSSwitch *)sender {
     int on = sender.state == NSControlStateValueOn;
     rdc_set_pref_bool("keep_awake", on);
     keep_awake(on);
 }
 
-- (void)toggleAuto:(NSButton *)sender {
-    if (g_on_action) g_on_action(g_app_ctx, sender.state == NSControlStateValueOn ? RDC_ACTION_AUTO_UPDATE_ON : RDC_ACTION_AUTO_UPDATE_OFF);
+- (void)toggleAuto:(NSSwitch *)sender {
+    act(sender.state == NSControlStateValueOn ? RDC_ACTION_AUTO_UPDATE_ON : RDC_ACTION_AUTO_UPDATE_OFF);
 }
 
 - (void)checkUpdate:(id)sender {
-    if (g_on_action) g_on_action(g_app_ctx, RDC_ACTION_CHECK_UPDATE);
+    act(RDC_ACTION_CHECK_UPDATE);
 }
 
 - (void)installUpdate:(id)sender {
-    if (g_on_action) g_on_action(g_app_ctx, RDC_ACTION_INSTALL_UPDATE);
+    act(RDC_ACTION_INSTALL_UPDATE);
 }
 @end
 
@@ -1769,8 +2118,8 @@ void rdc_app_set_permanent(int on, const char *link, const uint8_t *link_qr, int
                            const uint8_t *auth_qr, int auth_qr_size, const char *secret_text) {
     NSString *l = [NSString stringWithUTF8String:link] ?: @"";
     NSString *k = [NSString stringWithUTF8String:secret_text] ?: @"";
-    NSImage *lq = qr_image(link_qr, link_qr_size, 170);
-    NSImage *aq = qr_image(auth_qr, auth_qr_size, 190);
+    NSImage *lq = qr_image(link_qr, link_qr_size, 176);
+    NSImage *aq = qr_image(auth_qr, auth_qr_size, 176);
     dispatch_async(dispatch_get_main_queue(), ^{
         if (![g_perm_key isEqualToString:k]) g_app.permRevealed = NO;  // a new key is hidden again
         g_perm_on = on;
@@ -1789,6 +2138,8 @@ void rdc_app_run(rdc_ctx_cb on_ready, rdc_action_cb on_action, void *ctx) {
         g_app_ctx = ctx;
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        // Dark, as the viewer and the site.
+        NSApp.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
         g_app = [RDCAppDelegate new];
         NSApp.delegate = g_app;
         [NSApp run];
@@ -1800,52 +2151,65 @@ void rdc_app_set_info(const char *code, const char *link) {
     NSString *l = [NSString stringWithUTF8String:link];
     dispatch_async(dispatch_get_main_queue(), ^{
         g_app.codeLabel.stringValue = c;
-        g_app.linkLabel.stringValue = l;
         g_app.link = l;
+        [g_app.lanRow setDetailText:bare_link(l)];
     });
 }
 
+// The host says what "from anywhere" is doing in a caption; the row keeps its own title and
+// shows the link, or a word about why there is none.
 void rdc_app_set_remote(const char *caption, const char *link) {
     NSString *c = [NSString stringWithUTF8String:caption] ?: @"";
     NSString *l = [NSString stringWithUTF8String:link] ?: @"";
     dispatch_async(dispatch_get_main_queue(), ^{
         g_app.remoteLink = l;
-        g_app.remoteLabel.stringValue = l;
-        g_app.remoteCaption.stringValue = c;
-        g_app.remoteCaption.hidden = c.length == 0;
         BOOL none = l.length == 0;
-        g_app.remoteLabel.hidden = none;
-        g_app.remoteButtons.hidden = none;
+        g_app.remoteOff = [c localizedCaseInsensitiveContainsString:@"off"];
+        NSString *why = g_app.remoteOff ? @"Off" : @"Connecting…";
+        [g_app.remoteRow setDetailText:none ? why : bare_link(l)];
+        g_app.remoteCopy.hidden = none;
+        g_app.remoteOpen.hidden = none;
+        g_app.remoteRow.title.textColor = none ? NSColor.secondaryLabelColor : NSColor.labelColor;
+        [g_app refreshSettings];
     });
 }
 
+// "Connected: a, b" while someone is there; anything else means waiting.
 void rdc_app_set_status(const char *text) {
-    NSString *t = [NSString stringWithUTF8String:text];
-    dispatch_async(dispatch_get_main_queue(), ^{ g_app.statusLabel.stringValue = t; });
+    NSString *t = [NSString stringWithUTF8String:text] ?: @"";
+    dispatch_async(dispatch_get_main_queue(), ^{
+        BOOL on = [t hasPrefix:@"Connected: "];
+        g_app.connected = on;
+        g_app.peers = on ? [t substringFromIndex:11] : @"";
+        [g_app refreshMain];
+    });
 }
 
 void rdc_app_set_permissions(int screen_ok, int input_ok) {
     // Every couple of seconds from housekeeping: a good moment to look at the driver's state too.
     int media = rdc_media_status();
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSMutableArray *missing = [NSMutableArray array];
-        if (!screen_ok) [missing addObject:@"Screen Recording — without it viewers can't see the screen"];
-        if (!input_ok) [missing addObject:@"Accessibility — without it there is no remote control"];
-        g_app.permLabel.stringValue = [missing componentsJoinedByString:@"\n"];
-        g_app.permLabel.hidden = missing.count == 0;
-        g_app.screenButton.hidden = screen_ok != 0;
-        g_app.inputButton.hidden = input_ok != 0;
+        BOOL changed = g_app.screenOk != (screen_ok != 0) || g_app.inputOk != (input_ok != 0);
+        g_app.screenOk = screen_ok != 0;
+        g_app.inputOk = input_ok != 0;
         if (media != g_app.mediaStatus) [g_app refreshMedia];
+        else if (changed) [g_app refreshMain];
     });
 }
 
+// What a viewer lends right now ("Phone microphone live — <peer>"), or nothing.
 void rdc_app_set_media(const char *text) {
     NSString *t = [NSString stringWithUTF8String:text] ?: @"";
     dispatch_async(dispatch_get_main_queue(), ^{
-        g_app.mediaLabel.stringValue = t;
-        g_app.mediaLabel.hidden = t.length == 0;
-        g_app.mediaStopButton.hidden = t.length == 0;
-        [g_app fitWindow];
+        NSRange dash = [t rangeOfString:@" — "];
+        NSString *what = dash.location == NSNotFound ? t : [t substringToIndex:dash.location];
+        NSString *who = dash.location == NSNotFound ? @"" : [t substringFromIndex:NSMaxRange(dash)];
+        if ([what hasSuffix:@" live"]) what = [what substringToIndex:what.length - 5];
+        g_app.mediaRow.title.stringValue = what;
+        [g_app.mediaRow setDetailText:who];
+        g_app.mediaRow.icon.image = sym([what localizedCaseInsensitiveContainsString:@"camera"] ? @"video.fill" : @"mic.fill", 14, NSFontWeightRegular);
+        g_app.mediaGroup.hidden = t.length == 0;
+        fit_window(g_app.window);
     });
 }
 
@@ -1853,8 +2217,7 @@ void rdc_app_set_ai(int active) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (g_app.aiActive == (active != 0)) return;
         g_app.aiActive = active != 0;
-        g_app.kickButton.title = active ? @"Stop AI agent" : @"Disconnect all";
-        g_app.kickButton.bezelColor = active ? NSColor.systemRedColor : nil;
+        [g_app refreshMain];
         if (active) [NSApp requestUserAttention:NSInformationalRequest];
     });
 }

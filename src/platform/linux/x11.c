@@ -1,8 +1,9 @@
-// Linux capture and input through X11 (contract — ../platform.h): the root window of the X
-// screen grabbed with MIT-SHM (XShmGetImage; plain XGetImage without it), the cursor from XFixes
-// drawn on top, JPEG from src/core/jpeg.zig; input through XTest. libX11, libXext, libXtst and
-// libXfixes are opened with dlopen, and the few types used are declared here, so nothing X11 is
-// needed to build. Wayland: only XWayland's X11 windows can be seen and controlled this way.
+// Linux capture and input through X11 (contract — ../platform.h): one monitor of the X screen
+// (XRandR 1.5 monitors, Xinerama screens without it, else the whole root window) cut out of the
+// root window with MIT-SHM (XShmGetImage; plain XGetImage without it), the cursor from XFixes
+// drawn on top, JPEG from src/core/jpeg.zig; input through XTest in root coordinates. libX11,
+// libXext, libXtst, libXfixes, libXrandr and libXinerama are opened with dlopen, and the few
+// types used are declared here, so nothing X11 is needed to build. Wayland: only XWayland's X11 windows can be seen and controlled this way.
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
@@ -79,6 +80,25 @@ typedef struct {
 
 typedef int (*XErrorHandler)(Display *, XErrorEvent *);
 
+typedef unsigned long Atom;
+
+typedef struct {
+    Atom name;
+    Bool primary;
+    Bool automatic;
+    int noutput;
+    int x, y;
+    int width, height;
+    int mwidth, mheight;
+    XID *outputs;
+} XRRMonitorInfo;
+
+typedef struct {
+    int screen_number;
+    short x_org, y_org;
+    short width, height;
+} XineramaScreenInfo;
+
 #define ZPixmap 2
 #define AllPlanes (~0UL)
 #define NoSymbol 0UL
@@ -119,6 +139,14 @@ static struct {
     int (*TestFakeKeyEvent)(Display *, unsigned, Bool, unsigned long);
     Bool (*FixesQueryExtension)(Display *, int *, int *);
     XFixesCursorImage *(*FixesGetCursorImage)(Display *);
+    char *(*GetAtomName)(Display *, Atom);
+    int randr, xinerama;  // the monitor libraries are there
+    Bool (*RRQueryExtension)(Display *, int *, int *);
+    Status (*RRQueryVersion)(Display *, int *, int *);
+    XRRMonitorInfo *(*RRGetMonitors)(Display *, Window, Bool, int *);
+    void (*RRFreeMonitors)(XRRMonitorInfo *);
+    Bool (*XineramaIsActive)(Display *);
+    XineramaScreenInfo *(*XineramaQueryScreens)(Display *, int *);
 } X;
 
 #define LOAD(lib, field, name)                                         \
@@ -152,6 +180,7 @@ static void x11_load(void) {
     LOAD(x11, ChangeKeyboardMapping, "XChangeKeyboardMapping");
     LOAD(x11, DisplayKeycodes, "XDisplayKeycodes");
     LOAD(x11, SetErrorHandler, "XSetErrorHandler");
+    LOAD(x11, GetAtomName, "XGetAtomName");
     if (missing) {
         rlog("X11: libX11 has no %s", missing);
         return;
@@ -178,6 +207,18 @@ static void x11_load(void) {
     LOAD(xfixes, FixesQueryExtension, "XFixesQueryExtension");
     LOAD(xfixes, FixesGetCursorImage, "XFixesGetCursorImage");
     X.xfixes = !missing;
+    void *xrandr = dlopen("libXrandr.so.2", RTLD_NOW);
+    missing = NULL;
+    LOAD(xrandr, RRQueryExtension, "XRRQueryExtension");
+    LOAD(xrandr, RRQueryVersion, "XRRQueryVersion");
+    LOAD(xrandr, RRGetMonitors, "XRRGetMonitors");
+    LOAD(xrandr, RRFreeMonitors, "XRRFreeMonitors");
+    X.randr = !missing;
+    void *xinerama = dlopen("libXinerama.so.1", RTLD_NOW);
+    missing = NULL;
+    LOAD(xinerama, XineramaIsActive, "XineramaIsActive");
+    LOAD(xinerama, XineramaQueryScreens, "XineramaQueryScreens");
+    X.xinerama = !missing;
 }
 
 void lx_x11_init(void) {
@@ -189,12 +230,12 @@ int lx_x11_ready(void) { return X.ok; }
 
 // X errors on RDC's own connections are logged, not fatal (Xlib's default handler exits); the
 // others go to whoever had the handler before (GDK, which ignores displays it did not open).
-static Display *_Atomic g_cap_dpy, *_Atomic g_in_dpy;
+static Display *_Atomic g_cap_dpy, *_Atomic g_in_dpy, *_Atomic g_q_dpy;
 static XErrorHandler g_prev_handler;
 static atomic_int g_x_errors;
 
 static int on_x_error(Display *d, XErrorEvent *e) {
-    if (d == atomic_load(&g_cap_dpy) || d == atomic_load(&g_in_dpy)) {
+    if (d == atomic_load(&g_cap_dpy) || d == atomic_load(&g_in_dpy) || d == atomic_load(&g_q_dpy)) {
         if (atomic_fetch_add(&g_x_errors, 1) < 20)
             rlog("X11 error %d (request %d.%d)", e->error_code, e->request_code, e->minor_code);
         return 0;
@@ -208,6 +249,107 @@ static void install_handler(void) { g_prev_handler = X.SetErrorHandler(on_x_erro
 static int is_wayland(void) {
     const char *w = getenv("WAYLAND_DISPLAY"), *t = getenv("XDG_SESSION_TYPE");
     return (w && w[0]) || (t && strcmp(t, "wayland") == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Displays: XRandR 1.5 monitors (what `xrandr --listmonitors` shows), Xinerama screens on
+// servers without them, else the root window as one display. Ids: the monitor's name atom,
+// the Xinerama screen number + 1, or 1.
+
+static int query_monitors(Display *d, Window root, rdc_display *out, int max) {
+    int n = 0, ev, er, maj = 0, min = 0;
+    if (X.randr && X.RRQueryExtension(d, &ev, &er) && X.RRQueryVersion(d, &maj, &min) &&
+        (maj > 1 || (maj == 1 && min >= 5))) {
+        int count = 0;
+        XRRMonitorInfo *m = X.RRGetMonitors(d, root, 1, &count);
+        for (int i = 0; m && i < count && n < max; i++) {
+            if (m[i].width <= 0 || m[i].height <= 0) continue;
+            rdc_display *o = &out[n++];
+            memset(o, 0, sizeof *o);
+            o->id = (uint32_t)m[i].name ? (uint32_t)m[i].name : (uint32_t)(i + 1);
+            o->x = m[i].x;
+            o->y = m[i].y;
+            o->w = o->pw = m[i].width;
+            o->h = o->ph = m[i].height;
+            o->primary = m[i].primary ? 1 : 0;
+            char *name = m[i].name ? X.GetAtomName(d, m[i].name) : NULL;
+            snprintf(o->name, sizeof o->name, "%s", name ? name : "Monitor");
+            if (name) X.Free(name);
+        }
+        if (m) X.RRFreeMonitors(m);
+    }
+    if (n == 0 && X.xinerama && X.XineramaIsActive(d)) {
+        int count = 0;
+        XineramaScreenInfo *s = X.XineramaQueryScreens(d, &count);
+        for (int i = 0; s && i < count && n < max; i++) {
+            rdc_display *o = &out[n++];
+            memset(o, 0, sizeof *o);
+            o->id = (uint32_t)s[i].screen_number + 1;
+            o->x = s[i].x_org;
+            o->y = s[i].y_org;
+            o->w = o->pw = s[i].width;
+            o->h = o->ph = s[i].height;
+            o->primary = i == 0;
+            snprintf(o->name, sizeof o->name, "Screen %d", s[i].screen_number + 1);
+        }
+        if (s) X.Free(s);
+    }
+    if (n == 0 && max > 0) {
+        Window r;
+        int x, y;
+        unsigned w = 0, h = 0, bw, depth;
+        if (X.GetGeometry(d, root, &r, &x, &y, &w, &h, &bw, &depth) && w && h) {
+            memset(out, 0, sizeof *out);
+            out->id = 1;
+            out->w = out->pw = (int)w;
+            out->h = out->ph = (int)h;
+            out->primary = 1;
+            snprintf(out->name, sizeof out->name, "Screen");
+            n = 1;
+        }
+    }
+    int any_primary = 0;
+    for (int i = 0; i < n; i++) any_primary |= out[i].primary;
+    if (n > 0 && !any_primary) out[0].primary = 1;
+    return n;
+}
+
+// The rectangle of display id (0 or gone — the primary one) on the root window.
+static int monitor_rect(Display *d, Window root, uint32_t id, int *x, int *y, int *w, int *h) {
+    rdc_display list[RDC_MAX_DISPLAYS];
+    int n = query_monitors(d, root, list, RDC_MAX_DISPLAYS), pick = -1;
+    for (int i = 0; i < n; i++) {
+        if (id && list[i].id == id) pick = i;
+        if (pick < 0 && !id && list[i].primary) pick = i;
+    }
+    if (pick < 0) {
+        if (id || n == 0) return -1;
+        pick = 0;
+    }
+    *x = list[pick].x;
+    *y = list[pick].y;
+    *w = list[pick].w;
+    *h = list[pick].h;
+    return 0;
+}
+
+static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_q_tried;
+
+int rdc_displays(rdc_display *out, int max) {
+    pthread_mutex_lock(&g_q_lock);
+    Display *d = atomic_load(&g_q_dpy);
+    if (!d && !g_q_tried && X.ok) {
+        g_q_tried = 1;
+        d = X.OpenDisplay(NULL);
+        if (d) {
+            atomic_store(&g_q_dpy, d);
+            pthread_once(&g_handler_once, install_handler);
+        }
+    }
+    int n = d ? query_monitors(d, X.RootWindow(d, X.DefaultScreen(d)), out, max < RDC_MAX_DISPLAYS ? max : RDC_MAX_DISPLAYS) : 0;
+    pthread_mutex_unlock(&g_q_lock);
+    return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -226,12 +368,15 @@ static rdc_frame_cb g_cb;
 static void *g_cb_ctx;
 static int g_max_width = 1920;
 static uint64_t g_interval_us = 1000000 / MAX_FPS;
+// The display to capture (0 — the main one) and the one the capture thread shows now.
+static atomic_uint g_cap_want;
+static atomic_long g_cap_shown = -1;
 
 typedef struct {
     XImage *img;
     XShmSegmentInfo shm;
     int use_shm;
-    int w, h;
+    int x, y, w, h;  // the monitor's part of the root window
 } Grab;
 
 static void grab_close(Display *d, Grab *g) {
@@ -243,8 +388,10 @@ static void grab_close(Display *d, Grab *g) {
     memset(g, 0, sizeof *g);
 }
 
-static int grab_open(Display *d, int scr, Window root, int w, int h, Grab *g) {
+static int grab_open(Display *d, int scr, Window root, int x, int y, int w, int h, Grab *g) {
     memset(g, 0, sizeof *g);
+    g->x = x;
+    g->y = y;
     g->w = w;
     g->h = h;
     if (!X.shm || !X.ShmQueryExtension(d)) return 0;  // XGetImage every frame instead
@@ -283,11 +430,11 @@ static int grab_open(Display *d, int scr, Window root, int w, int h, Grab *g) {
 static const uint8_t *grab(Display *d, Window root, Grab *g, int *stride, XImage **tmp) {
     *tmp = NULL;
     if (g->use_shm) {
-        if (!X.ShmGetImage(d, root, g->img, 0, 0, AllPlanes)) return NULL;
+        if (!X.ShmGetImage(d, root, g->img, g->x, g->y, AllPlanes)) return NULL;
         *stride = g->img->bytes_per_line;
         return (const uint8_t *)g->img->data;
     }
-    XImage *img = X.GetImage(d, root, 0, 0, (unsigned)g->w, (unsigned)g->h, AllPlanes, ZPixmap);
+    XImage *img = X.GetImage(d, root, g->x, g->y, (unsigned)g->w, (unsigned)g->h, AllPlanes, ZPixmap);
     if (!img) return NULL;
     *tmp = img;
     *stride = img->bytes_per_line;
@@ -309,8 +456,9 @@ static int pixel_layout(XImage *img, int *rgbx) {
 }
 
 // The cursor is not in the root window's pixels: XFixes gives its image, drawn on top here.
-static void draw_cursor(uint8_t *px, int w, int h, int stride, int rgbx, const XFixesCursorImage *ci) {
-    int x0 = ci->x - ci->xhot, y0 = ci->y - ci->yhot;
+// (ox, oy) — where the picture starts on the root window.
+static void draw_cursor(uint8_t *px, int ox, int oy, int w, int h, int stride, int rgbx, const XFixesCursorImage *ci) {
+    int x0 = ci->x - ci->xhot - ox, y0 = ci->y - ci->yhot - oy;
     for (int cy = 0; cy < ci->height; cy++) {
         int y = y0 + cy;
         if (y < 0 || y >= h) continue;
@@ -372,11 +520,14 @@ static void *capture_main(void *arg) {
     int gx, gy;
     unsigned gw = 0, gh = 0, bw, depth;
     X.GetGeometry(d, root, &r_root, &gx, &gy, &gw, &gh, &bw, &depth);
+    long shown = (long)atomic_load(&g_cap_want);
+    int mx = 0, my = 0, mw = (int)gw, mh = (int)gh;
+    if (monitor_rect(d, root, (uint32_t)shown, &mx, &my, &mw, &mh) != 0) monitor_rect(d, root, 0, &mx, &my, &mw, &mh);
     Grab g;
-    grab_open(d, scr, root, (int)gw, (int)gh, &g);
+    grab_open(d, scr, root, mx, my, mw, mh, &g);
     int stride = 0, rgbx = 0;
     XImage *tmp = NULL;
-    const uint8_t *px = gw && gh ? grab(d, root, &g, &stride, &tmp) : NULL;
+    const uint8_t *px = mw > 0 && mh > 0 ? grab(d, root, &g, &stride, &tmp) : NULL;
     XImage *probe = g.use_shm ? g.img : tmp;
     if (!px || !probe || pixel_layout(probe, &rgbx) != 0) {
         if (probe)
@@ -399,7 +550,9 @@ static void *capture_main(void *arg) {
         cap_ready(-1);
         return NULL;
     }
-    rlog("capture: X11%s, %ux%u%s", g.use_shm ? " (MIT-SHM)" : "", gw, gh, have_fixes ? "" : ", no cursor (no XFixes)");
+    rlog("capture: X11%s, %dx%d at (%d, %d) of %ux%u%s", g.use_shm ? " (MIT-SHM)" : "", mw, mh, mx, my, gw, gh,
+         have_fixes ? "" : ", no cursor (no XFixes)");
+    atomic_store(&g_cap_shown, shown);
     cap_ready(0);
 
     uint8_t *prev = NULL, *work = NULL;  // the last picture without the cursor; the one being sent
@@ -415,16 +568,23 @@ static void *capture_main(void *arg) {
             now = rdc_now_us();
         }
         next = next + g_interval_us > now ? next + g_interval_us : now + g_interval_us;
-        // The screen changes size (xrandr, a resized VM window): start over at the new size.
-        if (now - last_geometry > 1000000) {
+        // Another display asked for (rdc_capture_display waits for this), or the monitor changed
+        // (xrandr, a resized VM window), checked every second: start over at its place and size.
+        long asked = (long)atomic_load(&g_cap_want);
+        if (asked != shown || now - last_geometry > 1000000) {
             last_geometry = now;
-            unsigned nw = 0, nh = 0;
-            if (X.GetGeometry(d, root, &r_root, &gx, &gy, &nw, &nh, &bw, &depth) && nw && nh &&
-                ((int)nw != g.w || (int)nh != g.h)) {
-                rlog("capture: the screen is now %ux%u", nw, nh);
+            int nx, ny, nw, nh;
+            if (monitor_rect(d, root, (uint32_t)asked, &nx, &ny, &nw, &nh) == 0 &&
+                (nx != g.x || ny != g.y || nw != g.w || nh != g.h)) {
+                rlog("capture: display %ld, %dx%d at (%d, %d)", asked, nw, nh, nx, ny);
                 grab_close(d, &g);
-                grab_open(d, scr, root, (int)nw, (int)nh, &g);
+                grab_open(d, scr, root, nx, ny, nw, nh, &g);
                 have_prev = 0;
+            }
+            if (asked != shown) {
+                shown = asked;
+                atomic_store(&g_cap_shown, shown);
+                atomic_store(&g_force_key, 1);
             }
         }
         if (!atomic_load(&g_want_jpeg)) continue;
@@ -465,7 +625,7 @@ static void *capture_main(void *arg) {
         }
         memcpy(work, prev, len);
         if (ci) {
-            draw_cursor(work, g.w, g.h, stride, rgbx, ci);
+            draw_cursor(work, g.x, g.y, g.w, g.h, stride, rgbx, ci);
             X.Free(ci);
         }
         int out_w = g.w, out_h = g.h;
@@ -520,11 +680,26 @@ int rdc_capture_start(int max_width, int fps, rdc_frame_cb cb, void *ctx) {
     return 0;
 }
 
+int rdc_capture_display(uint32_t id) {
+    if (id) {
+        rdc_display list[RDC_MAX_DISPLAYS];
+        int n = rdc_displays(list, RDC_MAX_DISPLAYS), found = 0;
+        for (int i = 0; i < n; i++) found |= list[i].id == id;
+        if (!found) return -1;
+    }
+    atomic_store(&g_cap_want, id);
+    if (!g_cap_started) return 0;
+    // The capture thread takes it before its next frame; frames after that are the new display's.
+    for (int i = 0; i < 300 && atomic_load(&g_cap_shown) != (long)id; i++) sleep_us(5000);
+    return atomic_load(&g_cap_shown) == (long)id ? 0 : -5;
+}
+
 void rdc_capture_stop(void) {
     if (!g_cap_started) return;
     atomic_store(&g_cap_run, 0);
     pthread_join(g_cap_thread, NULL);
     g_cap_started = 0;
+    atomic_store(&g_cap_shown, -1);
     rlog("capture stopped");
 }
 
@@ -584,11 +759,12 @@ static Display *in_display(void) {
     return g_in;
 }
 
-static double clamp01(double v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
-
-static void move_locked(Display *d, double nx, double ny) {
-    int x = (int)(clamp01(nx) * (g_in_w - 1) + 0.5), y = (int)(clamp01(ny) * (g_in_h - 1) + 0.5);
-    X.TestFakeMotionEvent(d, g_in_scr, x, y, 0);
+// Desktop coordinates are root-window pixels.
+static void move_locked(Display *d, double x, double y) {
+    int ix = (int)(x + 0.5), iy = (int)(y + 0.5);
+    ix = ix < 0 ? 0 : ix > g_in_w - 1 ? g_in_w - 1 : ix;
+    iy = iy < 0 ? 0 : iy > g_in_h - 1 ? g_in_h - 1 : iy;
+    X.TestFakeMotionEvent(d, g_in_scr, ix, iy, 0);
 }
 
 void rdc_mouse_move(double nx, double ny) {
@@ -748,16 +924,17 @@ void rdc_text(const char *utf8, size_t len) {
     pthread_mutex_unlock(&g_in_lock);
 }
 
-void rdc_cursor_pos(double *nx, double *ny) {
-    *nx = *ny = 0.5;
+void rdc_cursor_pos(double *x, double *y) {
     pthread_mutex_lock(&g_in_lock);
     Display *d = in_display();
     Window r, child;
     int rx, ry, wx, wy;
     unsigned mask;
+    *x = (g_in_w - 1) / 2.0;
+    *y = (g_in_h - 1) / 2.0;
     if (d && X.QueryPointer(d, g_in_root, &r, &child, &rx, &ry, &wx, &wy, &mask)) {
-        *nx = g_in_w > 1 ? clamp01((double)rx / (g_in_w - 1)) : 0.5;
-        *ny = g_in_h > 1 ? clamp01((double)ry / (g_in_h - 1)) : 0.5;
+        *x = rx;
+        *y = ry;
     }
     pthread_mutex_unlock(&g_in_lock);
 }

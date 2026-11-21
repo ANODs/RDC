@@ -86,6 +86,8 @@ const Device = struct {
     /// Size of the latest full screenshot: the agent's coordinate space for this computer.
     shot_w: u32 = 0,
     shot_h: u32 = 0,
+    /// The display the latest full screenshot shows (0 — the host does not say).
+    shot_display: u32 = 0,
 
     fn name(d: *const Device) []const u8 {
         return d.name_buf[0..d.name_len];
@@ -133,7 +135,7 @@ pub const Tools = struct {
             .{ "connect", connect },       .{ "devices", listDevices }, .{ "disconnect", disconnect },
             .{ "screenshot", screenshot }, .{ "click", click },         .{ "move", movePointer },
             .{ "drag", drag },             .{ "scroll", scroll },       .{ "type", typeText },
-            .{ "key", pressKeys },         .{ "wait", wait },
+            .{ "key", pressKeys },         .{ "wait", wait },           .{ "display", showDisplay },
         };
         inline for (handlers) |h| {
             if (std.mem.eql(u8, name, h[0])) {
@@ -196,7 +198,7 @@ pub const Tools = struct {
         var target: client.Target = undefined;
         if (args.str("link")) |link| {
             target = client.parseLink(link) orelse
-                return res.fail("Not an RDC link: {s}. It looks like http://192.168.1.20:7700/#123456789 (this network) or https://anods.github.io/RDC/#123456789-<key> (from anywhere) and comes from \"Copy link\" in the RDC window on that computer.", .{link});
+                return res.fail("Not an RDC link: {s}. It looks like http://192.168.1.20:7700/#123456789 (this network) or https://rdc.timoshkin.dev/#123456789-<key> (from anywhere) and comes from \"Copy link\" in the RDC window on that computer.", .{link});
         } else if (args.str("address")) |addr| {
             target = client.parseAddress(addr) orelse return res.fail("Not a valid address: {s}", .{addr});
             target.code = args.str("code") orelse return res.fail("Pass the 9-digit code from the RDC window along with the address.", .{});
@@ -304,6 +306,13 @@ pub const Tools = struct {
                     d.session.frame_w,
                     d.session.frame_h,
                 });
+                const st = d.session.displayState();
+                if (st.count > 1) {
+                    res.say("  {d} displays; the picture shows the one the pointer is on, or pick one with the display tool:", .{st.count});
+                    for (st.list[0..st.count], 0..) |*x, k| {
+                        res.say("  display {d}: {s}, {d}×{d}{s}{s}", .{ k + 1, x.name(), x.pw, x.ph, if (x.primary) ", main" else "", if (st.shown == k) " — shown now" else "" });
+                    }
+                }
             }
         }
         if (!any) res.say("No computers connected. Use connect with the link from the RDC window.", .{});
@@ -364,11 +373,18 @@ pub const Tools = struct {
             d.shot_w = @intCast(out_w);
             d.shot_h = @intCast(out_h);
             const cur = d.session.cursor();
-            res.say("Screenshot of {s}, {d}×{d} (the screen is {d}×{d}). Pointer at ({d}, {d}).", .{
-                d.name(),                                                         out_w,
-                out_h,                                                            d.session.frame_w,
-                d.session.frame_h,                                                @as(i32, @intFromFloat(cur[0] * @as(f64, @floatFromInt(out_w)))),
-                @as(i32, @intFromFloat(cur[1] * @as(f64, @floatFromInt(out_h)))),
+            const st = d.session.displayState();
+            d.shot_display = if (st.shown) |k| st.list[k].id else 0;
+            var where_buf: [120]u8 = undefined;
+            const where: []const u8 = if (st.count > 1 and st.shown != null)
+                std.fmt.bufPrint(&where_buf, ", display {d} of {d} ({s})", .{ st.shown.? + 1, st.count, st.list[st.shown.?].name() }) catch ""
+            else
+                "";
+            res.say("Screenshot of {s}{s}, {d}×{d} (the screen is {d}×{d}). Pointer at ({d}, {d}).", .{
+                d.name(),                                                         where,
+                out_w,                                                            out_h,
+                d.session.frame_w,                                                d.session.frame_h,
+                @as(i32, @intFromFloat(cur[0] * @as(f64, @floatFromInt(out_w)))), @as(i32, @intFromFloat(cur[1] * @as(f64, @floatFromInt(out_h)))),
             });
         }
         res.image(copy);
@@ -406,10 +422,22 @@ pub const Tools = struct {
     const Point = struct { nx: f32, ny: f32, px: i32, py: i32 };
 
     /// Screenshot pixels → the host's 0..1 space. The pixel centre, so (0,0) is the corner pixel.
-    fn point(d: *Device, x: f64, y: f64, res: *Result) ?Point {
+    fn point(t: *Tools, d: *Device, x: f64, y: f64, res: *Result) ?Point {
         if (d.shot_w == 0 or d.shot_h == 0) {
             res.fail("Take a screenshot first so there is a coordinate space.", .{});
             return null;
+        }
+        // The picture followed the pointer onto another display since the last screenshot: the
+        // coordinates were read off a display that is no longer shown.
+        const st = d.session.displayState();
+        if (st.count > 1 and d.shot_display != 0) {
+            if (st.shown) |k| {
+                if (st.list[k].id != d.shot_display) {
+                    res.fail("The picture of {s} switched to display {d} of {d} ({s}) since your last screenshot — the pointer went there. Nothing was done; here is that display, act on its coordinates (or call display to go back).", .{ d.name(), k + 1, st.count, st.list[k].name() });
+                    t.shoot(d, null, res);
+                    return null;
+                }
+            }
         }
         const w: f64 = @floatFromInt(d.shot_w);
         const h: f64 = @floatFromInt(d.shot_h);
@@ -482,7 +510,7 @@ pub const Tools = struct {
         const d = t.pick(args, res) orelse return;
         if (!t.alive(d, res)) return;
         const c = xy(args, res, "x", "y") orelse return;
-        const p = point(d, c[0], c[1], res) orelse return;
+        const p = t.point(d, c[0], c[1], res) orelse return;
         const since = d.session.frameSeq();
         d.session.move(p.nx, p.ny) catch return t.lost(d, res);
         res.say("Moved the pointer to ({d}, {d}) on {s}.", .{ p.px, p.py, d.name() });
@@ -493,7 +521,7 @@ pub const Tools = struct {
         const d = t.pick(args, res) orelse return;
         if (!t.alive(d, res)) return;
         const c = xy(args, res, "x", "y") orelse return;
-        const p = point(d, c[0], c[1], res) orelse return;
+        const p = t.point(d, c[0], c[1], res) orelse return;
         const btn = buttonCode(args, res) orelse return;
         const mods = modifiers(args, res) orelse return;
         var count: u32 = @intFromFloat(@max(1, @min(3, args.num("count") orelse 1)));
@@ -527,8 +555,8 @@ pub const Tools = struct {
         if (!t.alive(d, res)) return;
         const from = xy(args, res, "from_x", "from_y") orelse return;
         const to = xy(args, res, "to_x", "to_y") orelse return;
-        const a = point(d, from[0], from[1], res) orelse return;
-        const b = point(d, to[0], to[1], res) orelse return;
+        const a = t.point(d, from[0], from[1], res) orelse return;
+        const b = t.point(d, to[0], to[1], res) orelse return;
         const btn = buttonCode(args, res) orelse return;
         const mods = modifiers(args, res) orelse return;
         const s = d.session;
@@ -565,7 +593,7 @@ pub const Tools = struct {
         var at: ?Point = null;
         if (args.num("x") != null or args.num("y") != null) {
             const c = xy(args, res, "x", "y") orelse return;
-            at = point(d, c[0], c[1], res) orelse return;
+            at = t.point(d, c[0], c[1], res) orelse return;
         }
         var dx: f32 = @floatCast(args.num("right") orelse 0);
         var dy: f32 = @floatCast(args.num("down") orelse 0);
@@ -697,6 +725,32 @@ pub const Tools = struct {
         t.shoot(d, null, res);
     }
 
+    // ------------------------------------------------------------ displays
+
+    fn showDisplay(t: *Tools, args: Args, res: *Result) void {
+        const d = t.pick(args, res) orelse return;
+        if (!t.alive(d, res)) return;
+        const st = d.session.displayState();
+        if (st.count == 0) return res.fail("{s} does not report its displays: RDC there is older and shows the main display only.", .{d.name()});
+        const want = args.num("display") orelse return res.fail("display is required: a number from 1 to {d} (devices lists them).", .{st.count});
+        const k_f = @round(want) - 1;
+        if (!(k_f >= 0 and k_f < @as(f64, @floatFromInt(st.count)))) {
+            if (st.count == 1) return res.fail("{s} has one display.", .{d.name()});
+            return res.fail("{s} has {d} displays: pass display 1 to {d}.", .{ d.name(), st.count, st.count });
+        }
+        const k: usize = @intFromFloat(k_f);
+        const target = st.list[k];
+        if (st.shown != k) {
+            d.session.chooseDisplay(target.id) catch return t.lost(d, res);
+            if (!d.session.waitDisplay(target.id, 5000)) {
+                if (!t.alive(d, res)) return;
+                return res.fail("{s} did not switch to display {d}.", .{ d.name(), k + 1 });
+            }
+        }
+        res.say("Showing display {d} of {d} on {s}: {s}, {d}×{d}. The pointer is in its middle; coordinates are pixels of the screenshot below.", .{ k + 1, st.count, d.name(), target.name(), target.pw, target.ph });
+        t.shoot(d, null, res);
+    }
+
     fn lost(t: *Tools, d: *Device, res: *Result) void {
         if (t.alive(d, res)) {
             res.fail("Could not send the action to {s}.", .{d.name()});
@@ -734,8 +788,8 @@ fn countKept(comptime text: []const u8) usize {
 
 const definitions_source =
     \\[
-    \\{"name":"connect","title":"Connect to a computer","description":"Connect to a computer that runs RDC. Ask the user for a link from the RDC window on that computer: the one for this network (http://<ip>:7700/#<9-digit code>), the one from anywhere (https://anods.github.io/RDC/#<code>-<key>, works across networks through RDC's relay), or a permanent link (…#my-<key>), which also needs the current 6-digit code from the user's authenticator app in code. Or pass an address and the 9-digit code. On success you get a screenshot and the computer becomes the current device. Up to 4 computers at once.","inputSchema":{"type":"object","properties":{"link":{"type":"string","description":"A link from the RDC window: http://192.168.1.20:7700/#123456789, https://anods.github.io/RDC/#123456789-<key> or https://anods.github.io/RDC/#my-<key>"},"address":{"type":"string","description":"Host or IP with optional port (default 7700), when there is no link"},"code":{"type":"string","description":"With address: the 9-digit code from the RDC window. With a permanent link: the current 6-digit code from the authenticator app"},"name":{"type":"string","description":"Optional short name for this computer in later calls"}}},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true}},
-    \\{"name":"devices","title":"List connected computers","description":"Which computers are connected, their names, OS and screen size. The current device gets every call that does not name one.","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+    \\{"name":"connect","title":"Connect to a computer","description":"Connect to a computer that runs RDC. Ask the user for a link from the RDC window on that computer: the one for this network (http://<ip>:7700/#<9-digit code>), the one from anywhere (https://rdc.timoshkin.dev/#<code>-<key>, works across networks through RDC's relay), or a permanent link (…#my-<key>), which also needs the current 6-digit code from the user's authenticator app in code. Or pass an address and the 9-digit code. On success you get a screenshot and the computer becomes the current device. Up to 4 computers at once.","inputSchema":{"type":"object","properties":{"link":{"type":"string","description":"A link from the RDC window: http://192.168.1.20:7700/#123456789, https://rdc.timoshkin.dev/#123456789-<key> or https://rdc.timoshkin.dev/#my-<key>"},"address":{"type":"string","description":"Host or IP with optional port (default 7700), when there is no link"},"code":{"type":"string","description":"With address: the 9-digit code from the RDC window. With a permanent link: the current 6-digit code from the authenticator app"},"name":{"type":"string","description":"Optional short name for this computer in later calls"}}},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true}},
+    \\{"name":"devices","title":"List connected computers","description":"Which computers are connected, their names, OS, screen size and displays. The current device gets every call that does not name one.","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
     \\{"name":"disconnect","title":"Disconnect","description":"End the session with a computer.","inputSchema":{"type":"object","properties":{"device":{"type":"string","description":"Name from devices; default: the current device"}}},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
     \\{"name":"screenshot","title":"Screenshot","description":"The current screen of the computer. Coordinates of every other tool are pixels of this picture. Pass region to zoom into part of it for small text; the zoomed picture does not change the coordinate space.","inputSchema":{"type":"object","properties":{"device":{"type":"string"},"region":{"type":"object","description":"Part of the screenshot to enlarge","properties":{"x":{"type":"number"},"y":{"type":"number"},"width":{"type":"number"},"height":{"type":"number"}},"required":["x","y","width","height"]}}},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
     \\{"name":"click","title":"Click","description":"Move the pointer to (x, y) in screenshot pixels and click. Returns a screenshot taken after the screen settled.","inputSchema":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"},"button":{"type":"string","enum":["left","right","middle"],"default":"left"},"count":{"type":"integer","description":"1 (default), 2 for a double click, 3 for a triple click","minimum":1,"maximum":3},"modifiers":{"type":"string","description":"Keys held during the click, e.g. shift or ctrl+alt"},"device":{"type":"string"}},"required":["x","y"]},"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
@@ -744,11 +798,12 @@ const definitions_source =
     \\{"name":"scroll","title":"Scroll","description":"Turn the mouse wheel. Give a direction and an amount in notches (3 is about a screenful third), optionally at a point.","inputSchema":{"type":"object","properties":{"direction":{"type":"string","enum":["up","down","left","right"]},"amount":{"type":"number","description":"Wheel notches, default 3"},"x":{"type":"number","description":"Point to scroll at; default: where the pointer is"},"y":{"type":"number"},"device":{"type":"string"}},"required":["direction"]},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},
     \\{"name":"type","title":"Type text","description":"Type text into the focused field, any language. Click the field first. Set enter to press Enter afterwards.","inputSchema":{"type":"object","properties":{"text":{"type":"string"},"enter":{"type":"boolean","default":false},"device":{"type":"string"}},"required":["text"]},"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
     \\{"name":"key","title":"Press keys","description":"Press keys and shortcuts in order, separated by spaces: \"enter\", \"ctrl+s\", \"cmd+space\", \"alt+tab\", \"down down enter\", \"shift+tab\". Names: letters, digits, f1-f24, enter, tab, esc, space, backspace, delete, insert, home, end, pageup, pagedown, up, down, left, right, printscreen, menu; modifiers ctrl, shift, alt (option), cmd (win, meta).","inputSchema":{"type":"object","properties":{"keys":{"type":"string"},"repeat":{"type":"integer","description":"Repeat the whole sequence this many times","minimum":1,"maximum":50},"device":{"type":"string"}},"required":["keys"]},"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
+    \\{"name":"display","title":"Show another display","description":"For a computer with several displays (devices lists them): show display number N, 1-based. The pointer moves to the middle of that display and you get its screenshot. The picture also follows the pointer by itself, so after a drag onto another display the next screenshot shows that display.","inputSchema":{"type":"object","properties":{"display":{"type":"integer","minimum":1,"description":"Display number from devices, 1-based"},"device":{"type":"string"}},"required":["display"]},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
     \\{"name":"wait","title":"Wait","description":"Wait for the screen to change (a page loading, an app starting), then screenshot.","inputSchema":{"type":"object","properties":{"seconds":{"type":"number","default":1,"minimum":0.1,"maximum":30},"device":{"type":"string"}}},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}
     \\]
 ;
 
 /// What the model is told about this server.
 pub const instructions =
-    \\RDC lets you see and control other computers. Each computer runs RDC, which shows a 9-digit code and links; the person at that computer gives you one. A link from anywhere (https://anods.github.io/RDC/#<code>-<key>) works across networks; a permanent link (#my-<key>) also needs the current 6-digit authenticator code from the user. Workflow: connect(link) → look at the screenshot → act with click, type, key, scroll, drag (coordinates are pixels of the latest screenshot) → every action returns a new screenshot, read it before the next step. Use screenshot with a region to read small text. The person at the computer sees that an AI agent is connected and can stop you at any time; if a call says the connection ended, ask them for a fresh link. Be careful with irreversible actions: confirm with the user before deleting, sending or paying.
+    \\RDC lets you see and control other computers. Each computer runs RDC, which shows a 9-digit code and links; the person at that computer gives you one. A link from anywhere (https://rdc.timoshkin.dev/#<code>-<key>) works across networks; a permanent link (#my-<key>) also needs the current 6-digit authenticator code from the user. Workflow: connect(link) → look at the screenshot → act with click, type, key, scroll, drag (coordinates are pixels of the latest screenshot) → every action returns a new screenshot, read it before the next step. Use screenshot with a region to read small text. A computer with several displays shows one at a time — the one its pointer is on; screenshots say which ("display 2 of 3"), and display switches between them. The person at the computer sees that an AI agent is connected and can stop you at any time; if a call says the connection ended, ask them for a fresh link. Be careful with irreversible actions: confirm with the user before deleting, sending or paying.
 ;

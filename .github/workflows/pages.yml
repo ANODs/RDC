@@ -1,17 +1,25 @@
 name: Pages
 
-# Publishes the browser viewer (web/) at https://anods.github.io/RDC/ after every push to main
-# that changes it, or by hand (Run workflow).
+# Publishes the site at https://anods.github.io/RDC/ (and, through site/worker, at
+# https://rdc.timoshkin.dev): the browser viewer (web/) at the root and the landing page (site/)
+# under /en/, /ru/ and /zh/, put together by tools/site.py.
+# It runs when either changes, after every release (so the download buttons point at the new
+# files), once a day (so the download counter moves) and by hand (Run workflow).
 # One-time setup on GitHub: Settings → Pages → Build and deployment → Source: GitHub Actions.
 # Until then the deploy is skipped with a notice instead of failing.
-# The page reaches a computer by the link from anywhere in its RDC window (#<code>-<key>):
+# The viewer reaches a computer by the link from anywhere in its RDC window (#<code>-<key>):
 # it finds the computer through public MQTT brokers and connects over WebRTC (docs/PLAN.md,
 # section 6). viewer.js is loaded by a relative path, so the page works under /RDC/.
 
 on:
   push:
     branches: [main]
-    paths: ['web/**', '.github/workflows/pages.yml']
+    paths: ['web/**', 'site/src/**', 'site/i18n/**', 'site/site.json', 'tools/site.py', 'build.zig.zon', '.github/workflows/pages.yml']
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  schedule:
+    - cron: '23 4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -49,7 +57,7 @@ jobs:
           esac
 
   deploy:
-    name: Deploy web/
+    name: Build and deploy
     needs: check
     if: needs.check.outputs.enabled == 'true'
     runs-on: ubuntu-latest
@@ -59,9 +67,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/configure-pages@v6
+      - name: Build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tools/site.py
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: web
+          path: _site
       # GitHub sometimes lists a just-uploaded artifact only a little later ("No artifacts named
       # github-pages were found"): one more try after a pause.
       - id: deployment
