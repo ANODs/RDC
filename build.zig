@@ -11,9 +11,21 @@ const zon: struct {
 
 const mic_c_flags = [_][]const u8{ "-std=c11", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-four-char-constants", "-Wno-multichar" };
 
+/// The macOS SDK's frameworks, headers and libraries for a module. Zig finds them by itself only
+/// for the native target, and ours names macOS 14.4 as the minimum (see `build`).
+fn useMacSdk(b: *std.Build, m: *std.Build.Module) void {
+    const t = m.resolved_target orelse return;
+    if (t.result.os.tag != .macos or b.graph.host.result.os.tag != .macos) return;
+    const sdk = std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &t.result) orelse return;
+    m.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+    m.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
+    m.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
+}
+
 /// RDCMicrophone.driver at `dir` under the install prefix: the plug-in's binary and Info.plist.
 fn micDriver(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, sanitize: std.zig.SanitizeC, dir: []const u8) [2]*std.Build.Step {
     const mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .sanitize_c = sanitize });
+    useMacSdk(b, mod);
     mod.addCSourceFile(.{ .file = b.path("src/platform/macos/mic_driver.c"), .flags = &mic_c_flags });
     mod.linkFramework("CoreAudio", .{});
     mod.linkFramework("CoreFoundation", .{});
@@ -24,7 +36,14 @@ fn micDriver(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 }
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // On a Mac the default target is this Mac with macOS 14.4 as the minimum (Info.plist says the
+    // same): left to itself Zig takes the build machine's own version, and a release built on a
+    // newer CI runner then refuses to open on any older macOS ("cannot be used with this version").
+    const host = b.graph.host.result;
+    const target = b.standardTargetOptions(.{ .default_target = if (host.os.tag == .macos)
+        .{ .cpu_arch = host.cpu.arch, .os_tag = .macos, .os_version_min = .{ .semver = .{ .major = 14, .minor = 4, .patch = 0 } } }
+    else
+        .{} });
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "RDC version (default: from build.zig.zon)") orelse zon.version;
     const os = target.result.os.tag;
@@ -57,6 +76,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "web", .module = web }},
     });
     root.addOptions("build_options", options);
+    useMacSdk(b, root);
     root.addIncludePath(b.path("src/platform"));
     if (os == .windows) {
         root.addCSourceFile(.{
@@ -226,6 +246,7 @@ pub fn build(b: *std.Build) void {
         const check_driver = "mic-check/RDCMicrophone.driver";
         const check_steps = micDriver(b, target, .Debug, .full, check_driver);
         const mic_test_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+        useMacSdk(b, mic_test_mod);
         mic_test_mod.addCSourceFile(.{ .file = b.path("src/platform/macos/mic_test.c"), .flags = &mic_c_flags });
         mic_test_mod.linkFramework("CoreAudio", .{});
         mic_test_mod.linkFramework("CoreFoundation", .{});
