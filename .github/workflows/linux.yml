@@ -36,7 +36,7 @@ jobs:
       - name: Install Xvfb and tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils x11-xserver-utils xdotool libxtst6 libxfixes3 libxext6 libxrandr2
+          sudo apt-get install -y xvfb x11-utils x11-xserver-utils xdotool libxtst6 libxfixes3 libxext6 libxrandr2 libxinerama1
           sudo apt-get install -y libgtk-3-0t64 || sudo apt-get install -y libgtk-3-0
       - name: Host without a window
         run: |
@@ -50,15 +50,13 @@ jobs:
           grep -q "capture: X11 (MIT-SHM)" host.log || { echo "::error::capture did not use MIT-SHM"; exit 1; }
       - name: Two monitors
         run: |
-          # One 2560×800 X screen split into two XRandR monitors; the host shows one at a time.
-          Xvfb :98 -screen 0 2560x800x24 -nolisten tcp &
+          # Two 1280×800 screens joined by Xinerama into one 2560×800 desktop (Xvfb does not split
+          # one screen with xrandr --setmonitor); the host shows one at a time. Xvfb turns RandR off
+          # with Xinerama, so this also checks the host's Xinerama path.
+          Xvfb :98 +xinerama -screen 0 1280x800x24 -screen 1 1280x800x24 -nolisten tcp &
           export DISPLAY=:98
           for i in $(seq 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.2; done
-          # The left monitor takes the screen's output, so its automatic whole-screen monitor goes away.
-          out=$(xrandr | awk '/ connected/ {print $1; exit}')
-          xrandr --setmonitor LEFT 1280/338x800/211+0+0 "${out:-screen}"
-          xrandr --setmonitor RIGHT 1280/338x800/211+1280+0 none
-          xrandr --listmonitors
+          xdpyinfo -ext XINERAMA | grep -A3 -i xinerama || true
           zig-out/package/rdc-linux-x86_64 host --no-ui --no-remote --port 7810 > displays.log 2>&1 &
           python3 src/platform/linux/ci_smoke.py displays.log displays --displays
       - name: Host with its window
