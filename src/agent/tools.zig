@@ -196,17 +196,28 @@ pub const Tools = struct {
         var target: client.Target = undefined;
         if (args.str("link")) |link| {
             target = client.parseLink(link) orelse
-                return res.fail("Not an RDC link: {s}. It looks like http://192.168.1.20:7700/#123456789 and comes from \"Copy link\" in the RDC window on that computer.", .{link});
+                return res.fail("Not an RDC link: {s}. It looks like http://192.168.1.20:7700/#123456789 (this network) or https://anods.github.io/RDC/#123456789-<key> (from anywhere) and comes from \"Copy link\" in the RDC window on that computer.", .{link});
         } else if (args.str("address")) |addr| {
             target = client.parseAddress(addr) orelse return res.fail("Not a valid address: {s}", .{addr});
             target.code = args.str("code") orelse return res.fail("Pass the 9-digit code from the RDC window along with the address.", .{});
         } else return res.fail("Pass link (from the RDC window on that computer), or address and code.", .{});
 
-        var digits: usize = 0;
-        for (target.code) |c| {
-            if (std.ascii.isDigit(c)) digits += 1;
+        if (target.permanent()) {
+            // The permanent link asks for the current code of the authenticator app.
+            target.otp = args.str("code") orelse
+                return res.fail("This is a permanent link: it needs the current 6-digit code from the authenticator app on the user's phone. Ask the user for it and call connect again with code.", .{});
+            var n: usize = 0;
+            for (target.otp) |c| {
+                if (std.ascii.isDigit(c)) n += 1;
+            }
+            if (n != 6) return res.fail("The authenticator code has 6 digits, got \"{s}\".", .{target.otp});
+        } else {
+            var digits: usize = 0;
+            for (target.code) |c| {
+                if (std.ascii.isDigit(c)) digits += 1;
+            }
+            if (digits != 9) return res.fail("The code has 9 digits, got \"{s}\".", .{target.code});
         }
-        if (digits != 9) return res.fail("The code has 9 digits, got \"{s}\".", .{target.code});
 
         const slot = for (t.devices, 0..) |d, i| {
             if (d == null) break i;
@@ -214,11 +225,19 @@ pub const Tools = struct {
 
         var failure: client.Failure = .{};
         const session = client.connect(t.gpa, t.io, target, t.agent_buf[0..t.agent_len], &failure) catch |e| switch (e) {
-            error.Rejected => return res.fail("{s}:{d} refused: {s}", .{ target.host, target.port, failure.text() }),
+            error.Rejected => if (target.remote())
+                return res.fail("The computer refused: {s}", .{failure.text()})
+            else
+                return res.fail("{s}:{d} refused: {s}", .{ target.host, target.port, failure.text() }),
+            error.NotFound => return res.fail("The computer did not answer through the public servers. RDC must be running there (0.6.2 or newer for an AI agent from anywhere) and connected to the internet; a link becomes invalid after \"New code\".", .{}),
+            error.NoRelay => return res.fail("Could not meet the computer on its relay{s}{s}. Check this machine's internet connection; on that computer the relay must not be off in RDC's Settings.", .{ if (failure.len > 0) ": " else "", failure.text() }),
             error.BadAddress => return res.fail("Cannot resolve \"{s}\".", .{target.host}),
             error.ConnectFailed => return res.fail("Nothing answers at {s}:{d}. RDC must be running on that computer and reachable from this one (same network, or a tunnel).", .{ target.host, target.port }),
             error.HandshakeFailed => return res.fail("{s}:{d} is not an RDC host.", .{ target.host, target.port }),
-            error.Timeout => return res.fail("{s}:{d} did not answer in time.", .{ target.host, target.port }),
+            error.Timeout => if (target.remote())
+                return res.fail("The computer did not answer in time.", .{})
+            else
+                return res.fail("{s}:{d} did not answer in time.", .{ target.host, target.port }),
             error.Closed => return res.fail("{s}:{d} closed the connection.", .{ target.host, target.port }),
             error.OutOfMemory => return res.fail("Out of memory.", .{}),
         };
@@ -715,7 +734,7 @@ fn countKept(comptime text: []const u8) usize {
 
 const definitions_source =
     \\[
-    \\{"name":"connect","title":"Connect to a computer","description":"Connect to a computer that runs RDC. Ask the user for the link shown in the RDC window on that computer (Copy link gives http://<ip>:7700/#<9-digit code>); or pass its address and the 9-digit code. On success you get a screenshot and the computer becomes the current device. Up to 4 computers at once.","inputSchema":{"type":"object","properties":{"link":{"type":"string","description":"The link from the RDC window, like http://192.168.1.20:7700/#123456789"},"address":{"type":"string","description":"Host or IP with optional port (default 7700), when there is no link"},"code":{"type":"string","description":"The 9-digit code from the RDC window, with address"},"name":{"type":"string","description":"Optional short name for this computer in later calls"}}},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true}},
+    \\{"name":"connect","title":"Connect to a computer","description":"Connect to a computer that runs RDC. Ask the user for a link from the RDC window on that computer: the one for this network (http://<ip>:7700/#<9-digit code>), the one from anywhere (https://anods.github.io/RDC/#<code>-<key>, works across networks through RDC's relay), or a permanent link (…#my-<key>), which also needs the current 6-digit code from the user's authenticator app in code. Or pass an address and the 9-digit code. On success you get a screenshot and the computer becomes the current device. Up to 4 computers at once.","inputSchema":{"type":"object","properties":{"link":{"type":"string","description":"A link from the RDC window: http://192.168.1.20:7700/#123456789, https://anods.github.io/RDC/#123456789-<key> or https://anods.github.io/RDC/#my-<key>"},"address":{"type":"string","description":"Host or IP with optional port (default 7700), when there is no link"},"code":{"type":"string","description":"With address: the 9-digit code from the RDC window. With a permanent link: the current 6-digit code from the authenticator app"},"name":{"type":"string","description":"Optional short name for this computer in later calls"}}},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true}},
     \\{"name":"devices","title":"List connected computers","description":"Which computers are connected, their names, OS and screen size. The current device gets every call that does not name one.","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
     \\{"name":"disconnect","title":"Disconnect","description":"End the session with a computer.","inputSchema":{"type":"object","properties":{"device":{"type":"string","description":"Name from devices; default: the current device"}}},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
     \\{"name":"screenshot","title":"Screenshot","description":"The current screen of the computer. Coordinates of every other tool are pixels of this picture. Pass region to zoom into part of it for small text; the zoomed picture does not change the coordinate space.","inputSchema":{"type":"object","properties":{"device":{"type":"string"},"region":{"type":"object","description":"Part of the screenshot to enlarge","properties":{"x":{"type":"number"},"y":{"type":"number"},"width":{"type":"number"},"height":{"type":"number"}},"required":["x","y","width","height"]}}},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
@@ -731,5 +750,5 @@ const definitions_source =
 
 /// What the model is told about this server.
 pub const instructions =
-    \\RDC lets you see and control other computers. Each computer runs RDC, which shows a link and a 9-digit code; the person at that computer gives them to you. Workflow: connect(link) → look at the screenshot → act with click, type, key, scroll, drag (coordinates are pixels of the latest screenshot) → every action returns a new screenshot, read it before the next step. Use screenshot with a region to read small text. The person at the computer sees that an AI agent is connected and can stop you at any time; if a call says the connection ended, ask them for a fresh link. Be careful with irreversible actions: confirm with the user before deleting, sending or paying.
+    \\RDC lets you see and control other computers. Each computer runs RDC, which shows a 9-digit code and links; the person at that computer gives you one. A link from anywhere (https://anods.github.io/RDC/#<code>-<key>) works across networks; a permanent link (#my-<key>) also needs the current 6-digit authenticator code from the user. Workflow: connect(link) → look at the screenshot → act with click, type, key, scroll, drag (coordinates are pixels of the latest screenshot) → every action returns a new screenshot, read it before the next step. Use screenshot with a region to read small text. The person at the computer sees that an AI agent is connected and can stop you at any time; if a call says the connection ended, ask them for a fresh link. Be careful with irreversible actions: confirm with the user before deleting, sending or paying.
 ;

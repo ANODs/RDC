@@ -19,7 +19,7 @@ Lightweight, low-latency cross-platform remote desktop written in Zig.
 
 ## AI agents
 
-RDC is also a tool for AI agents: `rdc mcp` is an [MCP](https://modelcontextprotocol.io) server with `connect`, `screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `devices` and `disconnect`. The agent connects with the link from the RDC window on the computer to control and works from screenshots; every action answers with a fresh one. The person at that computer sees "AI agent …" in the RDC window and in the browser viewer, with a **Stop** button.
+RDC is also a tool for AI agents: `rdc mcp` is an [MCP](https://modelcontextprotocol.io) server with `connect`, `screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `devices` and `disconnect`. The agent connects with a link from the RDC window on the computer to control — the one for this network, the one from anywhere (through RDC's relay), or the permanent link with the current code from the authenticator app — and works from screenshots; every action answers with a fresh one. The person at that computer sees "AI agent …" in the RDC window and in the browser viewer, with a **Stop** button.
 
 | Where the agent runs | How to install |
 |---|---|
@@ -28,6 +28,7 @@ RDC is also a tool for AI agents: `rdc mcp` is an [MCP](https://modelcontextprot
 | Codex (CLI or the ChatGPT desktop app) | `codex plugin marketplace add ANODs/RDC`, then install **RDC** from `/plugins` |
 | claude.ai, ChatGPT in a browser | run `rdc mcp --http --tunnel` on your computer and add the printed URL as a custom connector (needs [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)) |
 | Any other MCP client | `{"command": "<path to rdc>", "args": ["mcp"]}` |
+| An agent in the browser (WebMCP) | nothing: the viewer page at [anods.github.io/RDC](https://anods.github.io/RDC/) registers `rdc_connect`, `rdc_status`, `rdc_screenshot`, `rdc_click`, `rdc_move`, `rdc_scroll`, `rdc_type`, `rdc_key` and `rdc_disconnect` with `document.modelContext` where the browser supports it (Chrome's WebMCP origin trial) |
 
 `rdc mcp` options: `--name NAME` (how the agent is shown on the controlled computer), `--http [PORT]` (Streamable HTTP on 127.0.0.1:7710 instead of stdio), `--public` (listen on every interface; a token is required or generated), `--token T` (the secret, as the path `/mcp/T` or `Authorization: Bearer T`; also `RDC_MCP_TOKEN`), `--tunnel` (a Cloudflare quick tunnel, prints the public URL).
 

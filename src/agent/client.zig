@@ -1,5 +1,8 @@
 //! A connection to an RDC host as a viewer: the AI agent's eyes and hands.
-//! WebSocket to http://host:port/ws with the 9-digit code; JPEG frames come in, input goes out.
+//! On the local network: WebSocket to http://host:port/ws with the 9-digit code. From anywhere
+//! (https://anods.github.io/RDC/#<code>-<key>, or the permanent #my-<key> with an authenticator
+//! code): the host is found through signaling and both meet on its relay (src/net/relay.zig) —
+//! the agent cannot do WebRTC, the relay is its way. Either way JPEG frames come in, input goes out.
 //! A reader thread keeps the latest frame and the cursor position; a pinger keeps the session
 //! alive (the host drops viewers that are silent for 30 s) and asks where the cursor is.
 const std = @import("std");
@@ -7,6 +10,8 @@ const Io = std.Io;
 const net = std.Io.net;
 const ws = @import("../net/ws.zig");
 const proto = @import("../core/proto.zig");
+const signal = @import("../net/signal.zig");
+const relay = @import("../net/relay.zig");
 
 pub const default_port: u16 = 7700;
 const max_frame_bytes = 32 * 1024 * 1024;
@@ -16,6 +21,10 @@ pub const text_chunk = 4000;
 
 pub const Error = error{
     BadAddress,
+    /// No answer through signaling: RDC is not running there, or is older than 0.6.2.
+    NotFound,
+    /// The host has no relay, or the relay could not be reached.
+    NoRelay,
     ConnectFailed,
     HandshakeFailed,
     Rejected,
@@ -27,7 +36,11 @@ pub const Error = error{
 pub const Session = struct {
     gpa: std.mem.Allocator,
     io: Io,
-    stream: net.Stream,
+    /// The local network: a WebSocket to the host. From anywhere: a room on the relay instead.
+    stream: ?net.Stream = null,
+    relay_session: ?*relay.Session = null,
+    /// The relay session has ended and freed itself.
+    relay_gone: bool = false,
 
     // Filled from the host's "ok": what this computer is.
     host_name_buf: [128]u8 = undefined,
@@ -118,6 +131,8 @@ pub const Session = struct {
     // --- Sending
 
     fn send(s: *Session, opcode: ws.Opcode, payload: []const u8) Error!void {
+        if (s.relay_session) |r| return r.send(opcode == .binary, payload) catch error.Closed;
+        const stream = s.stream orelse return error.Closed;
         var mask: [4]u8 = undefined;
         s.io.random(&mask);
         var hb: [14]u8 = undefined;
@@ -126,7 +141,7 @@ pub const Session = struct {
         s.write_mutex.lockUncancelable(s.io);
         defer s.write_mutex.unlock(s.io);
         var wbuf: [4096]u8 = undefined;
-        var sw = s.stream.writer(s.io, &wbuf);
+        var sw = stream.writer(s.io, &wbuf);
         const w = &sw.interface;
         w.writeAll(head) catch return error.Closed;
         var off: usize = 0;
@@ -261,7 +276,7 @@ pub const Session = struct {
 
     fn readerMain(s: *Session) void {
         var buf: [64 * 1024]u8 = undefined;
-        var sr = s.stream.reader(s.io, &buf);
+        var sr = s.stream.?.reader(s.io, &buf);
         const r = &sr.interface;
         var reason: []const u8 = "the connection to the computer was lost";
         loop: while (true) {
@@ -327,6 +342,39 @@ pub const Session = struct {
             }
         }
         s.setClosed(reason);
+    }
+
+    /// A whole binary message through the relay: the frame header, then the picture.
+    fn onBinary(s: *Session, msg: []const u8) void {
+        if (msg.len < proto.frame_header_len or msg[0] != @backingInt(proto.FrameKind.jpeg)) return;
+        const data = s.gpa.dupe(u8, msg[proto.frame_header_len..]) catch return;
+        s.lock();
+        const old = s.frame;
+        s.frame = data;
+        s.frame_seq += 1;
+        s.cond.broadcast(s.io);
+        s.unlock();
+        if (old) |o| s.gpa.free(o);
+    }
+
+    fn relayMessage(ctx: *anyopaque, r: *relay.Session, binary: bool, data: []const u8) void {
+        const s: *Session = @ptrCast(@alignCast(ctx));
+        if (binary) return s.onBinary(data);
+        if (data.len > max_text_bytes) return;
+        if (s.onText(data)) |why| {
+            s.setClosed(why);
+            r.close();
+        }
+    }
+
+    fn relayClosed(ctx: *anyopaque, r: *relay.Session, reason: []const u8) void {
+        _ = r;
+        const s: *Session = @ptrCast(@alignCast(ctx));
+        s.setClosed(reason);
+        s.lock();
+        s.relay_gone = true;
+        s.cond.broadcast(s.io);
+        s.unlock();
     }
 
     /// Handles a text message; returns the reason if the host ends the session.
@@ -404,10 +452,17 @@ pub const Session = struct {
     /// Ends the session and frees it.
     pub fn close(s: *Session) void {
         s.setClosed("disconnected");
-        s.stream.shutdown(s.io, .both) catch {};
+        if (s.stream) |st| st.shutdown(s.io, .both) catch {};
+        if (s.relay_session) |r| {
+            r.close();
+            // The relay's thread calls back into this session until it has gone.
+            s.lock();
+            while (!s.relay_gone) s.cond.waitUncancelable(s.io, &s.mutex);
+            s.unlock();
+        }
         if (s.reader) |t| t.join();
         if (s.pinger) |t| t.join();
-        s.stream.close(s.io);
+        if (s.stream) |st| st.close(s.io);
         if (s.frame) |f| s.gpa.free(f);
         s.gpa.destroy(s);
     }
@@ -417,11 +472,38 @@ pub const Target = struct {
     host: []const u8,
     port: u16 = default_port,
     code: []const u8,
+    /// A link from anywhere: the key after the code (or after "my" for the permanent link).
+    key: ?[relay.token_len]u8 = null,
+    /// The permanent link asks for this: the 6-digit code from the authenticator app.
+    otp: []const u8 = "",
+
+    pub fn remote(t: *const Target) bool {
+        return t.key != null;
+    }
+    pub fn permanent(t: *const Target) bool {
+        return t.key != null and std.mem.eql(u8, t.code, "my");
+    }
 };
 
-/// "http://192.168.1.20:7700/#123456789" → host, port and code.
+/// "http://192.168.1.20:7700/#123456789" → host, port and code. A link from anywhere,
+/// "https://anods.github.io/RDC/#123456789-<key>" or the permanent "…#my-<key>", → code and key.
 pub fn parseLink(link: []const u8) ?Target {
     var s = std.mem.trim(u8, link, " \t\r\n");
+    if (std.mem.findScalar(u8, s, '#')) |hash| {
+        const frag = s[hash + 1 ..];
+        if (std.mem.findScalar(u8, frag, '-')) |dash| {
+            const code = frag[0..dash];
+            const key_text = frag[dash + 1 ..];
+            const is_code = code.len == 9 and for (code) |c| {
+                if (!std.ascii.isDigit(c)) break false;
+            } else true;
+            if ((is_code or std.mem.eql(u8, code, "my")) and key_text.len == 22) {
+                var key: [relay.token_len]u8 = undefined;
+                std.base64.url_safe_no_pad.Decoder.decode(&key, key_text) catch return null;
+                return .{ .host = "", .port = 0, .code = code, .key = key };
+            }
+        }
+    }
     if (std.mem.startsWith(u8, s, "http://")) s = s["http://".len..];
     if (std.mem.startsWith(u8, s, "https://")) return null; // the host speaks plain HTTP in the LAN
     const hash = std.mem.findScalar(u8, s, '#') orelse return null;
@@ -469,6 +551,7 @@ pub const Failure = struct {
 /// Connects, logs in with the code and waits for the host's "ok".
 /// `agent` names the AI agent on the host's screen ("Claude Code").
 pub fn connect(gpa: std.mem.Allocator, io: Io, target: Target, agent: []const u8, failure: *Failure) Error!*Session {
+    if (target.remote()) return connectRemote(gpa, io, target, agent, failure);
     const stream = try openStream(gpa, io, target);
     handshake(io, stream, target) catch |e| {
         stream.close(io);
@@ -488,9 +571,15 @@ pub fn connect(gpa: std.mem.Allocator, io: Io, target: Target, agent: []const u8
         return error.OutOfMemory;
     };
 
+    return login(s, target, agent, failure);
+}
+
+/// Says hello — the code, or the authenticator code on the permanent link — and waits for "ok".
+fn login(s: *Session, target: Target, agent: []const u8, failure: *Failure) Error!*Session {
+    const io = s.io;
     var digits: [9]u8 = undefined;
     var nd: usize = 0;
-    for (target.code) |c| {
+    for (if (target.permanent()) target.otp else target.code) |c| {
         if (c >= '0' and c <= '9' and nd < digits.len) {
             digits[nd] = c;
             nd += 1;
@@ -498,7 +587,8 @@ pub fn connect(gpa: std.mem.Allocator, io: Io, target: Target, agent: []const u8
     }
     var label_buf: [64]u8 = undefined;
     var hello_buf: [256]u8 = undefined;
-    const hello = std.fmt.bufPrint(&hello_buf, "{{\"t\":\"hello\",\"code\":\"{s}\",\"h264\":false,\"ai\":\"{s}\",\"agent\":\"RDC MCP\"}}", .{
+    const hello = std.fmt.bufPrint(&hello_buf, "{{\"t\":\"hello\",\"{s}\":\"{s}\",\"h264\":false,\"ai\":\"{s}\",\"agent\":\"RDC MCP\"}}", .{
+        if (target.permanent()) "otp" else "code",
         digits[0..nd],
         proto.jsonEscape(&label_buf, agent),
     }) catch unreachable;
@@ -532,6 +622,116 @@ pub fn connect(gpa: std.mem.Allocator, io: Io, target: Target, agent: []const u8
 }
 
 const connect_timeout_ms = 6000;
+
+/// What signaling brought back for our relay request.
+const Meeting = struct {
+    io: Io,
+    id: [16]u8,
+    mutex: Io.Mutex = .init,
+    done: Io.Event = .unset,
+    url_buf: [relay.max_url]u8 = undefined,
+    url_len: usize = 0,
+    err_buf: [200]u8 = undefined,
+    err_len: usize = 0,
+
+    fn handler(ctx: *anyopaque, text: []const u8) void {
+        const m: *Meeting = @ptrCast(@alignCast(ctx));
+        const t = proto.jsonString(text, "t") orelse return;
+        if (!std.mem.eql(u8, proto.jsonString(text, "id") orelse "", &m.id)) return;
+        m.mutex.lockUncancelable(m.io);
+        defer m.mutex.unlock(m.io);
+        if (m.url_len > 0 or m.err_len > 0) return;
+        if (std.mem.eql(u8, t, "relaying")) {
+            const url = proto.jsonString(text, "url") orelse return;
+            if (url.len == 0 or url.len > m.url_buf.len) return;
+            @memcpy(m.url_buf[0..url.len], url);
+            m.url_len = url.len;
+        } else if (std.mem.eql(u8, t, "err")) {
+            const msg = proto.jsonString(text, "msg") orelse "the computer refused";
+            m.err_len = @min(msg.len, m.err_buf.len);
+            @memcpy(m.err_buf[0..m.err_len], msg[0..m.err_len]);
+        } else return;
+        m.done.set(m.io);
+    }
+};
+
+/// Signaling's own log lines go to stderr, the MCP server's log.
+fn signalLog(msg: []const u8) void {
+    std.debug.print("{s}\n", .{msg});
+}
+
+/// Root certificates for relays, read once for the whole process.
+var relay_trust: relay.Trust = .{};
+
+/// A link from anywhere: ask the host through signaling to meet on its relay, then go there.
+fn connectRemote(gpa: std.mem.Allocator, io: Io, target: Target, agent: []const u8, failure: *Failure) Error!*Session {
+    const key = target.key.?;
+    // The signaling threads may still touch it for a moment after they are told to stop, so it
+    // is never freed: half a kilobyte per connection, from the page allocator (not leak-checked).
+    const meeting = std.heap.page_allocator.create(Meeting) catch return error.OutOfMemory;
+    meeting.* = .{ .io = io, .id = undefined };
+    var id_raw: [8]u8 = undefined;
+    io.random(&id_raw);
+    meeting.id = std.fmt.bytesToHex(id_raw, .lower);
+    const sig = signal.Signal.start(gpa, io, signal.derive(target.code, &key), Meeting.handler, meeting, signalLog) catch return error.ConnectFailed;
+    defer sig.stop();
+
+    // Wait for a broker, then ask; the answer names the relay.
+    var waited: i64 = 0;
+    while (sig.connected() == 0 and waited < 10_000) : (waited += 100) io.sleep(.fromMilliseconds(100), .awake) catch {};
+    if (sig.connected() == 0) return error.ConnectFailed;
+    var token: [relay.token_len]u8 = undefined;
+    io.random(&token);
+    var req_buf: [160]u8 = undefined;
+    const ts = Io.Clock.real.now(io).toMilliseconds();
+    const req = std.fmt.bufPrint(&req_buf, "{{\"t\":\"relay\",\"id\":\"{s}\",\"ts\":{d},\"r\":\"{s}\"}}", .{ &meeting.id, ts, &std.fmt.bytesToHex(token, .lower) }) catch unreachable;
+    sig.send(req);
+    meeting.done.waitTimeout(io, deadlineIn(io, 12_000)) catch {};
+    meeting.mutex.lockUncancelable(io);
+    const url_len = meeting.url_len;
+    const err_len = meeting.err_len;
+    meeting.mutex.unlock(io);
+    if (err_len > 0) {
+        failure.len = err_len;
+        @memcpy(failure.buf[0..err_len], meeting.err_buf[0..err_len]);
+        return error.Rejected;
+    }
+    if (url_len == 0) return error.NotFound;
+
+    const s = gpa.create(Session) catch return error.OutOfMemory;
+    s.* = .{ .gpa = gpa, .io = io };
+    const printed = std.fmt.bufPrint(&s.address_buf, "relay {s}", .{meeting.url_buf[0..url_len]}) catch s.address_buf[0..0];
+    s.address_len = printed.len;
+    const keys = relay.derive(target.code, &key, &token);
+    s.relay_session = relay.Session.startAs(gpa, io, .viewer, &relay_trust, meeting.url_buf[0..url_len], keys, .{
+        .ctx = s,
+        .message = Session.relayMessage,
+        .closed = Session.relayClosed,
+    }) catch {
+        gpa.destroy(s);
+        return error.NoRelay;
+    };
+    // Both ends in the room: only then does a message reach the host.
+    {
+        s.lock();
+        defer s.unlock();
+        var tries: u32 = 0;
+        while (!s.closed and !s.relay_session.?.isReady() and tries < 150) : (tries += 1) {
+            s.cond.waitTimeout(io, &s.mutex, deadlineIn(io, 100)) catch {};
+        }
+    }
+    if (!s.relay_session.?.isReady()) {
+        var why: [200]u8 = undefined;
+        const reason = s.closedReason(&why);
+        if (reason) |r| {
+            failure.len = @min(r.len, failure.buf.len);
+            @memcpy(failure.buf[0..failure.len], r[0..failure.len]);
+        }
+        s.close();
+        return error.NoRelay;
+    }
+    return login(s, target, agent, failure);
+}
 
 /// A blocking connect on its own thread, so the agent gets an answer in 6 s even when the
 /// address is a black hole (the OS would wait over a minute). An abandoned attempt closes its
@@ -668,6 +868,17 @@ fn nowNs(io: Io) i96 {
 
 fn deadlineIn(io: Io, ms: i64) Io.Timeout {
     return (Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } }).toDeadline(io);
+}
+
+test "client: links from anywhere" {
+    const a = parseLink("https://anods.github.io/RDC/#123456789-AAECAwQFBgcICQoLDA0ODw").?;
+    try std.testing.expect(a.remote() and !a.permanent());
+    try std.testing.expectEqualStrings("123456789", a.code);
+    try std.testing.expectEqual(@as(u8, 15), a.key.?[15]);
+    const p = parseLink("https://anods.github.io/RDC/#my-AAECAwQFBgcICQoLDA0ODw").?;
+    try std.testing.expect(p.permanent());
+    try std.testing.expect(parseLink("https://anods.github.io/RDC/#12345-AAECAwQFBgcICQoLDA0ODw") == null);
+    try std.testing.expect(!parseLink("http://10.0.0.2:7700/#123456789").?.remote());
 }
 
 test "client: links and addresses" {

@@ -142,9 +142,23 @@ const Conn = struct {
     }
 };
 
+/// Which end of the room this is: the host, or a viewer (the browser, or RDC's own agent).
+pub const Side = enum {
+    host,
+    viewer,
+
+    fn out(side: Side) u8 {
+        return if (side == .host) dir_host else dir_browser;
+    }
+    fn in(side: Side) u8 {
+        return if (side == .host) dir_browser else dir_host;
+    }
+};
+
 pub const Session = struct {
     gpa: std.mem.Allocator,
     io: Io,
+    side: Side = .host,
     keys: Keys,
     cb: Callbacks,
     trust: *Trust,
@@ -163,16 +177,25 @@ pub const Session = struct {
 
     /// Connects to the room on a thread of its own. `url` is the relay's address as parsed by Url.
     pub fn start(gpa: std.mem.Allocator, io: Io, trust: *Trust, url: []const u8, keys: Keys, cb: Callbacks) !*Session {
+        return startAs(gpa, io, .host, trust, url, keys, cb);
+    }
+
+    pub fn startAs(gpa: std.mem.Allocator, io: Io, side: Side, trust: *Trust, url: []const u8, keys: Keys, cb: Callbacks) !*Session {
         if (url.len > max_url or Url.parse(url) == null) return error.BadUrl;
         const s = try gpa.create(Session);
         errdefer gpa.destroy(s);
-        s.* = .{ .gpa = gpa, .io = io, .keys = keys, .cb = cb, .trust = trust, .url_buf = undefined, .url_len = url.len };
+        s.* = .{ .gpa = gpa, .io = io, .side = side, .keys = keys, .cb = cb, .trust = trust, .url_buf = undefined, .url_len = url.len };
         @memcpy(s.url_buf[0..url.len], url);
         s.seal_buf = try gpa.alloc(u8, sealedLen(piece_len + 1));
         errdefer gpa.free(s.seal_buf);
-        const t = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, main, .{s});
+        const t = try std.Thread.spawn(.{ .stack_size = 4 * 1024 * 1024 }, main, .{s}); // TLS with P-256 needs room in Debug builds
         t.detach();
         return s;
+    }
+
+    /// Both ends are in the room: what is sent now reaches the other end.
+    pub fn isReady(s: *const Session) bool {
+        return s.ready.load(.acquire);
     }
 
     pub fn peer(_: *const Session) []const u8 {
@@ -206,7 +229,7 @@ pub const Session = struct {
         var plain: [piece_len + 1]u8 = undefined;
         plain[0] = kind;
         @memcpy(plain[1..][0..data.len], data);
-        const sealed = seal(s.seal_buf, &s.keys, dir_host, s.out_counter, plain[0 .. data.len + 1]);
+        const sealed = seal(s.seal_buf, &s.keys, s.side.out(), s.out_counter, plain[0 .. data.len + 1]);
         s.out_counter += 1;
         writeFrame(s.io, c, .binary, sealed) catch return error.Closed;
         c.flush() catch return error.Closed;
@@ -270,19 +293,23 @@ pub const Session = struct {
         if (closed_early) return error.ConnectionClosed;
 
         const record = tls.Client.min_buffer_len;
-        const bufs = try gpa.alloc(u8, record * 4 + 4096);
+        // Whatever reads WebSocket frames (TLS, or the socket itself without it) must hold a whole
+        // frame: a piece of a video frame is up to 60 KB, plus a TLS record of room to refill.
+        const frame_room = sealedLen(piece_len + 1) + 16 + record;
+        const bufs = try gpa.alloc(u8, frame_room + record + frame_room + record);
         defer gpa.free(bufs);
         const c = try gpa.create(Conn);
         defer gpa.destroy(c);
-        c.* = .{ .sr = stream.reader(io, bufs[0..record]), .sw = stream.writer(io, bufs[record..][0..record]) };
+        const sock_read = if (url.secure) bufs[0..record] else bufs[0..frame_room];
+        c.* = .{ .sr = stream.reader(io, sock_read), .sw = stream.writer(io, bufs[frame_room..][0..record]) };
         if (url.secure) {
             var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
             io.random(&entropy);
             c.tls_client = tls.Client.init(&c.sr.interface, &c.sw.interface, .{
                 .host = .{ .explicit = url.host },
                 .ca = .{ .bundle = .{ .gpa = gpa, .io = io, .lock = &s.trust.lock, .bundle = &s.trust.bundle } },
-                .read_buffer = bufs[record * 2 ..][0 .. record * 2],
-                .write_buffer = bufs[record * 4 ..],
+                .read_buffer = bufs[frame_room + record ..][0..frame_room],
+                .write_buffer = bufs[frame_room + record + frame_room ..],
                 .entropy = &entropy,
                 .realtime_now = Io.Clock.real.now(io),
             }) catch |e| switch (e) {
@@ -327,7 +354,7 @@ pub const Session = struct {
                     if (std.mem.eql(u8, body, "ready")) s.ready.store(true, .release);
                 },
                 .binary => {
-                    const p = open(plain, &s.keys, dir_browser, in_counter, body) orelse return error.Forged;
+                    const p = open(plain, &s.keys, s.side.in(), in_counter, body) orelse return error.Forged;
                     in_counter += 1;
                     if (p.len == 0) return error.Forged;
                     const data = p[1..];

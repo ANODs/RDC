@@ -1343,7 +1343,16 @@ pub const Host = struct {
         }
         if (is_offer) return h.onOffer(port, m.id, m.ts, m.sdp);
         if (is_relay) {
-            const refusal = h.startRelay(port.permanent, m.id, m.r) orelse return;
+            const refusal = h.startRelay(port.permanent, m.id, m.r) orelse {
+                // Where the room is: RDC's own agent learns the relay from this (a browser had it in the answer).
+                const sig = h.signalFor(port.permanent) orelse return;
+                var buf: [relay.max_url + 96]u8 = undefined;
+                h.lock();
+                const reply = std.fmt.bufPrint(&buf, "{{\"t\":\"relaying\",\"id\":\"{s}\",\"ts\":{d},\"url\":\"{s}\"}}", .{ m.id, m.ts, h.relay_url_buf[0..h.relay_url_len] }) catch "";
+                h.unlock();
+                if (reply.len > 0) sig.send(reply);
+                return;
+            };
             return h.signalError(port.permanent, m.id, m.ts, refusal);
         }
         h.lock();

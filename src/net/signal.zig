@@ -180,6 +180,10 @@ pub const Signal = struct {
     handler: Handler,
     ctx: *anyopaque,
     log_fn: LogFn,
+    /// `stop` was called: the broker threads leave, and the last one out frees this.
+    stopping: std.atomic.Value(bool) = .init(false),
+    /// One per broker thread and one for whoever started it.
+    refs: std.atomic.Value(u32) = .init(brokers.len + 1),
 
     pub fn start(gpa: std.mem.Allocator, io: Io, keys: Keys, handler: Handler, ctx: *anyopaque, log_fn: LogFn) !*Signal {
         const s = try gpa.create(Signal);
@@ -307,14 +311,32 @@ pub const Signal = struct {
     }
 
     fn brokerMain(s: *Signal, i: usize) void {
+        defer s.release();
         var backoff_ms: u64 = 2_000;
-        while (true) {
+        while (!s.stopping.load(.acquire)) {
             const started = s.now();
-            s.connection(i) catch |e| s.log("signaling: {s}: {t}", .{ brokers[i].host, e });
+            s.connection(i) catch |e| if (!s.stopping.load(.acquire)) s.log("signaling: {s}: {t}", .{ brokers[i].host, e });
+            if (s.stopping.load(.acquire)) break;
             if (s.now() -| started > 120_000_000) backoff_ms = 2_000;
             s.io.sleep(.fromMilliseconds(@intCast(backoff_ms)), .awake) catch {};
             backoff_ms = @min(backoff_ms * 2, 120_000);
         }
+    }
+
+    /// Leaves the brokers (the agent needs signaling only while it connects). The handler may still
+    /// be called for a moment; `s` must not be used after this.
+    pub fn stop(s: *Signal) void {
+        s.stopping.store(true, .release);
+        s.mutex.lockUncancelable(s.io);
+        for (&s.conns) |*c| {
+            if (c.sock) |sock| sock.shutdown(s.io, .both) catch {};
+        }
+        s.mutex.unlock(s.io);
+        s.release();
+    }
+
+    fn release(s: *Signal) void {
+        if (s.refs.fetchSub(1, .acq_rel) == 1) s.gpa.destroy(s);
     }
 
     fn connection(s: *Signal, i: usize) !void {

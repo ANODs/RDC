@@ -5,7 +5,7 @@ description: Control another computer through RDC. Use when the user wants somet
 
 # Working on another computer through RDC
 
-RDC shows a 9-digit code and a link (`http://<ip>:7700/#<code>`) in its window on the computer to control. The person there copies the link with **Copy link** and gives it to you.
+RDC shows a 9-digit code and links in its window on the computer to control; the person there copies one with **Copy link** and gives it to you. `http://<ip>:7700/#<code>` works on the same network. `https://anods.github.io/RDC/#<code>-<key>` ("From anywhere") works from any network: RDC finds the computer through public servers and meets it on its relay. A permanent link, `…#my-<key>`, never changes and also needs the current 6-digit code from the user's authenticator app — ask the user for it and pass it as `code`.
 
 ## Workflow
 

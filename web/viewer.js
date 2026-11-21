@@ -1829,3 +1829,198 @@ function startFromHash() {
 }
 window.addEventListener('hashchange', startFromHash);
 startFromHash();
+
+// ---------------------------------------------------------------- WebMCP
+// Tools for an AI agent in the browser (WebMCP: document.modelContext.registerTool, Chrome's origin
+// trial). The agent connects with a link, looks at the screen and controls the computer the way
+// the person on this page would — the same session, the same "AI agent" banner on the computer
+// for nobody else, since it is this page's own connection. Coordinates are pixels of the remote
+// screen, as in rdc_screenshot.
+(() => {
+  const mc = document.modelContext || navigator.modelContext;
+  if (!mc || typeof mc.registerTool !== 'function') return;
+
+  const live = () => !!host && document.body.classList.contains('live');
+  const size = () => ({ width: canvas.width, height: canvas.height });
+  const notLive = () => ({ error: 'Not connected. Call rdc_connect with a link from the RDC window on the computer.' });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const point = (x, y) => {
+    const { width, height } = size();
+    if (!(x >= 0 && y >= 0 && x < width && y < height)) return null;
+    return [x / Math.max(1, width - 1), y / Math.max(1, height - 1)];
+  };
+  const status = () => (live()
+    ? { connected: true, computer: host.name || 'computer', os: host.os, ...size(), path: via || 'this network' }
+    : { connected: false, waitingFor: perm && $('join').style.display !== 'none' ? 'authenticator code' : null, message: $('err').textContent || null });
+
+  // Key names: KeyboardEvent.code values (KeyA, Enter, ArrowLeft…) or short ones (a, enter, ctrl, cmd…).
+  const ALIAS = {
+    ctrl: 'ControlLeft', control: 'ControlLeft', shift: 'ShiftLeft', alt: 'AltLeft', option: 'AltLeft',
+    cmd: 'MetaLeft', command: 'MetaLeft', meta: 'MetaLeft', win: 'MetaLeft', super: 'MetaLeft',
+    enter: 'Enter', return: 'Enter', esc: 'Escape', escape: 'Escape', tab: 'Tab', space: 'Space',
+    backspace: 'Backspace', delete: 'Delete', del: 'Delete', insert: 'Insert', home: 'Home', end: 'End',
+    pageup: 'PageUp', pagedown: 'PageDown', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight',
+    capslock: 'CapsLock', minus: 'Minus', equal: 'Equal', comma: 'Comma', period: 'Period', slash: 'Slash',
+  };
+  const usageOf = (name) => {
+    const n = String(name).trim();
+    if (HID[n] !== undefined) return HID[n];
+    const l = n.toLowerCase();
+    if (ALIAS[l]) return HID[ALIAS[l]];
+    if (/^[a-z]$/.test(l)) return HID['Key' + l.toUpperCase()];
+    if (/^[0-9]$/.test(l)) return HID['Digit' + l];
+    if (/^f([1-9]|1[0-9]|2[0-4])$/.test(l)) return HID['F' + l.slice(1)];
+    return undefined;
+  };
+
+  const tools = [
+    {
+      name: 'rdc_connect',
+      description: 'Connect this page to a computer that runs RDC. link: a link from the RDC window on that computer (https://anods.github.io/RDC/#<code>-<key>, or a permanent link #my-<key>). A permanent link also needs code: the current 6-digit code from the user\'s authenticator app — ask the user for it. Returns the status; the person at the computer can stop an AI agent at any time.',
+      inputSchema: { type: 'object', properties: { link: { type: 'string' }, code: { type: 'string', description: '6-digit authenticator code, for a permanent link' } } },
+      annotations: { consequentialHint: true },
+      async execute({ link, code } = {}) {
+        if (link) {
+          const e = parseEntry(link);
+          if (!e.perm && e.code.length !== 9) return { error: 'Not an RDC link: it looks like https://anods.github.io/RDC/#123456789-<key> and comes from the RDC window on the computer.' };
+          location.hash = '#' + (e.perm ? 'my-' + e.key : e.code + (e.key ? '-' + e.key : ''));
+          await sleep(300);
+        }
+        if (perm && !live()) {
+          if (!code) return { error: 'This is a permanent link: it needs the current 6-digit code from the authenticator app. Ask the user and call rdc_connect again with code.' };
+          submitOtp(String(code));
+        }
+        for (let i = 0; i < 100 && !live(); i++) {
+          if (!wantConnected && $('err').textContent && i > 3) break;
+          await sleep(200);
+        }
+        // The screen's size comes with the first picture.
+        for (let i = 0; i < 25 && live() && !gotFrame; i++) await sleep(200);
+        return live() ? status() : { error: $('err').textContent || 'The computer did not answer.' };
+      },
+    },
+    {
+      name: 'rdc_status',
+      description: 'Whether this page is connected to a computer, its name, OS and screen size in pixels.',
+      inputSchema: { type: 'object', properties: {} },
+      annotations: { readOnlyHint: true },
+      async execute() { return status(); },
+    },
+    {
+      name: 'rdc_screenshot',
+      description: 'The remote screen as it is now: a JPEG as a data URL, with the size of the screen in pixels. Coordinates for the other tools are pixels of this screen.',
+      inputSchema: { type: 'object', properties: { max_width: { type: 'number', description: 'Shrink the picture to at most this width (default 1280); coordinates stay in screen pixels' } } },
+      annotations: { readOnlyHint: true },
+      async execute({ max_width } = {}) {
+        if (!live()) return notLive();
+        const { width, height } = size();
+        const k = Math.min(1, (max_width || 1280) / width);
+        const c = document.createElement('canvas');
+        c.width = Math.round(width * k);
+        c.height = Math.round(height * k);
+        c.getContext('2d').drawImage(canvas, 0, 0, c.width, c.height);
+        return { screen: { width, height }, image: { width: c.width, height: c.height, dataUrl: c.toDataURL('image/jpeg', 0.7) } };
+      },
+    },
+    {
+      name: 'rdc_click',
+      description: 'Click at (x, y) in screen pixels. button: left (default), right or middle; double: a double click.',
+      inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, button: { type: 'string', enum: ['left', 'right', 'middle'] }, double: { type: 'boolean' } }, required: ['x', 'y'] },
+      annotations: { consequentialHint: true },
+      async execute({ x, y, button = 'left', double = false }) {
+        if (!live()) return notLive();
+        const p = point(x, y);
+        if (!p) return { error: `(${x}, ${y}) is outside the screen, ${canvas.width}×${canvas.height}.` };
+        const b = button === 'right' ? 2 : button === 'middle' ? 1 : 0;
+        sendMove(p[0], p[1]);
+        for (let i = 0; i < (double ? 2 : 1); i++) { sendButton(b, true, p[0], p[1]); sendButton(b, false, p[0], p[1]); }
+        await sleep(150);
+        return { done: true };
+      },
+    },
+    {
+      name: 'rdc_move',
+      description: 'Move the pointer to (x, y) in screen pixels.',
+      inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'] },
+      async execute({ x, y }) {
+        if (!live()) return notLive();
+        const p = point(x, y);
+        if (!p) return { error: `(${x}, ${y}) is outside the screen, ${canvas.width}×${canvas.height}.` };
+        sendMove(p[0], p[1]);
+        return { done: true };
+      },
+    },
+    {
+      name: 'rdc_scroll',
+      description: 'Scroll at (x, y): dy > 0 scrolls down, dx > 0 right, in pixels (about 100 a notch).',
+      inputSchema: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, dx: { type: 'number' }, dy: { type: 'number' } }, required: ['x', 'y'] },
+      async execute({ x, y, dx = 0, dy = 0 }) {
+        if (!live()) return notLive();
+        const p = point(x, y);
+        if (!p) return { error: `(${x}, ${y}) is outside the screen.` };
+        sendMove(p[0], p[1]);
+        const b = new DataView(new ArrayBuffer(9));
+        b.setUint8(0, MSG.WHEEL); b.setFloat32(1, dx, true); b.setFloat32(5, dy, true);
+        send(b.buffer);
+        await sleep(150);
+        return { done: true };
+      },
+    },
+    {
+      name: 'rdc_type',
+      description: 'Type text on the computer, whatever its keyboard layout (any language). Use rdc_key for Enter, shortcuts and arrows.',
+      inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+      annotations: { consequentialHint: true },
+      async execute({ text }) {
+        if (!live()) return notLive();
+        if (!host.text) return { error: 'RDC on that computer is too old for text input: update it.' };
+        const bytes = te.encode(String(text));
+        for (let off = 0; off < bytes.length;) {
+          // Pieces under the host's limit, cut between characters.
+          let end = Math.min(bytes.length, off + 4000);
+          while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--;
+          const m = new Uint8Array(1 + end - off);
+          m[0] = 6;
+          m.set(bytes.subarray(off, end), 1);
+          send(m.buffer);
+          off = end;
+        }
+        await sleep(100);
+        return { done: true };
+      },
+    },
+    {
+      name: 'rdc_key',
+      description: 'Press a key or a shortcut, held together and released in reverse: "enter", "esc", "tab", "ctrl+c", "cmd+shift+4", "alt+f4", "up". Names: KeyboardEvent.code values or short names (ctrl, shift, alt, cmd, a–z, 0–9, f1–f24, arrows).',
+      inputSchema: { type: 'object', properties: { keys: { type: 'string' } }, required: ['keys'] },
+      annotations: { consequentialHint: true },
+      async execute({ keys }) {
+        if (!live()) return notLive();
+        const names = String(keys).split('+').map((k) => k.trim()).filter(Boolean);
+        const usages = names.map(usageOf);
+        const bad = names.filter((_, i) => usages[i] === undefined);
+        if (!names.length || bad.length) return { error: `Unknown key: ${bad.join(', ') || keys}` };
+        for (const u of usages) sendKey(u, true);
+        for (const u of [...usages].reverse()) sendKey(u, false);
+        await sleep(100);
+        return { done: true };
+      },
+    },
+    {
+      name: 'rdc_disconnect',
+      description: 'End this page\'s session with the computer.',
+      inputSchema: { type: 'object', properties: {} },
+      async execute() {
+        if (!live()) return { connected: false };
+        $('leave').click();
+        return { connected: false };
+      },
+    },
+  ];
+  for (const t of tools) {
+    try {
+      const r = mc.registerTool(t);
+      if (r && typeof r.catch === 'function') r.catch((e) => console.warn('WebMCP', t.name, e));
+    } catch (e) { console.warn('WebMCP', t.name, e); }
+  }
+})();
