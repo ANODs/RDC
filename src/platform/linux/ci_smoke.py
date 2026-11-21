@@ -76,7 +76,8 @@ class WebSocket:
         self.sock.sendall(hdr + mask + body)
 
     def send_json(self, obj):
-        self.send(1, json.dumps(obj).encode())
+        # Compact, as browsers send it: the host reads JSON without spaces between tokens.
+        self.send(1, json.dumps(obj, separators=(",", ":")).encode())
 
     def _need(self, n, deadline):
         while len(self.buf) < n:
