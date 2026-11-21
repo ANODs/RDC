@@ -182,6 +182,126 @@ pub fn winScancode(usage: u16) ?u16 {
     return if (k == 0) null else k;
 }
 
+/// HID → Linux evdev key code (KEY_* in linux/input-event-codes.h), as the kernel's own HID driver
+/// maps a USB keyboard (hid_keyboard[] in drivers/hid/hid-input.c). 0 — no such key.
+pub const hid_to_evdev: [256]u8 = blk: {
+    var t: [256]u8 = @splat(0);
+    // A..Z: HID 0x04..0x1D
+    const letters = [26]u8{
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50,
+        49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44,
+    };
+    for (letters, 0..) |k, i| t[0x04 + i] = k;
+    // 1..9, 0: HID 0x1E..0x27 → KEY_1..KEY_0 (2..11)
+    for (0..10) |i| t[0x1E + i] = 2 + i;
+    // F1..F10: HID 0x3A..0x43 → 59..68
+    for (0..10) |i| t[0x3A + i] = 59 + i;
+    // F13..F24: HID 0x68..0x73 → 183..194
+    for (0..12) |i| t[0x68 + i] = 183 + i;
+    // Keypad 1..9: HID 0x59..0x61
+    const pad = [9]u8{ 79, 80, 81, 75, 76, 77, 71, 72, 73 };
+    for (pad, 0..) |k, i| t[0x59 + i] = k;
+    const pairs = [_][2]u8{
+        .{ 0x28, 28 }, // Enter
+        .{ 0x29, 1 }, // Escape
+        .{ 0x2A, 14 }, // Backspace
+        .{ 0x2B, 15 }, // Tab
+        .{ 0x2C, 57 }, // Space
+        .{ 0x2D, 12 }, // -
+        .{ 0x2E, 13 }, // =
+        .{ 0x2F, 26 }, // [
+        .{ 0x30, 27 }, // ]
+        .{ 0x31, 43 }, // \
+        .{ 0x32, 43 }, // # (non-US)
+        .{ 0x33, 39 }, // ;
+        .{ 0x34, 40 }, // '
+        .{ 0x35, 41 }, // `
+        .{ 0x36, 51 }, // ,
+        .{ 0x37, 52 }, // .
+        .{ 0x38, 53 }, // /
+        .{ 0x39, 58 }, // Caps Lock
+        .{ 0x44, 87 }, // F11
+        .{ 0x45, 88 }, // F12
+        .{ 0x46, 99 }, // Print Screen (KEY_SYSRQ)
+        .{ 0x47, 70 }, // Scroll Lock
+        .{ 0x48, 119 }, // Pause
+        .{ 0x49, 110 }, // Insert
+        .{ 0x4A, 102 }, // Home
+        .{ 0x4B, 104 }, // Page Up
+        .{ 0x4C, 111 }, // Delete
+        .{ 0x4D, 107 }, // End
+        .{ 0x4E, 109 }, // Page Down
+        .{ 0x4F, 106 }, // →
+        .{ 0x50, 105 }, // ←
+        .{ 0x51, 108 }, // ↓
+        .{ 0x52, 103 }, // ↑
+        .{ 0x53, 69 }, // Num Lock
+        .{ 0x54, 98 }, // KP /
+        .{ 0x55, 55 }, // KP *
+        .{ 0x56, 74 }, // KP -
+        .{ 0x57, 78 }, // KP +
+        .{ 0x58, 96 }, // KP Enter
+        .{ 0x62, 82 }, // KP 0
+        .{ 0x63, 83 }, // KP .
+        .{ 0x64, 86 }, // ISO \ (IntlBackslash, KEY_102ND)
+        .{ 0x65, 127 }, // Menu (KEY_COMPOSE)
+        .{ 0x66, 116 }, // Power
+        .{ 0x67, 117 }, // KP =
+        .{ 0x7F, 113 }, // Mute
+        .{ 0x80, 115 }, // Volume Up
+        .{ 0x81, 114 }, // Volume Down
+        .{ 0x85, 121 }, // KP ,
+        .{ 0x87, 89 }, // IntlRo (KEY_RO)
+        .{ 0x88, 93 }, // Katakana/Hiragana
+        .{ 0x89, 124 }, // IntlYen
+        .{ 0x8A, 92 }, // Henkan
+        .{ 0x8B, 94 }, // Muhenkan
+        .{ 0x90, 122 }, // Lang1 (Hangeul)
+        .{ 0x91, 123 }, // Lang2 (Hanja)
+        .{ 0xE0, 29 }, // Left Ctrl
+        .{ 0xE1, 42 }, // Left Shift
+        .{ 0xE2, 56 }, // Left Alt
+        .{ 0xE3, 125 }, // Left Super
+        .{ 0xE4, 97 }, // Right Ctrl
+        .{ 0xE5, 54 }, // Right Shift
+        .{ 0xE6, 100 }, // Right Alt (AltGr)
+        .{ 0xE7, 126 }, // Right Super
+    };
+    for (pairs) |p| t[p[0]] = p[1];
+    break :blk t;
+};
+
+/// X11 key code for a HID code: the evdev code + 8, as the X server (evdev and libinput drivers,
+/// Xwayland, Xvfb with the default keymap) numbers the keys. null — no such key.
+pub fn x11Keycode(usage: u16) ?u16 {
+    if (usage > 0xFF) return null;
+    const k = hid_to_evdev[usage];
+    return if (k == 0) null else @as(u16, k) + 8;
+}
+
+test "keymap: X11 key codes" {
+    try std.testing.expectEqual(@as(?u16, 38), x11Keycode(0x04)); // A
+    try std.testing.expectEqual(@as(?u16, 52), x11Keycode(0x1D)); // Z
+    try std.testing.expectEqual(@as(?u16, 10), x11Keycode(0x1E)); // 1
+    try std.testing.expectEqual(@as(?u16, 19), x11Keycode(0x27)); // 0
+    try std.testing.expectEqual(@as(?u16, 36), x11Keycode(0x28)); // Return
+    try std.testing.expectEqual(@as(?u16, 9), x11Keycode(0x29)); // Escape
+    try std.testing.expectEqual(@as(?u16, 22), x11Keycode(0x2A)); // BackSpace
+    try std.testing.expectEqual(@as(?u16, 65), x11Keycode(0x2C)); // space
+    try std.testing.expectEqual(@as(?u16, 67), x11Keycode(0x3A)); // F1
+    try std.testing.expectEqual(@as(?u16, 96), x11Keycode(0x45)); // F12
+    try std.testing.expectEqual(@as(?u16, 111), x11Keycode(0x52)); // Up
+    try std.testing.expectEqual(@as(?u16, 113), x11Keycode(0x50)); // Left
+    try std.testing.expectEqual(@as(?u16, 119), x11Keycode(0x4C)); // Delete
+    try std.testing.expectEqual(@as(?u16, 37), x11Keycode(0xE0)); // Control_L
+    try std.testing.expectEqual(@as(?u16, 133), x11Keycode(0xE3)); // Super_L
+    try std.testing.expectEqual(@as(?u16, 108), x11Keycode(0xE6)); // ISO_Level3_Shift (AltGr)
+    try std.testing.expectEqual(@as(?u16, 94), x11Keycode(0x64)); // less/greater (ISO)
+    try std.testing.expectEqual(@as(?u16, 191), x11Keycode(0x68)); // F13
+    try std.testing.expectEqual(@as(?u16, null), x11Keycode(0x00));
+    try std.testing.expectEqual(@as(?u16, null), x11Keycode(0x1234));
+}
+
 test "keymap: Windows scan codes" {
     try std.testing.expectEqual(@as(?u16, 0x1E), winScancode(0x04)); // A
     try std.testing.expectEqual(@as(?u16, 0x2C), winScancode(0x1D)); // Z

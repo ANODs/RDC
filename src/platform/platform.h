@@ -32,6 +32,8 @@ typedef void (*rdc_action_cb)(void *ctx, int action);
 #define RDC_ACTION_PERMANENT_ON 11
 #define RDC_ACTION_PERMANENT_OFF 12
 #define RDC_ACTION_PERMANENT_RESET 13
+// Settings → relay: the window has written the "relay" pref (rdc_set_pref_string); the host reads it again.
+#define RDC_ACTION_RELAY_CHANGED 14
 
 // Process: the log goes to stderr and to a file (macOS — ~/Library/Logs/RDC/rdc.log,
 // Windows — %LOCALAPPDATA%\RDC\rdc.log).
@@ -86,6 +88,12 @@ int rdc_install_path(char *buf, int buflen);  // path to RDC.app (macOS) or rdc.
 void rdc_cleanup_old_install(void);          // remove leftovers of the previous version after an update
 int rdc_pref_bool(const char *key, int def);
 void rdc_set_pref_bool(const char *key, int value);
+// A string pref (UTF-8): its length, copied into buf with a terminating zero, or -1 when it is not set
+// (or does not fit). An empty value removes the pref.
+int rdc_pref_string(const char *key, char *buf, int buflen);
+void rdc_set_pref_string(const char *key, const char *value);
+// The "relay" pref (docs/PLAN.md, section 6): not set — the default relay, "off" — no relay, otherwise
+// the https:// address of the person's own relay (a Cloudflare Worker from relay/ in the repository).
 // The seed of permanent access, kept between runs in a file only this user can read (macOS —
 // ~/Library/Application Support/RDC/permanent, Windows — %LOCALAPPDATA%\RDC\permanent). The process
 // that loads it holds it until it exits. Load: bytes read, 0 — none yet, -1 — failed, -2 — another

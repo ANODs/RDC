@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
         const libs = [_][]const u8{
             "d3d11",    "dxgi",     "ole32",  "oleaut32", "user32",   "gdi32",   "shell32",
             "advapi32", "iphlpapi", "ws2_32", "winhttp",  "comctl32", "version", "mfplat",
+            "credui",
         };
         for (libs) |lib| root.linkSystemLibrary(lib, .{});
         // "RDC Camera" (docs/PLAN.md, section 6): rdc-camera.dll, the Media Foundation media source
@@ -88,6 +89,42 @@ pub fn build(b: *std.Build) void {
             b.fmt("/dRDC_VERSION_NUM={d},{d},{d},0", .{ sv.major, sv.minor, sv.patch }),
             b.fmt("/dRDC_VERSION_STR=\"{s}\"", .{version}),
         } });
+    }
+    // The JPEG encoder of the Linux host (pure Zig) and `zig build jpeg-check`, which times it and
+    // has the build machine's own decoder (sips on a Mac) check its files.
+    const jpeg_mod = b.createModule(.{ .root_source_file = b.path("src/core/jpeg.zig") });
+    {
+        const check = b.addExecutable(.{ .name = "jpeg-check", .root_module = b.createModule(.{
+            .root_source_file = b.path("src/platform/linux/jpeg_check.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "jpeg", .module = jpeg_mod }},
+        }) });
+        const run_check = b.addRunArtifact(check);
+        run_check.addPassthruArgs();
+        run_check.has_side_effects = true;
+        b.step("jpeg-check", "Time the Linux host's JPEG encoder and check its output decodes (args: output dir)").dependOn(&run_check.step);
+    }
+    if (os == .linux) {
+        // Linux (X11): every system library — X11, XShm, XTest, XFixes, GTK 3 — is loaded with
+        // dlopen at run time, so the binary needs only glibc and builds on any machine.
+        root.addCSourceFiles(.{
+            .root = b.path("src/platform/linux"),
+            .files = &.{ "shim.c", "x11.c", "window.c" },
+            .flags = &.{ "-std=gnu11", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-missing-field-initializers" },
+        });
+        const zig_part = b.addObject(.{ .name = "rdc-linux", .root_module = b.createModule(.{
+            .root_source_file = b.path("src/platform/linux/zig_export.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "jpeg", .module = jpeg_mod }},
+        }) });
+        root.addObject(zig_part);
+        root.linkSystemLibrary("dl", .{});
+        root.linkSystemLibrary("pthread", .{});
+        // A release binary without DWARF: 13 MB → about 3 (Windows keeps its debug info in a .pdb).
+        if (optimize != .debug) root.strip = true;
     }
     if (is_macos) {
         root.addCSourceFile(.{
@@ -117,6 +154,11 @@ pub fn build(b: *std.Build) void {
         const exe_name = if (target.result.cpu.arch == .x86_64) "RDC.exe" else b.fmt("RDC-{s}.exe", .{@tagName(target.result.cpu.arch)});
         const install_exe = b.addInstallFileWithDir(exe.getEmittedBin(), .{ .custom = "package" }, exe_name);
         b.step("package", "RDC.exe for a release in zig-out/package").dependOn(&install_exe.step);
+    }
+    if (os == .linux) {
+        // For a release: a single binary, rdc-linux-x86_64 — download, chmod +x, run.
+        const install_bin = b.addInstallFileWithDir(exe.getEmittedBin(), .{ .custom = "package" }, b.fmt("rdc-{s}", .{platform}));
+        b.step("package", "rdc-linux-<arch> for a release in zig-out/package").dependOn(&install_bin.step);
     }
 
     const run_cmd = b.addRunArtifact(exe);

@@ -20,6 +20,7 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <sddl.h>
+#include <wincred.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1225,10 +1226,6 @@ int rdc_seed_save(const void *data, int len) {
     return 0;
 }
 
-// The settings for permanent access live in the macOS window so far; on Windows it stays off.
-void rdc_app_set_permanent(int on, const char *link, const uint8_t *link_qr, int link_qr_size,
-                           const uint8_t *auth_qr, int auth_qr_size, const char *secret_text) {}
-
 int rdc_pref_bool(const char *key, int def) {
     wchar_t wk[128];
     to_wide(key, wk, 128);
@@ -1246,6 +1243,30 @@ void rdc_set_pref_bool(const char *key, int value) {
         return;
     DWORD v = value != 0;
     RegSetValueExW(k, wk, 0, REG_DWORD, (const BYTE *)&v, sizeof v);
+    RegCloseKey(k);
+}
+
+int rdc_pref_string(const char *key, char *buf, int buflen) {
+    wchar_t wk[128], wv[1024];
+    to_wide(key, wk, 128);
+    DWORD sz = sizeof wv;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\RDC", wk, RRF_RT_REG_SZ, NULL, wv, &sz) != ERROR_SUCCESS) return -1;
+    int n = WideCharToMultiByte(CP_UTF8, 0, wv, -1, buf, buflen, NULL, NULL);
+    return n > 0 ? n - 1 : -1;
+}
+
+void rdc_set_pref_string(const char *key, const char *value) {
+    wchar_t wk[128], wv[1024];
+    to_wide(key, wk, 128);
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\RDC", 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS)
+        return;
+    if (!value || !value[0]) {
+        RegDeleteValueW(k, wk);
+    } else {
+        to_wide(value, wv, 1024);
+        RegSetValueExW(k, wk, 0, REG_SZ, (const BYTE *)wv, (DWORD)((wcslen(wv) + 1) * sizeof(wchar_t)));
+    }
     RegCloseKey(k);
 }
 
@@ -1287,6 +1308,9 @@ static const wchar_t *own_args(void) {
     while (*p == L' ' || *p == L'\t') p++;
     return p;
 }
+
+// Settings → "Start RDC at login" started this process: its window stays hidden.
+static int started_at_login(void) { return wcsstr(own_args(), L"--login") != NULL; }
 
 // Starts this exe again as administrator with these arguments; with `wait`, until it exits.
 // 0 — started (its exit code in *code), 1 — the person declined the UAC prompt, -1 — failed.
@@ -1854,7 +1878,11 @@ int rdc_app_prepare(const void *camera_dll, size_t camera_dll_len) {
             return 1;
         }
     }
-    if (!g_elevated && !relaunched) {
+    // Started at login from the Run key: a UAC prompt there would hold the login up with no one to
+    // answer it, so this run keeps the normal rights (the scheduled task starts RDC elevated already).
+    if (!g_elevated && !relaunched && started_at_login()) {
+        rlog("started at login without administrator rights: input will not reach apps that run as administrator");
+    } else if (!g_elevated && !relaunched) {
         wchar_t args[2048];
         wfmt(args, 2048, L"%ls --elevated", own_args());
         int r = run_elevated(args, 0, NULL);
@@ -1885,10 +1913,13 @@ int rdc_app_prepare(const void *camera_dll, size_t camera_dll_len) {
 // ---------------------------------------------------------------------------
 // App window
 
-enum { ID_COPY = 101, ID_OPEN, ID_NEWCODE, ID_KICK, ID_AUTO, ID_CHECK, ID_INSTALL, ID_COPY_REMOTE, ID_OPEN_REMOTE, ID_MEDIA_STOP, ID_CAMERA };
+enum { ID_COPY = 101, ID_OPEN, ID_NEWCODE, ID_KICK, ID_AUTO, ID_CHECK, ID_INSTALL, ID_COPY_REMOTE, ID_OPEN_REMOTE, ID_MEDIA_STOP, ID_CAMERA,
+       ID_SETTINGS };
 #define WM_RDC_REFRESH (WM_APP + 1)
 #define WM_RDC_READY (WM_APP + 2)
+#define WM_RDC_RELAY_DONE (WM_APP + 3)  // a relay check finished: lParam — its RelayCheck
 #define TIMER_COPIED 1
+#define IDM_QUIT 0x0110  // "Quit RDC" in the window menu (system command ids keep the low 4 bits clear)
 #define CLIENT_W 440
 #define CLIENT_H 600
 static const DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
@@ -1896,7 +1927,7 @@ static const DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_M
 static HWND volatile g_hwnd;
 static HWND g_code, g_link, g_copy, g_status, g_upd_status, g_auto, g_check, g_install, g_lbl_code, g_lbl_link, g_kick;
 static HWND g_lbl_remote, g_remote, g_copy_remote, g_open_remote;
-static HWND g_media, g_media_stop, g_cam_caption, g_cam_button;
+static HWND g_media, g_media_stop, g_cam_caption, g_cam_button, g_settings;
 static volatile LONG g_ai_active;  // an AI agent is connected: the kick button stops it
 static HFONT g_font, g_font_big, g_font_small;
 static rdc_ctx_cb g_on_ready;
@@ -1911,6 +1942,15 @@ static wchar_t g_ui_remote_caption[128] = L"";
 static wchar_t g_ui_media[160] = L"";  // what a viewer lends right now
 static wchar_t g_ui_version[32] = L"", g_ui_upd[512] = L"";
 static int g_ui_auto = 1, g_ui_can_install, g_ui_busy;
+// Permanent access, from rdc_app_set_permanent: the link, its QR code, the authenticator's QR code and key.
+#define QR_MAX (17 + 4 * 15)  // core/qr.zig: versions 1–15
+static int g_perm_on, g_perm_serial;
+static wchar_t g_perm_link[512] = L"", g_perm_key[96] = L"";
+static uint8_t g_perm_link_qr[QR_MAX * QR_MAX], g_perm_auth_qr[QR_MAX * QR_MAX];
+static int g_perm_link_qr_size, g_perm_auth_qr_size;
+
+static void settings_refresh(void);
+static void perm_refresh(void);
 
 static int px(int v) { return MulDiv(v, g_dpi, 96); }
 
@@ -1976,6 +2016,8 @@ static void refresh_ui(void) {
     ShowWindow(g_install, can ? SW_SHOW : SW_HIDE);
     EnableWindow(g_install, can && !busy);
     set_text(g_kick, g_ai_active ? L"Stop AI agent" : L"Disconnect all");
+    settings_refresh();
+    perm_refresh();
 }
 
 static void post_refresh(void) {
@@ -2029,7 +2071,8 @@ static void build_controls(HWND p) {
     g_auto = make(p, L"BUTTON", L"Update automatically", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 28, 484, 210, 26, ID_AUTO, g_font);
     g_check = make(p, L"BUTTON", L"Check for updates", btn, 0, 245, 482, 170, 30, ID_CHECK, g_font);
     g_upd_status = make(p, L"STATIC", L"", SS_CENTER, 0, 12, 520, 416, 34, 0, g_font_small);
-    g_install = make(p, L"BUTTON", L"Update and restart", btn, 0, 110, 558, 220, 30, ID_INSTALL, g_font);
+    g_settings = make(p, L"BUTTON", L"Settings…", btn, 0, 45, 558, 170, 30, ID_SETTINGS, g_font);
+    g_install = make(p, L"BUTTON", L"Update and restart", btn, 0, 225, 558, 170, 30, ID_INSTALL, g_font);
     ShowWindow(g_install, SW_HIDE);
 }
 
@@ -2048,35 +2091,927 @@ static void window_size(int dpi, int *w, int *h) {
     *h = r.bottom - r.top;
 }
 
+static int clipboard_set(HWND hwnd, const wchar_t *text) {
+    size_t bytes = (wcslen(text) + 1) * sizeof(wchar_t);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!mem) return -1;
+    void *dst = GlobalLock(mem);
+    if (!dst) {
+        GlobalFree(mem);
+        return -1;
+    }
+    memcpy(dst, text, bytes);
+    GlobalUnlock(mem);
+    if (!OpenClipboard(hwnd)) {
+        GlobalFree(mem);
+        return -1;
+    }
+    EmptyClipboard();
+    int rc = 0;
+    if (!SetClipboardData(CF_UNICODETEXT, mem)) {
+        GlobalFree(mem);
+        rc = -1;
+    }
+    CloseClipboard();
+    return rc;
+}
+
 static void copy_link(HWND hwnd, int remote) {
     wchar_t link[256];
     AcquireSRWLockShared(&g_ui_lock);
     wcscpy(link, remote ? g_ui_remote : g_ui_link);
     ReleaseSRWLockShared(&g_ui_lock);
-    if (!link[0]) return;
-    size_t bytes = (wcslen(link) + 1) * sizeof(wchar_t);
-    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-    if (!mem) return;
-    void *dst = GlobalLock(mem);
-    if (!dst) {
-        GlobalFree(mem);
-        return;
-    }
-    memcpy(dst, link, bytes);
-    GlobalUnlock(mem);
-    if (!OpenClipboard(hwnd)) {
-        GlobalFree(mem);
-        return;
-    }
-    EmptyClipboard();
-    if (!SetClipboardData(CF_UNICODETEXT, mem)) GlobalFree(mem);
-    CloseClipboard();
+    if (!link[0] || clipboard_set(hwnd, link) != 0) return;
     SetWindowTextW(remote ? g_copy_remote : g_copy, L"Copied ✓");
     SetTimer(hwnd, TIMER_COPIED, 1500, NULL);
 }
 
 static void action(int a) {
     if (g_on_action) g_on_action(g_app_ctx, a);
+}
+
+// ---------------------------------------------------------------------------
+// Settings: permanent access (with the "Permanent access" window for setting up the phone), start
+// at login, keep awake, the relay. Two more top-level windows on the window thread, each with its
+// own DPI; their controls are laid out from the top down, so hidden ones leave no gap.
+
+enum { ID_S_PERM = 201, ID_S_SETUP, ID_S_LOGIN, ID_S_AWAKE, ID_S_RELAY, ID_S_RELAY_URL, ID_S_RELAY_USE, ID_S_RELAY_HOW,
+       ID_P_COPY, ID_P_SHOW, ID_P_RESET };
+#define SUB_W 440
+#define TIMER_P_COPIED 2
+static const DWORD kSubStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+static const wchar_t kRelayHowTo[] = L"https://github.com/ANODs/RDC/tree/main/relay#readme";
+
+typedef struct {
+    HWND hwnd;
+    int dpi;
+    HFONT font, small, extra;  // extra: the underlined link (Settings), the monospaced key (Permanent access)
+} SubWin;
+static SubWin g_set, g_perm;
+static HWND g_s_perm, g_s_perm_note, g_s_setup, g_s_login, g_s_login_note, g_s_awake, g_s_awake_note, g_s_line;
+static HWND g_s_relay_title, g_s_relay, g_s_relay_url, g_s_relay_use, g_s_relay_note, g_s_relay_how;
+static HWND g_p_step1, g_p_link, g_p_copy, g_p_step2, g_p_show, g_p_key, g_p_reset;
+static RECT g_p_qr1, g_p_qr2;            // where the two QR codes are painted, in the window's pixels
+static int g_perm_revealed;              // the authenticator's code is shown: only after the account password
+static int g_perm_seen = -1;             // g_perm_serial the window last painted
+static wchar_t g_perm_shown_key[96] = L"";
+static wchar_t g_relay_msg[256] = L"";   // the result of "Use", shown instead of the usual note
+static int g_relay_checking, g_relay_gen;
+static volatile LONG g_login_state = -1;  // start at login: -1 — not known yet, 0 — off, 1 — on
+static volatile LONG g_login_busy;
+
+static int sx(const SubWin *w, int v) { return MulDiv(v, w->dpi, 96); }
+static void perm_show_window(void);
+
+static const wchar_t kPermNote[] =
+    L"A link of your own that never changes. Whoever opens it must enter the current 6-digit code from your "
+    L"authenticator app (Google Authenticator and the like), so the link alone lets no one in.";
+static const wchar_t kLoginNote[] = L"RDC starts hidden when you log in and keeps running when its window is closed.";
+static const wchar_t kAwakeNote[] =
+    L"A sleeping computer cannot be reached. The display may still turn off; a laptop with its lid closed may sleep anyway.";
+static const wchar_t kStep1[] =
+    L"1. Open the link on your phone — point its camera at this code — and keep it: add the page to the home screen.";
+static const wchar_t kStep2[] =
+    L"2. Add this computer to the authenticator app: in the app, scan the second code. Anyone who sees it can make "
+    L"the codes, so it is shown only when you ask.";
+
+// --- Keep awake: the window thread lives as long as RDC, and the state belongs to the thread.
+static void keep_awake(int on) { SetThreadExecutionState(on ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED : ES_CONTINUOUS); }
+
+// --- Start at login. As administrator: a scheduled task that starts RDC elevated at this user's
+// logon, with no UAC prompt. Without the rights: the Run key (RDC then runs without them).
+#define RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+
+static int login_command(wchar_t *out, size_t n) {
+    wchar_t exe[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return -1;
+    wfmt(out, n, L"\"%ls\" --login", exe);
+    return 0;
+}
+
+static int run_value_get(wchar_t *buf, DWORD bytes) {
+    return RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, L"RDC", RRF_RT_REG_SZ, NULL, buf, &bytes) == ERROR_SUCCESS ? 0 : -1;
+}
+
+static int run_value_set(int on) {
+    if (!on) {
+        LSTATUS r = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, L"RDC");
+        return r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND ? 0 : -1;
+    }
+    wchar_t cmd[MAX_PATH + 16];
+    if (login_command(cmd, MAX_PATH + 16) != 0) return -1;
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS) return -1;
+    LSTATUS r = RegSetValueExW(k, L"RDC", 0, REG_SZ, (const BYTE *)cmd, (DWORD)((wcslen(cmd) + 1) * sizeof(wchar_t)));
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS ? 0 : -1;
+}
+
+static int schtasks(const wchar_t *args) {
+    wchar_t sys[MAX_PATH], cmd[2048];
+    if (!GetSystemDirectoryW(sys, MAX_PATH)) return -1;
+    wfmt(cmd, 2048, L"\"%ls\\schtasks.exe\" %ls", sys, args);
+    return run_hidden(cmd);
+}
+
+static int task_exists(void) { return schtasks(L"/query /tn RDC") == 0; }
+
+static void xml_escape(const wchar_t *in, wchar_t *out, size_t n) {
+    size_t o = 0;
+    for (; *in && o + 7 < n; in++) {
+        const wchar_t *rep = *in == L'&' ? L"&amp;" : *in == L'<' ? L"&lt;" : *in == L'>' ? L"&gt;" : NULL;
+        if (rep) {
+            while (*rep) out[o++] = *rep++;
+        } else {
+            out[o++] = *in;
+        }
+    }
+    out[o] = 0;
+}
+
+// The task in XML: schtasks' own switches would stop RDC after 72 hours and skip it on battery.
+static int task_create(void) {
+    wchar_t exe[MAX_PATH], exe_xml[MAX_PATH * 5], path[MAX_PATH], args[MAX_PATH + 64];
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return -1;
+    xml_escape(exe, exe_xml, MAX_PATH * 5);
+    // The logon of this user only, by SID: names can hold anything.
+    wchar_t *sid = NULL;
+    HANDLE token = NULL;
+    union {
+        TOKEN_USER user;
+        uint8_t bytes[256];
+    } tu;
+    DWORD got = 0;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        if (GetTokenInformation(token, TokenUser, &tu, sizeof tu, &got)) ConvertSidToStringSidW(tu.user.User.Sid, &sid);
+        CloseHandle(token);
+    }
+    if (!sid) return -1;
+    static wchar_t xml[8192];  // the window thread's helper threads take turns (g_login_busy)
+    wfmt(xml, 8192,
+         L"\xFEFF<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
+         L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
+         L"<RegistrationInfo><Description>Starts RDC when you log in (RDC Settings: Start RDC at login).</Description></RegistrationInfo>\r\n"
+         L"<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>%ls</UserId></LogonTrigger></Triggers>\r\n"
+         L"<Principals><Principal id=\"Author\"><UserId>%ls</UserId><LogonType>InteractiveToken</LogonType>"
+         L"<RunLevel>HighestAvailable</RunLevel></Principal></Principals>\r\n"
+         L"<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
+         L"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"
+         L"<AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>false</StartWhenAvailable>"
+         L"<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>"
+         L"<AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden>"
+         L"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>5</Priority></Settings>\r\n"
+         L"<Actions Context=\"Author\"><Exec><Command>%ls</Command><Arguments>--login</Arguments></Exec></Actions>\r\n"
+         L"</Task>\r\n",
+         sid, sid, exe_xml);
+    LocalFree(sid);
+    temp_path(path, L"rdc-login-task.xml");
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
+    if (f == INVALID_HANDLE_VALUE) return -1;
+    DWORD bytes = (DWORD)(wcslen(xml) * sizeof(wchar_t)), put = 0;
+    BOOL ok = WriteFile(f, xml, bytes, &put, NULL) && put == bytes;
+    CloseHandle(f);
+    int rc = -1;
+    if (ok) {
+        wfmt(args, MAX_PATH + 64, L"/create /tn RDC /xml \"%ls\" /f", path);
+        rc = schtasks(args);
+    }
+    DeleteFileW(path);
+    return rc;
+}
+
+static void autostart_set(int on) {
+    if (!on) {
+        if (run_value_set(0) != 0) rlog("start at login: cannot remove the Run key value");
+        if (task_exists()) {
+            int rc = schtasks(L"/delete /tn RDC /f");
+            if (rc != 0) rlog("start at login: cannot remove the scheduled task \"RDC\" (schtasks returned %d)", rc);
+        }
+        rlog("start at login: off");
+        return;
+    }
+    if (g_elevated) {
+        int rc = task_create();
+        if (rc == 0) {
+            run_value_set(0);
+            rlog("start at login: on (the scheduled task \"RDC\", as administrator)");
+            return;
+        }
+        rlog("start at login: the scheduled task was not created (schtasks returned %d), using the Run key", rc);
+    }
+    if (run_value_set(1) == 0)
+        rlog("start at login: on (the Run key, without administrator rights)");
+    else
+        rlog("start at login: cannot write the Run key value");
+}
+
+// On a helper thread: schtasks takes a moment. arg: 1 — turn on, 0 — off, -1 — only look.
+static DWORD WINAPI login_main(LPVOID arg) {
+    int want = (int)(INT_PTR)arg;
+    if (want >= 0) autostart_set(want);
+    wchar_t have[MAX_PATH + 16], cmd[MAX_PATH + 16];
+    int run = run_value_get(have, sizeof have) == 0;
+    // RDC was moved since the value was written: point it at where RDC is now.
+    if (want < 0 && run && login_command(cmd, MAX_PATH + 16) == 0 && _wcsicmp(have, cmd) != 0) run_value_set(1);
+    InterlockedExchange(&g_login_state, run || task_exists() ? 1 : 0);
+    InterlockedExchange(&g_login_busy, 0);
+    post_refresh();
+    return 0;
+}
+
+static void login_start(int want) {
+    if (InterlockedCompareExchange(&g_login_busy, 1, 0) != 0) return;
+    HANDLE t = CreateThread(NULL, 0, login_main, (LPVOID)(INT_PTR)want, 0, NULL);
+    if (t)
+        CloseHandle(t);
+    else
+        InterlockedExchange(&g_login_busy, 0);
+}
+
+// --- The relay check, on a helper thread: the relay answers {"rdc_relay":1} at its root.
+typedef struct {
+    int gen, result;  // result: 1 — an RDC relay, 0 — something else answers, -1 — no answer
+    char url[1024];
+} RelayCheck;
+
+static DWORD WINAPI relay_check_main(LPVOID arg) {
+    RelayCheck *rc = arg;
+    char url[1100];
+    snprintf(url, sizeof url, "%s/", rc->url);
+    size_t len = 0;
+    int status = -1;
+    uint8_t *body = rdc_http_get(url, 4096, &len, &status);
+    rc->result = status < 0 ? -1 : 0;
+    static const char mark[] = "\"rdc_relay\"";
+    if (body && status == 200)
+        for (size_t i = 0; i + sizeof mark - 1 <= len; i++)
+            if (memcmp(body + i, mark, sizeof mark - 1) == 0) rc->result = 1;
+    free(body);
+    HWND h = g_hwnd;
+    if (!h || !PostMessageW(h, WM_RDC_RELAY_DONE, 0, (LPARAM)rc)) free(rc);
+    return 0;
+}
+
+// --- Window helpers.
+static HWND make_sub(SubWin *w, const wchar_t *cls, const wchar_t *text, DWORD style, DWORD ex, int id, HFONT font) {
+    HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0, w->hwnd, (HMENU)(INT_PTR)id,
+                             GetModuleHandleW(NULL), NULL);
+    SendMessageW(c, WM_SETFONT, (WPARAM)font, FALSE);
+    return c;
+}
+
+static void place(const SubWin *w, HWND c, int x, int y, int cw, int ch) {
+    RECT r;
+    GetWindowRect(c, &r);
+    MapWindowPoints(HWND_DESKTOP, w->hwnd, (POINT *)&r, 2);
+    int nx = sx(w, x), ny = sx(w, y), nw = sx(w, cw), nh = sx(w, ch);
+    // A drop-down list reports the height of its box, not the height it was given with its list.
+    int same_h = r.bottom - r.top == nh || (c == g_s_relay && r.bottom - r.top > 0);
+    if (r.left != nx || r.top != ny || r.right - r.left != nw || !same_h) MoveWindow(c, nx, ny, nw, nh, TRUE);
+}
+
+// The control's own visibility: IsWindowVisible is false for all of them while their window is hidden.
+static void show(HWND c, int visible) {
+    int now = (GetWindowLongW(c, GWL_STYLE) & WS_VISIBLE) != 0;
+    if (now != !!visible) ShowWindow(c, visible ? SW_SHOW : SW_HIDE);
+}
+
+// Height (in 96-dpi units) of wrapped text in this width; *text_w — the width of its longest line.
+static int text_height(const SubWin *w, HFONT f, const wchar_t *text, int width, int *text_w) {
+    HDC dc = GetDC(w->hwnd);
+    HGDIOBJ old = SelectObject(dc, f);
+    RECT r = {0, 0, sx(w, width), 0};
+    DrawTextW(dc, text, -1, &r, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    SelectObject(dc, old);
+    ReleaseDC(w->hwnd, dc);
+    if (text_w) *text_w = MulDiv(r.right, 96, w->dpi) + 2;
+    return MulDiv(r.bottom, 96, w->dpi) + 2;
+}
+
+static void sub_fonts(SubWin *w, int mono) {
+    if (w->font) DeleteObject(w->font);
+    if (w->small) DeleteObject(w->small);
+    if (w->extra) DeleteObject(w->extra);
+    w->font = CreateFontW(-sx(w, 15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    w->small = CreateFontW(-sx(w, 13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    w->extra = mono ? CreateFontW(-sx(w, 13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY,
+                                  FIXED_PITCH | FF_MODERN, L"Consolas")
+                    : CreateFontW(-sx(w, 13), 0, 0, 0, FW_NORMAL, 0, TRUE, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+}
+
+// The window is as tall as what it shows, with its top edge in place.
+static void sub_client_height(const SubWin *w, int h) {
+    RECT want = {0, 0, sx(w, SUB_W), sx(w, h)}, have;
+    GetClientRect(w->hwnd, &have);
+    if (have.right == want.right && have.bottom == want.bottom) return;
+    AdjustWindowRectExForDpi(&want, kSubStyle, FALSE, 0, (UINT)w->dpi);
+    SetWindowPos(w->hwnd, NULL, 0, 0, want.right - want.left, want.bottom - want.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// Centered over another window (or its monitor when that one is hidden), inside the work area.
+static void center_over(HWND w, HWND over) {
+    MONITORINFO mi = {sizeof mi};
+    HMONITOR mon = MonitorFromWindow(over ? over : w, MONITOR_DEFAULTTOPRIMARY);
+    if (!GetMonitorInfoW(mon, &mi)) return;
+    RECT o = mi.rcWork, r;
+    if (over && IsWindowVisible(over) && !IsIconic(over)) GetWindowRect(over, &o);
+    GetWindowRect(w, &r);
+    int ww = r.right - r.left, wh = r.bottom - r.top;
+    int x = o.left + (o.right - o.left - ww) / 2, y = o.top + (o.bottom - o.top - wh) / 2;
+    if (x + ww > mi.rcWork.right) x = mi.rcWork.right - ww;
+    if (y + wh > mi.rcWork.bottom) y = mi.rcWork.bottom - wh;
+    if (x < mi.rcWork.left) x = mi.rcWork.left;
+    if (y < mi.rcWork.top) y = mi.rcWork.top;
+    SetWindowPos(w, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static LRESULT sub_ctlcolor(HDC dc, HWND c) {
+    int gray = c == g_s_perm_note || c == g_s_login_note || c == g_s_awake_note || c == g_s_relay_note || c == g_p_step1 ||
+               c == g_p_step2;
+    int link = c == g_s_relay_how || c == g_p_link;
+    SetTextColor(dc, GetSysColor(link ? COLOR_HOTLIGHT : gray ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT));
+    SetBkColor(dc, GetSysColor(COLOR_WINDOW));
+    return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+}
+
+static int checked(HWND c) { return SendMessageW(c, BM_GETCHECK, 0, 0) == BST_CHECKED; }
+
+// --- The Settings window.
+static void settings_build(void) {
+    SubWin *w = &g_set;
+    const DWORD btn = BS_PUSHBUTTON | WS_TABSTOP, box = BS_AUTOCHECKBOX | WS_TABSTOP, note = SS_LEFT | SS_NOPREFIX;
+    g_s_perm = make_sub(w, L"BUTTON", L"Permanent access", box, 0, ID_S_PERM, w->font);
+    g_s_perm_note = make_sub(w, L"STATIC", kPermNote, note, 0, 0, w->small);
+    g_s_setup = make_sub(w, L"BUTTON", L"Set up the phone…", btn, 0, ID_S_SETUP, w->font);
+    g_s_login = make_sub(w, L"BUTTON", L"Start RDC at login", box, 0, ID_S_LOGIN, w->font);
+    g_s_login_note = make_sub(w, L"STATIC", kLoginNote, note, 0, 0, w->small);
+    g_s_awake = make_sub(w, L"BUTTON", L"Keep this computer awake", box, 0, ID_S_AWAKE, w->font);
+    g_s_awake_note = make_sub(w, L"STATIC", kAwakeNote, note, 0, 0, w->small);
+    g_s_line = make_sub(w, L"STATIC", L"", SS_ETCHEDHORZ, 0, 0, w->font);
+    g_s_relay_title = make_sub(w, L"STATIC", L"Relay — when a phone cannot connect directly", SS_LEFT | SS_NOPREFIX, 0, 0, w->font);
+    g_s_relay = make_sub(w, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, ID_S_RELAY, w->font);
+    SendMessageW(g_s_relay, CB_ADDSTRING, 0, (LPARAM)L"RDC's relay");
+    SendMessageW(g_s_relay, CB_ADDSTRING, 0, (LPARAM)L"My own relay");
+    SendMessageW(g_s_relay, CB_ADDSTRING, 0, (LPARAM)L"Off");
+    g_s_relay_url = make_sub(w, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, ID_S_RELAY_URL, w->font);
+    SendMessageW(g_s_relay_url, EM_SETCUEBANNER, TRUE, (LPARAM)L"https://rdc-relay.<your-name>.workers.dev");
+    SendMessageW(g_s_relay_url, EM_SETLIMITTEXT, 250, 0);
+    g_s_relay_use = make_sub(w, L"BUTTON", L"Use", btn, 0, ID_S_RELAY_USE, w->font);
+    g_s_relay_note = make_sub(w, L"STATIC", L"", note, 0, 0, w->small);
+    g_s_relay_how = make_sub(w, L"STATIC", L"How to set up your own relay…", SS_LEFT | SS_NOPREFIX | SS_NOTIFY, 0, ID_S_RELAY_HOW, w->extra);
+}
+
+static void settings_layout(int perm_on, int own_shown) {
+    SubWin *w = &g_set;
+    int y = 18, h, tw;
+    place(w, g_s_perm, 24, y, 392, 24);
+    y += 26;
+    h = text_height(w, w->small, kPermNote, 372, NULL);
+    place(w, g_s_perm_note, 44, y, 372, h);
+    y += h + 10;
+    show(g_s_setup, perm_on);
+    if (perm_on) {
+        place(w, g_s_setup, 44, y, 200, 30);
+        y += 30 + 10;
+    }
+    y += 8;
+    place(w, g_s_login, 24, y, 392, 24);
+    y += 26;
+    h = text_height(w, w->small, kLoginNote, 372, NULL);
+    place(w, g_s_login_note, 44, y, 372, h);
+    y += h + 18;
+    place(w, g_s_awake, 24, y, 392, 24);
+    y += 26;
+    h = text_height(w, w->small, kAwakeNote, 372, NULL);
+    place(w, g_s_awake_note, 44, y, 372, h);
+    y += h + 18;
+    place(w, g_s_line, 24, y, 392, 2);
+    y += 16;
+    place(w, g_s_relay_title, 24, y, 392, 22);
+    y += 26;
+    place(w, g_s_relay, 24, y, 220, 200);  // the height of a drop-down list includes its list
+    y += 36;
+    show(g_s_relay_url, own_shown);
+    show(g_s_relay_use, own_shown);
+    if (own_shown) {
+        place(w, g_s_relay_url, 24, y, 300, 28);
+        place(w, g_s_relay_use, 332, y - 1, 84, 30);
+        y += 38;
+    }
+    wchar_t text[512];
+    GetWindowTextW(g_s_relay_note, text, 512);
+    h = text_height(w, w->small, text, 392, NULL);
+    place(w, g_s_relay_note, 24, y, 392, h);
+    y += h + 10;
+    text_height(w, w->extra, L"How to set up your own relay…", 392, &tw);
+    place(w, g_s_relay_how, 24, y, tw, 20);
+    y += 20 + 20;
+    sub_client_height(w, y);
+}
+
+// The "relay" pref: not set — RDC's relay, "off" — none, otherwise the person's own.
+static int relay_refresh(void) {
+    char buf[256];
+    wchar_t v[256];
+    int n = rdc_pref_string("relay", buf, sizeof buf);
+    to_wide(n >= 0 ? buf : "", v, 256);
+    int off = wcscmp(v, L"off") == 0, own = v[0] && !off;
+    // "My own relay" picked with no address yet: the field takes over until it holds one.
+    if ((int)SendMessageW(g_s_relay, CB_GETCURSEL, 0, 0) != 1 || own) SendMessageW(g_s_relay, CB_SETCURSEL, off ? 2 : own ? 1 : 0, 0);
+    int own_shown = (int)SendMessageW(g_s_relay, CB_GETCURSEL, 0, 0) == 1;
+    if (own && GetFocus() != g_s_relay_url) set_text(g_s_relay_url, v);
+    EnableWindow(g_s_relay_use, !g_relay_checking);
+    set_text(g_s_relay_note, g_relay_msg[0] ? g_relay_msg
+                             : off          ? L"Only direct connections. A phone on mobile data may not reach this PC."
+                             : own_shown    ? L"Your own Cloudflare Worker: it sees only sealed bytes. Press Enter or Use to use the address."
+                                            : L"If a direct connection fails, the phone and this PC meet on RDC's Cloudflare Worker. "
+                                              L"It passes sealed bytes and cannot see the screen.");
+    return own_shown;
+}
+
+static void settings_refresh(void) {
+    if (!g_set.hwnd) return;
+    AcquireSRWLockShared(&g_ui_lock);
+    int on = g_perm_on;
+    ReleaseSRWLockShared(&g_ui_lock);
+    SendMessageW(g_s_perm, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+    LONG login = g_login_state;
+    SendMessageW(g_s_login, BM_SETCHECK, login == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
+    EnableWindow(g_s_login, login >= 0 && !g_login_busy);
+    SendMessageW(g_s_awake, BM_SETCHECK, rdc_pref_bool("keep_awake", 0) ? BST_CHECKED : BST_UNCHECKED, 0);
+    int own_shown = relay_refresh();
+    settings_layout(on, own_shown);
+}
+
+static void relay_chosen(void) {
+    int i = (int)SendMessageW(g_s_relay, CB_GETCURSEL, 0, 0);
+    g_relay_msg[0] = 0;
+    g_relay_gen++;  // a check still running no longer decides anything
+    g_relay_checking = 0;
+    if (i == 1) {
+        settings_refresh();
+        SetFocus(g_s_relay_url);
+        return;
+    }
+    rdc_set_pref_string("relay", i == 2 ? "off" : "");
+    action(RDC_ACTION_RELAY_CHANGED);
+    settings_refresh();
+}
+
+static void relay_use(void) {
+    if (g_relay_checking) return;
+    wchar_t in[300];
+    GetWindowTextW(g_s_relay_url, in, 300);
+    wchar_t *v = in;
+    while (*v == L' ' || *v == L'\t' || *v == L'\r' || *v == L'\n') v++;
+    size_t n = wcslen(v);
+    while (n > 0 && (v[n - 1] == L' ' || v[n - 1] == L'\t' || v[n - 1] == L'\r' || v[n - 1] == L'\n' || v[n - 1] == L'/')) v[--n] = 0;
+    if (n < 12 || wcsncmp(v, L"https://", 8) != 0 || wcspbrk(v + 8, L"/?#@ \t") != NULL) {
+        wcscpy(g_relay_msg, L"That does not look like a relay address: it starts with https:// and has no path.");
+        settings_refresh();
+        return;
+    }
+    RelayCheck *rc = calloc(1, sizeof *rc);
+    if (!rc || to_utf8(v, rc->url, sizeof rc->url) != 0) {
+        free(rc);
+        return;
+    }
+    set_text(g_s_relay_url, v);
+    rc->gen = ++g_relay_gen;
+    HANDLE t = CreateThread(NULL, 0, relay_check_main, rc, 0, NULL);
+    if (!t) {
+        free(rc);
+        wcscpy(g_relay_msg, L"Cannot check it right now. Try again.");
+    } else {
+        CloseHandle(t);
+        g_relay_checking = 1;
+        wcscpy(g_relay_msg, L"Checking…");
+    }
+    settings_refresh();
+}
+
+static void relay_done(RelayCheck *rc) {
+    if (rc->gen == g_relay_gen) {
+        g_relay_checking = 0;
+        if (rc->result == 1) {
+            rdc_set_pref_string("relay", rc->url);
+            action(RDC_ACTION_RELAY_CHANGED);
+            wcscpy(g_relay_msg, L"Your relay answers. RDC uses it from now on.");
+        } else if (rc->result == 0) {
+            wcscpy(g_relay_msg, L"Something answers there, but it is not an RDC relay.");
+        } else {
+            wcscpy(g_relay_msg, L"Cannot reach it: there is no answer at that address.");
+        }
+        settings_refresh();
+    }
+    free(rc);
+}
+
+static void sub_clear(SubWin *w) {
+    HWND c;
+    while ((c = GetWindow(w->hwnd, GW_CHILD)) != NULL) DestroyWindow(c);
+}
+
+static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE:
+        g_set.hwnd = hwnd;
+        g_set.dpi = (int)GetDpiForWindow(hwnd);
+        sub_fonts(&g_set, 0);
+        settings_build();
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case ID_S_PERM:
+            action(checked(g_s_perm) ? RDC_ACTION_PERMANENT_ON : RDC_ACTION_PERMANENT_OFF);
+            settings_refresh();  // the host has answered through rdc_app_set_permanent by now, or will
+            break;
+        case ID_S_SETUP:
+            perm_show_window();
+            break;
+        case ID_S_LOGIN:
+            login_start(checked(g_s_login));
+            settings_refresh();
+            break;
+        case ID_S_AWAKE: {
+            int on = checked(g_s_awake);
+            rdc_set_pref_bool("keep_awake", on);
+            keep_awake(on);
+            rlog("keep awake: %s", on ? "on" : "off");
+            break;
+        }
+        case ID_S_RELAY:
+            if (HIWORD(wp) == CBN_SELCHANGE) relay_chosen();
+            break;
+        case ID_S_RELAY_URL:
+            // Typing a new address clears the last result.
+            if (HIWORD(wp) == EN_CHANGE && GetFocus() == (HWND)lp && g_relay_msg[0] && !g_relay_checking) {
+                g_relay_msg[0] = 0;
+                settings_refresh();
+            }
+            break;
+        case IDOK:  // Enter (IsDialogMessage) in the address field
+            if (GetFocus() == g_s_relay_url) relay_use();
+            break;
+        case ID_S_RELAY_USE:
+            relay_use();
+            break;
+        case ID_S_RELAY_HOW:
+            if (HIWORD(wp) == STN_CLICKED) ShellExecuteW(hwnd, L"open", kRelayHowTo, NULL, NULL, SW_SHOWNORMAL);
+            break;
+        }
+        return 0;
+    case WM_SETCURSOR:
+        if ((HWND)wp == g_s_relay_how) {
+            SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_HAND));
+            return TRUE;
+        }
+        break;
+    case WM_CTLCOLORSTATIC:
+        return sub_ctlcolor((HDC)wp, (HWND)lp);
+    case WM_DPICHANGED: {
+        // The address being typed and the picked item survive the new controls.
+        wchar_t url[300];
+        GetWindowTextW(g_s_relay_url, url, 300);
+        LRESULT pick = SendMessageW(g_s_relay, CB_GETCURSEL, 0, 0);
+        g_set.dpi = HIWORD(wp);
+        sub_clear(&g_set);
+        sub_fonts(&g_set, 0);
+        settings_build();
+        SetWindowTextW(g_s_relay_url, url);
+        SendMessageW(g_s_relay, CB_SETCURSEL, (WPARAM)pick, 0);
+        const RECT *r = (const RECT *)lp;
+        SetWindowPos(hwnd, NULL, r->left, r->top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        settings_refresh();
+        return 0;
+    }
+    case WM_CLOSE:
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void settings_show(void) {
+    if (!g_set.hwnd) {
+        RECT r = {0, 0, 0, 0};
+        if (g_hwnd) GetWindowRect(g_hwnd, &r);
+        // Created over the main window, so it starts on that monitor with its DPI.
+        if (!CreateWindowExW(0, L"RDCSettings", L"RDC Settings", kSubStyle, r.left, r.top, 100, 100, g_hwnd, NULL,
+                             GetModuleHandleW(NULL), NULL)) {
+            rlog("settings window not created (%lu)", (unsigned long)GetLastError());
+            return;
+        }
+        settings_refresh();
+        center_over(g_set.hwnd, g_hwnd);
+    }
+    login_start(-1);  // what is there now: the task or the Run key may have changed outside RDC
+    settings_refresh();
+    ShowWindow(g_set.hwnd, SW_SHOW);
+    SetForegroundWindow(g_set.hwnd);
+}
+
+// --- The "Permanent access" window: the link's QR code for the phone's camera, and the
+// authenticator's QR code once the person at the PC has proved it is them.
+
+static void paint_qr(HDC dc, const RECT *r, const uint8_t *m, int n) {
+    if (n <= 0) return;
+    int total = n + 8, side = r->right - r->left;  // 4 light modules of quiet zone on each side
+    FillRect(dc, r, (HBRUSH)GetStockObject(WHITE_BRUSH));
+    HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    for (int y = 0; y < n; y++) {
+        for (int x = 0; x < n;) {
+            if (!m[y * n + x]) {
+                x++;
+                continue;
+            }
+            int x1 = x;
+            while (x1 < n && m[y * n + x1]) x1++;  // one rectangle for a run of dark modules
+            RECT c = {r->left + MulDiv(x + 4, side, total), r->top + MulDiv(y + 4, side, total), r->left + MulDiv(x1 + 4, side, total),
+                      r->top + MulDiv(y + 5, side, total)};
+            FillRect(dc, &c, black);
+            x = x1;
+        }
+    }
+}
+
+static void perm_build(void) {
+    SubWin *w = &g_perm;
+    const DWORD btn = BS_PUSHBUTTON | WS_TABSTOP, note = SS_LEFT | SS_NOPREFIX;
+    g_p_step1 = make_sub(w, L"STATIC", kStep1, note, 0, 0, w->small);
+    g_p_link = make_sub(w, L"EDIT", L"", ES_CENTER | ES_READONLY | ES_AUTOHSCROLL, 0, 0, w->small);
+    g_p_copy = make_sub(w, L"BUTTON", L"Copy link", btn, 0, ID_P_COPY, w->font);
+    g_p_step2 = make_sub(w, L"STATIC", kStep2, note, 0, 0, w->small);
+    g_p_show = make_sub(w, L"BUTTON", L"Show the code for the authenticator app", btn, 0, ID_P_SHOW, w->font);
+    g_p_key = make_sub(w, L"EDIT", L"", ES_CENTER | ES_READONLY | ES_AUTOHSCROLL, 0, 0, w->extra);
+    g_p_reset = make_sub(w, L"BUTTON", L"New link and key…", btn, 0, ID_P_RESET, w->font);
+}
+
+static void perm_layout(void) {
+    SubWin *w = &g_perm;
+    int y = 20, h;
+    RECT q1 = g_p_qr1, q2 = g_p_qr2;
+    h = text_height(w, w->small, kStep1, 392, NULL);
+    place(w, g_p_step1, 24, y, 392, h);
+    y += h + 12;
+    g_p_qr1 = (RECT){sx(w, 135), sx(w, y), sx(w, 135) + sx(w, 170), sx(w, y) + sx(w, 170)};
+    y += 170 + 10;
+    place(w, g_p_link, 12, y, 416, 22);
+    y += 22 + 8;
+    place(w, g_p_copy, 135, y, 170, 30);
+    y += 30 + 22;
+    h = text_height(w, w->small, kStep2, 392, NULL);
+    place(w, g_p_step2, 24, y, 392, h);
+    y += h + 12;
+    show(g_p_show, !g_perm_revealed);
+    show(g_p_key, g_perm_revealed);
+    if (!g_perm_revealed) {
+        place(w, g_p_show, 60, y, 320, 30);
+        y += 30 + 22;
+        g_p_qr2 = (RECT){0, 0, 0, 0};
+    } else {
+        g_p_qr2 = (RECT){sx(w, 125), sx(w, y), sx(w, 125) + sx(w, 190), sx(w, y) + sx(w, 190)};
+        y += 190 + 10;
+        place(w, g_p_key, 12, y, 416, 22);
+        y += 22 + 22;
+    }
+    place(w, g_p_reset, 120, y, 200, 30);
+    y += 30 + 20;
+    sub_client_height(w, y);
+    if (!EqualRect(&q1, &g_p_qr1) || !EqualRect(&q2, &g_p_qr2)) InvalidateRect(w->hwnd, NULL, TRUE);
+}
+
+static void perm_refresh(void) {
+    if (!g_perm.hwnd) return;
+    wchar_t link[512], key[96], text[160];
+    AcquireSRWLockShared(&g_ui_lock);
+    int on = g_perm_on, serial = g_perm_serial;
+    wcscpy(link, g_perm_link);
+    wcscpy(key, g_perm_key);
+    ReleaseSRWLockShared(&g_ui_lock);
+    if (wcscmp(key, g_perm_shown_key) != 0) {  // a new key is hidden again
+        g_perm_revealed = 0;
+        wcscpy(g_perm_shown_key, key);
+    }
+    if (!on) {
+        g_perm_revealed = 0;
+        if (IsWindowVisible(g_perm.hwnd)) ShowWindow(g_perm.hwnd, SW_HIDE);
+    }
+    set_text(g_p_link, link);
+    wfmt(text, 160, L"Or type the key: %ls", key);
+    set_text(g_p_key, g_perm_revealed ? text : L"");
+    perm_layout();
+    if (serial != g_perm_seen) {
+        g_perm_seen = serial;
+        InvalidateRect(g_perm.hwnd, NULL, TRUE);
+    }
+}
+
+// Whoever is merely connected must not see the authenticator's key: the Windows account password
+// of the person at this PC first. 1 — it is them.
+static int same_user(HANDLE logon) {
+    union {
+        TOKEN_USER user;
+        uint8_t bytes[256];
+    } a, b;
+    DWORD n = 0;
+    HANDLE own = NULL;
+    int same = 0;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &own)) {
+        if (GetTokenInformation(own, TokenUser, &a, sizeof a, &n) && GetTokenInformation(logon, TokenUser, &b, sizeof b, &n))
+            same = EqualSid(a.user.User.Sid, b.user.User.Sid) != 0;
+        CloseHandle(own);
+    }
+    return same;
+}
+
+#ifndef CRED_PACK_PROTECTED_CREDENTIALS
+#define CRED_PACK_PROTECTED_CREDENTIALS 0x1
+#endif
+
+static int verify_user(HWND owner) {
+    CREDUI_INFOW ui;
+    memset(&ui, 0, sizeof ui);
+    ui.cbSize = sizeof ui;
+    ui.hwndParent = owner;
+    ui.pszCaptionText = L"RDC";
+    ui.pszMessageText = L"Enter the password of this Windows account to show the code for the authenticator app.";
+    DWORD auth_error = 0;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        ULONG package = 0, out_len = 0;
+        void *out = NULL;
+        BOOL save = FALSE;
+        DWORD rc = CredUIPromptForWindowsCredentialsW(&ui, auth_error, &package, NULL, 0, &out, &out_len, &save,
+                                                      CREDUIWIN_ENUMERATE_CURRENT_USER);
+        if (rc != ERROR_SUCCESS) {
+            if (rc != ERROR_CANCELLED) rlog("authenticator code: the password prompt failed (%lu)", (unsigned long)rc);
+            return 0;
+        }
+        static wchar_t user[CREDUI_MAX_USERNAME_LENGTH + 1], domain[CREDUI_MAX_DOMAIN_TARGET_LENGTH + 1],
+            pass[CREDUI_MAX_PASSWORD_LENGTH + 1], u[CREDUI_MAX_USERNAME_LENGTH + 1], d[CREDUI_MAX_DOMAIN_TARGET_LENGTH + 1];
+        BOOL ok = FALSE;
+        for (int flags = CRED_PACK_PROTECTED_CREDENTIALS; flags >= 0 && !ok; flags--) {
+            DWORD nu = CREDUI_MAX_USERNAME_LENGTH + 1, nd = CREDUI_MAX_DOMAIN_TARGET_LENGTH + 1, np = CREDUI_MAX_PASSWORD_LENGTH + 1;
+            ok = CredUnPackAuthenticationBufferW((DWORD)flags, out, out_len, user, &nu, domain, &nd, pass, &np);
+        }
+        SecureZeroMemory(out, out_len);
+        CoTaskMemFree(out);
+        if (!ok) {
+            rlog("authenticator code: Windows gave RDC no password to check (%lu); sign in with the account password",
+                 (unsigned long)GetLastError());
+            SecureZeroMemory(pass, sizeof pass);
+            MessageBoxW(owner, L"RDC can check only the account password. Try again and enter the password rather than a PIN.",
+                        L"RDC", MB_OK | MB_ICONINFORMATION);
+            continue;
+        }
+        // "DOMAIN\user" (or "MicrosoftAccount\name@example.com") when the domain came back empty.
+        wcscpy(u, user);
+        wcscpy(d, domain);
+        if (!d[0] && CredUIParseUserNameW(user, u, CREDUI_MAX_USERNAME_LENGTH + 1, d, CREDUI_MAX_DOMAIN_TARGET_LENGTH + 1) != NO_ERROR) {
+            wcscpy(u, user);
+            d[0] = 0;
+        }
+        HANDLE token = NULL;
+        BOOL good = LogonUserW(u, d[0] ? d : NULL, pass, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, &token);
+        DWORD err = good ? 0 : GetLastError();
+        int blank = pass[0] == 0;
+        SecureZeroMemory(pass, sizeof pass);
+        if (good) {
+            int same = same_user(token);
+            CloseHandle(token);
+            if (same) return 1;
+            err = ERROR_LOGON_FAILURE;
+        } else if (err == ERROR_ACCOUNT_RESTRICTION && blank) {
+            // The right (empty) password of an account that has none: Windows lets it log on only at the console.
+            wchar_t me[CREDUI_MAX_USERNAME_LENGTH + 1];
+            DWORD n = CREDUI_MAX_USERNAME_LENGTH + 1;
+            if (GetUserNameW(me, &n) && _wcsicmp(me, u) == 0) return 1;
+        }
+        rlog("authenticator code: the password was not accepted (%lu)", (unsigned long)err);
+        auth_error = ERROR_LOGON_FAILURE;
+    }
+    return 0;
+}
+
+static void perm_reveal(void) {
+    if (verify_user(g_perm.hwnd)) {
+        g_perm_revealed = 1;
+        rlog("authenticator code: shown on this PC");
+    }
+    perm_refresh();
+}
+
+static void perm_reset(void) {
+    if (MessageBoxW(g_perm.hwnd,
+                    L"Make a new link and key?\n\nThe old link and the entry in the authenticator app stop working. You will set both up again.",
+                    L"RDC", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+        return;
+    g_perm_revealed = 0;
+    action(RDC_ACTION_PERMANENT_RESET);
+    perm_refresh();
+}
+
+static LRESULT CALLBACK perm_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE:
+        g_perm.hwnd = hwnd;
+        g_perm.dpi = (int)GetDpiForWindow(hwnd);
+        sub_fonts(&g_perm, 1);
+        perm_build();
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        AcquireSRWLockShared(&g_ui_lock);
+        paint_qr(dc, &g_p_qr1, g_perm_link_qr, g_perm_link_qr_size);
+        if (g_perm_revealed) paint_qr(dc, &g_p_qr2, g_perm_auth_qr, g_perm_auth_qr_size);
+        ReleaseSRWLockShared(&g_ui_lock);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case ID_P_COPY: {
+            wchar_t link[512];
+            AcquireSRWLockShared(&g_ui_lock);
+            wcscpy(link, g_perm_link);
+            ReleaseSRWLockShared(&g_ui_lock);
+            if (link[0] && clipboard_set(hwnd, link) == 0) {
+                SetWindowTextW(g_p_copy, L"Copied ✓");
+                SetTimer(hwnd, TIMER_P_COPIED, 1500, NULL);
+            }
+            break;
+        }
+        case ID_P_SHOW:
+            perm_reveal();
+            break;
+        case ID_P_RESET:
+            perm_reset();
+            break;
+        }
+        return 0;
+    case WM_TIMER:
+        if (wp == TIMER_P_COPIED) {
+            KillTimer(hwnd, TIMER_P_COPIED);
+            SetWindowTextW(g_p_copy, L"Copy link");
+        }
+        return 0;
+    case WM_CTLCOLORSTATIC:
+        return sub_ctlcolor((HDC)wp, (HWND)lp);
+    case WM_DPICHANGED: {
+        g_perm.dpi = HIWORD(wp);
+        sub_clear(&g_perm);
+        sub_fonts(&g_perm, 1);
+        perm_build();
+        const RECT *r = (const RECT *)lp;
+        SetWindowPos(hwnd, NULL, r->left, r->top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        g_perm_seen = -1;
+        perm_refresh();
+        return 0;
+    }
+    case WM_CLOSE:
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void perm_show_window(void) {
+    AcquireSRWLockShared(&g_ui_lock);
+    int on = g_perm_on;
+    ReleaseSRWLockShared(&g_ui_lock);
+    if (!on) return;
+    if (!g_perm.hwnd) {
+        RECT r = {0, 0, 0, 0};
+        if (g_set.hwnd) GetWindowRect(g_set.hwnd, &r);
+        if (!CreateWindowExW(0, L"RDCPermanent", L"Permanent access", kSubStyle, r.left, r.top, 100, 100, g_set.hwnd, NULL,
+                             GetModuleHandleW(NULL), NULL)) {
+            rlog("permanent access window not created (%lu)", (unsigned long)GetLastError());
+            return;
+        }
+    }
+    g_perm_revealed = 0;  // every visit asks again before the key is shown
+    perm_refresh();
+    center_over(g_perm.hwnd, g_set.hwnd);
+    ShowWindow(g_perm.hwnd, SW_SHOW);
+    SetForegroundWindow(g_perm.hwnd);
+}
+
+void rdc_app_set_permanent(int on, const char *link, const uint8_t *link_qr, int link_qr_size,
+                           const uint8_t *auth_qr, int auth_qr_size, const char *secret_text) {
+    if (!link_qr || link_qr_size < 0 || link_qr_size > QR_MAX) link_qr_size = 0;
+    if (!auth_qr || auth_qr_size < 0 || auth_qr_size > QR_MAX) auth_qr_size = 0;
+    AcquireSRWLockExclusive(&g_ui_lock);
+    g_perm_on = on != 0;
+    to_wide(link, g_perm_link, 512);
+    to_wide(secret_text, g_perm_key, 96);
+    g_perm_link_qr_size = link_qr_size;
+    g_perm_auth_qr_size = auth_qr_size;
+    if (link_qr_size) memcpy(g_perm_link_qr, link_qr, (size_t)link_qr_size * (size_t)link_qr_size);
+    if (auth_qr_size) memcpy(g_perm_auth_qr, auth_qr, (size_t)auth_qr_size * (size_t)auth_qr_size);
+    g_perm_serial++;
+    ReleaseSRWLockExclusive(&g_ui_lock);
+    post_refresh();
 }
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2091,6 +3026,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // A launch without administrator rights may ask this window to come forward too.
         if (g_msg_show) ChangeWindowMessageFilterEx(hwnd, g_msg_show, MSGFLT_ALLOW, NULL);
         g_dpi = (int)GetDpiForWindow(hwnd);
+        // With start at login on, closing the window only hides it: the window menu can still quit.
+        HMENU sys = GetSystemMenu(hwnd, FALSE);
+        if (sys) {
+            AppendMenuW(sys, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(sys, MF_STRING, IDM_QUIT, L"Quit RDC");
+        }
         rebuild(hwnd);
         int w, h;
         window_size(g_dpi, &w, &h);
@@ -2104,6 +3045,24 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_RDC_REFRESH:
         refresh_ui();
+        return 0;
+    case WM_RDC_RELAY_DONE:
+        relay_done((RelayCheck *)lp);
+        return 0;
+    case WM_SYSCOMMAND:
+        if ((wp & 0xFFF0) == IDM_QUIT) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        // Start at login on: RDC is there to be reached, so closing the window leaves it running;
+        // launching RDC again brings the window back.
+        if (g_login_state == 1) {
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        }
+        DestroyWindow(hwnd);
         return 0;
     case WM_TIMER:
         if (wp == TIMER_COPIED) {
@@ -2142,6 +3101,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case ID_INSTALL:
             action(RDC_ACTION_INSTALL_UPDATE);
+            break;
+        case ID_SETTINGS:
+            settings_show();
             break;
         case ID_MEDIA_STOP:
             action(RDC_ACTION_STOP_MEDIA);
@@ -2193,6 +3155,14 @@ void rdc_app_run(rdc_ctx_cb on_ready, rdc_action_cb on_action, void *ctx) {
     if (!wc.hIcon) wc.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
     wc.lpszClassName = L"RDCWindow";
     RegisterClassExW(&wc);
+    wc.lpfnWndProc = settings_proc;
+    wc.lpszClassName = L"RDCSettings";
+    RegisterClassExW(&wc);
+    wc.lpfnWndProc = perm_proc;
+    wc.lpszClassName = L"RDCPermanent";
+    RegisterClassExW(&wc);
+    keep_awake(rdc_pref_bool("keep_awake", 0));
+    login_start(-1);  // is start at login on: closing the window hides it then
     // Centered in the work area of the main monitor.
     int w, h, x = CW_USEDEFAULT, y = CW_USEDEFAULT;
     window_size((int)GetDpiForSystem(), &w, &h);
@@ -2206,11 +3176,18 @@ void rdc_app_run(rdc_ctx_cb on_ready, rdc_action_cb on_action, void *ctx) {
         rlog("window not created (%lu)", (unsigned long)GetLastError());
         ExitProcess(1);
     }
-    ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
+    // Started at login: out of the way until RDC is launched again.
+    if (started_at_login()) {
+        rlog("started at login: the window stays hidden until RDC is launched again");
+    } else {
+        ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
+    }
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {
         if (IsDialogMessageW(hwnd, &m)) continue;
+        if (g_set.hwnd && IsDialogMessageW(g_set.hwnd, &m)) continue;
+        if (g_perm.hwnd && IsDialogMessageW(g_perm.hwnd, &m)) continue;
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }

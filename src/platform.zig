@@ -16,6 +16,7 @@ pub const action_media_remove: c_int = 10;
 pub const action_permanent_on: c_int = 11;
 pub const action_permanent_off: c_int = 12;
 pub const action_permanent_reset: c_int = 13;
+pub const action_relay_changed: c_int = 14;
 
 pub const media_mic: c_int = 1;
 pub const media_camera: c_int = 2;
@@ -66,6 +67,8 @@ pub extern fn rdc_install_path(buf: [*]u8, buflen: c_int) c_int;
 pub extern fn rdc_cleanup_old_install() void;
 pub extern fn rdc_pref_bool(key: [*:0]const u8, def: c_int) c_int;
 pub extern fn rdc_set_pref_bool(key: [*:0]const u8, value: c_int) void;
+pub extern fn rdc_pref_string(key: [*:0]const u8, buf: [*]u8, buflen: c_int) c_int;
+pub extern fn rdc_set_pref_string(key: [*:0]const u8, value: [*:0]const u8) void;
 pub extern fn rdc_seed_load(buf: [*]u8, cap: c_int) c_int;
 pub extern fn rdc_seed_save(data: [*]const u8, len: c_int) c_int;
 pub extern fn rdc_app_set_permanent(on: c_int, link: [*:0]const u8, link_qr: ?[*]const u8, link_qr_size: c_int, auth_qr: ?[*]const u8, auth_qr_size: c_int, secret_text: [*:0]const u8) void;

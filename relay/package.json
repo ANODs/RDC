@@ -1,0 +1,7 @@
+{
+  "name": "rdc-relay",
+  "private": true,
+  "description": "RDC relay: passes sealed messages between RDC and a browser that cannot connect directly",
+  "scripts": { "deploy": "wrangler deploy", "dev": "wrangler dev" },
+  "devDependencies": { "wrangler": "^4" }
+}

@@ -23,6 +23,7 @@ const usage =
     \\  --update-url U  for testing: updates from U instead of GitHub releases
     \\  --no-remote     no link from anywhere: no public signaling brokers, no WebRTC
     \\  --remote-url U  for testing: the page the link from anywhere opens (default https://anods.github.io/RDC/)
+    \\  --relay URL|off the relay for browsers that cannot connect directly (default: Settings, or RDC's own)
     \\
     \\MCP options (stdio by default; Claude Code, Codex and Claude Desktop start it this way):
     \\  --name NAME     how the agent is shown on the controlled computer (default: the client's name)
@@ -73,6 +74,9 @@ pub fn main(init: std.process.Init) !void {
             opts.update_url = args[i];
         } else if (eql(u8, a, "--no-remote")) {
             opts.remote = false;
+        } else if (i + 1 < args.len and eql(u8, a, "--relay")) {
+            i += 1;
+            opts.relay = args[i]; // a relay address, or "off"
         } else if (eql(u8, a, "--login")) {
             opts.login = true; // started by the OS at login: the window stays hidden
         } else if (eql(u8, a, "--elevated")) {

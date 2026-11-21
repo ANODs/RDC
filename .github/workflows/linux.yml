@@ -1,0 +1,77 @@
+name: Linux host
+
+# The Linux host (src/platform/linux/) on a real X server: Xvfb on ubuntu-latest. The host runs
+# without a window, src/platform/linux/ci_smoke.py connects as a viewer and checks the handshake,
+# a JPEG frame, silence for a still screen and a mouse move; then the host runs with its GTK window
+# and the window must appear. The frames it received are kept as an artifact.
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'build.zig', '.github/workflows/linux.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.17.1
+
+jobs:
+  smoke:
+    name: Host under Xvfb
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test
+      - name: Build x86_64 and aarch64
+        run: |
+          zig build package -Dtarget=x86_64-linux-gnu.2.28 -Doptimize=ReleaseSafe
+          zig build -Dtarget=aarch64-linux-gnu.2.28 -Doptimize=ReleaseSafe -p zig-out/aarch64
+          ls -l zig-out/package/rdc-linux-x86_64 zig-out/aarch64/bin/rdc
+      - name: Install Xvfb and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils xdotool libxtst6 libxfixes3 libxext6
+          sudo apt-get install -y libgtk-3-0t64 || sudo apt-get install -y libgtk-3-0
+      - name: Host without a window
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &
+          export DISPLAY=:99
+          for i in $(seq 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.2; done
+          xdpyinfo | grep -E 'dimensions|MIT-SHM|XTEST|XFIXES|XInputExtension' || true
+          zig-out/package/rdc-linux-x86_64 version
+          zig-out/package/rdc-linux-x86_64 host --no-ui --no-remote > host.log 2>&1 &
+          python3 src/platform/linux/ci_smoke.py host.log smoke
+          grep -q "capture: X11 (MIT-SHM)" host.log || { echo "::error::capture did not use MIT-SHM"; exit 1; }
+      - name: Host with its window
+        run: |
+          export DISPLAY=:99
+          zig-out/package/rdc-linux-x86_64 --no-remote --port 7800 > window.log 2>&1 &
+          for i in $(seq 50); do xdotool search --name '^RDC' >/dev/null 2>&1 && break; sleep 0.2; done
+          xdotool search --name '^RDC' >/dev/null || { echo "::error::no RDC window"; cat window.log; exit 1; }
+          if grep -q "running without a window" window.log; then echo "::error::GTK did not start"; exit 1; fi
+          xwininfo -root -tree | grep -i '"RDC' || true
+          # A second launch brings the first window forward and exits.
+          zig-out/package/rdc-linux-x86_64 --no-remote --port 7801 > second.log 2>&1
+          grep -q "already running" second.log || { echo "::error::a second window started"; cat second.log; exit 1; }
+          # The window, as a viewer sees it.
+          python3 src/platform/linux/ci_smoke.py window.log window --window
+      - name: Logs
+        if: always()
+        run: |
+          for f in host.log window.log second.log ~/.local/state/rdc/rdc.log; do
+            [ -f "$f" ] && { echo "== $f"; cat "$f"; }
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: linux-frames
+          path: |
+            smoke/*.jpg
+            window/*.jpg
+          if-no-files-found: ignore

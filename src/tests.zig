@@ -5,6 +5,7 @@ test {
     _ = @import("core/proto.zig");
     _ = @import("core/totp.zig");
     _ = @import("core/qr.zig");
+    _ = @import("core/jpeg.zig");
     _ = @import("net/ws.zig");
     _ = @import("net/http.zig");
     _ = @import("net/stun.zig");
@@ -14,6 +15,7 @@ test {
     _ = @import("net/mqtt.zig");
     _ = @import("net/signal.zig");
     _ = @import("net/webrtc.zig");
+    _ = @import("net/relay.zig");
     _ = @import("core/manifest.zig");
     _ = @import("agent/keys.zig");
     _ = @import("agent/client.zig");

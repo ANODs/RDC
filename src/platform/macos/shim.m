@@ -855,6 +855,22 @@ void rdc_set_pref_bool(const char *key, int value) {
     [NSUserDefaults.standardUserDefaults setBool:value != 0 forKey:[NSString stringWithUTF8String:key]];
 }
 
+int rdc_pref_string(const char *key, char *buf, int buflen) {
+    NSString *v = [NSUserDefaults.standardUserDefaults stringForKey:[NSString stringWithUTF8String:key]];
+    if (!v) return -1;
+    const char *u = v.UTF8String;
+    size_t n = strlen(u);
+    if ((int)n >= buflen) return -1;
+    memcpy(buf, u, n + 1);
+    return (int)n;
+}
+
+void rdc_set_pref_string(const char *key, const char *value) {
+    NSString *k = [NSString stringWithUTF8String:key];
+    if (!value || !value[0]) return [NSUserDefaults.standardUserDefaults removeObjectForKey:k];
+    [NSUserDefaults.standardUserDefaults setObject:[NSString stringWithUTF8String:value] forKey:k];
+}
+
 // ---------------------------------------------------------------------------
 // Permanent access: the seed file, start at login, staying awake
 
@@ -1154,6 +1170,9 @@ void rdc_camera_stop(void) {}
 @property(nonatomic, strong) NSButton *permShow;
 @property(nonatomic, strong) NSButton *setLogin;
 @property(nonatomic, strong) NSButton *setAwake;
+@property(nonatomic, strong) NSPopUpButton *setRelay;
+@property(nonatomic, strong) NSTextField *setRelayUrl;
+@property(nonatomic, strong) NSTextField *setRelayNote;
 @property(nonatomic) BOOL permRevealed;
 @property(nonatomic, strong) id activity;
 - (void)refreshSettings;
@@ -1518,9 +1537,26 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
         NSTextField *loginHint = make_note(@"RDC starts hidden when you log in and keeps running when its window is closed.");
         self.setAwake = [NSButton checkboxWithTitle:@"Keep this Mac awake" target:self action:@selector(toggleAwake:)];
         NSTextField *awakeHint = make_note(@"A sleeping computer cannot be reached. The display may still turn off; a MacBook with its lid closed sleeps anyway.");
+        // The relay: the way through when a phone and this Mac cannot connect directly.
+        NSBox *line2 = [NSBox new];
+        line2.boxType = NSBoxSeparator;
+        NSTextField *relayTitle = make_label(@"Relay — when a phone cannot connect directly", 13, NSFontWeightRegular, NSColor.labelColor);
+        self.setRelay = [NSPopUpButton new];
+        [self.setRelay addItemsWithTitles:@[ @"RDC's relay", @"My own relay", @"Off" ]];
+        self.setRelay.target = self;
+        self.setRelay.action = @selector(relayChosen:);
+        self.setRelayUrl = [NSTextField textFieldWithString:@""];
+        self.setRelayUrl.placeholderString = @"https://rdc-relay.<your-name>.workers.dev";
+        self.setRelayUrl.target = self;
+        self.setRelayUrl.action = @selector(relayUrlEntered:);
+        [self.setRelayUrl.widthAnchor constraintEqualToConstant:360].active = YES;
+        self.setRelayNote = make_note(@"");
+        NSButton *relayHow = [NSButton buttonWithTitle:@"How to set up your own relay…" target:self action:@selector(relayHowTo:)];
+        relayHow.bezelStyle = NSBezelStyleInline;
         NSStackView *stack = [NSStackView stackViewWithViews:@[
             self.setVersion, self.setAuto, hint, self.setStatus, buttons, self.setRemoveMic, line, self.setPermanent, permHint,
-            self.permSetup, self.setLogin, loginHint, self.setAwake, awakeHint
+            self.permSetup, self.setLogin, loginHint, self.setAwake, awakeHint, line2, relayTitle, self.setRelay, self.setRelayUrl,
+            self.setRelayNote, relayHow
         ]];
         stack.orientation = NSUserInterfaceLayoutOrientationVertical;
         stack.alignment = NSLayoutAttributeCenterX;
@@ -1530,6 +1566,8 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
         [stack setCustomSpacing:4 afterView:self.setLogin];
         [stack setCustomSpacing:4 afterView:self.setAwake];
         [line.widthAnchor constraintEqualToConstant:400].active = YES;
+        [line2.widthAnchor constraintEqualToConstant:400].active = YES;
+        [stack setCustomSpacing:4 afterView:relayTitle];
         [hint.widthAnchor constraintLessThanOrEqualToConstant:400].active = YES;
         [self.setStatus.widthAnchor constraintLessThanOrEqualToConstant:400].active = YES;
         w.contentView = stack;
@@ -1566,6 +1604,7 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     self.permKeyLabel.stringValue = self.permRevealed ? [@"Or type the key: " stringByAppendingString:g_perm_key] : @"";
     self.setLogin.state = autostart_on() ? NSControlStateValueOn : NSControlStateValueOff;
     self.setAwake.state = rdc_pref_bool("keep_awake", 0) ? NSControlStateValueOn : NSControlStateValueOff;
+    [self refreshRelay];
     // Each window is as tall as what it shows, with its top edge in place.
     for (NSWindow *w in @[ self.settingsWindow, self.permWindow ]) {
         [w.contentView layoutSubtreeIfNeeded];
@@ -1584,6 +1623,69 @@ static NSTextField *make_label(NSString *text, CGFloat size, NSFontWeight weight
     [self refreshSettings];
     [self.permWindow center];
     [self.permWindow makeKeyAndOrderFront:nil];
+}
+
+// The "relay" pref: not set — RDC's relay, "off" — none, otherwise the person's own.
+- (void)refreshRelay {
+    char buf[256];
+    int n = rdc_pref_string("relay", buf, sizeof buf);
+    NSString *v = n >= 0 ? @(buf) : @"";
+    BOOL off = [v isEqualToString:@"off"], own = v.length > 0 && !off;
+    if (self.setRelay.indexOfSelectedItem != 1 || own) [self.setRelay selectItemAtIndex:off ? 2 : own ? 1 : 0];
+    BOOL ownShown = self.setRelay.indexOfSelectedItem == 1;
+    self.setRelayUrl.hidden = !ownShown;
+    if (own && ![self.setRelayUrl.stringValue isEqualToString:v] && self.window.firstResponder != self.setRelayUrl.currentEditor)
+        self.setRelayUrl.stringValue = v;
+    self.setRelayNote.stringValue =
+        off ? @"Only direct connections. A phone on mobile data may not reach this Mac."
+        : ownShown ? @"Your own Cloudflare Worker: it sees only sealed bytes. Press Return to use the address."
+                   : @"If a direct connection fails, the phone and this Mac meet on RDC's Cloudflare Worker. It passes sealed bytes and cannot see the screen.";
+}
+
+- (void)relayChosen:(NSPopUpButton *)sender {
+    NSInteger i = sender.indexOfSelectedItem;
+    if (i == 1) {
+        // The address field takes over; until it holds an address, the choice stays as it was.
+        [self refreshSettings];
+        [self.settingsWindow makeFirstResponder:self.setRelayUrl];
+        return;
+    }
+    rdc_set_pref_string("relay", i == 2 ? "off" : "");
+    if (g_on_action) g_on_action(g_app_ctx, RDC_ACTION_RELAY_CHANGED);
+    [self refreshSettings];
+}
+
+- (void)relayUrlEntered:(NSTextField *)sender {
+    NSString *v = [sender.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    while ([v hasSuffix:@"/"]) v = [v substringToIndex:v.length - 1];
+    if (![v hasPrefix:@"https://"] || v.length < 12 || [v substringFromIndex:8].length == 0 ||
+        [[v substringFromIndex:8] rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"/?#@ "]].location != NSNotFound) {
+        self.setRelayNote.stringValue = @"That does not look like a relay address: it starts with https:// and has no path.";
+        return;
+    }
+    sender.stringValue = v;
+    self.setRelayNote.stringValue = @"Checking…";
+    // The relay answers {"rdc_relay":1} at its root.
+    NSURL *u = [NSURL URLWithString:[v stringByAppendingString:@"/"]];
+    [[NSURLSession.sharedSession dataTaskWithURL:u
+                               completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+                                   BOOL ok = data && [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] containsString:@"rdc_relay"];
+                                   dispatch_async(dispatch_get_main_queue(), ^{
+                                       if (!ok) {
+                                           self.setRelayNote.stringValue = err ? [@"Cannot reach it: " stringByAppendingString:err.localizedDescription]
+                                                                                : @"Something answers there, but it is not an RDC relay.";
+                                           return;
+                                       }
+                                       rdc_set_pref_string("relay", v.UTF8String);
+                                       if (g_on_action) g_on_action(g_app_ctx, RDC_ACTION_RELAY_CHANGED);
+                                       [self refreshSettings];
+                                       self.setRelayNote.stringValue = @"Your relay answers. RDC uses it from now on.";
+                                   });
+                               }] resume];
+}
+
+- (void)relayHowTo:(id)sender {
+    [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"https://github.com/ANODs/RDC/tree/main/relay#readme"]];
 }
 
 - (void)togglePermanent:(NSButton *)sender {

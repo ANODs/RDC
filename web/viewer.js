@@ -38,6 +38,7 @@ const canvas = $('screen');
 const ctx2d = canvas.getContext('2d', { alpha: false, desynchronized: true });
 
 let conn = null;               // the current transport: {send(data), close()}
+let via = '';                  // what the stats line says about the path: '', 'WebRTC', 'relay'
 let code = '';
 let key = '';                  // the key of a link from anywhere; empty — this network
 let perm = false;              // the permanent link: the computer asks for a code from an authenticator app
@@ -218,6 +219,7 @@ function closeConn() {
 
 function connect() {
   closeConn();
+  via = '';
   // The permanent link with nothing to show the computer: ask for a code instead of trying.
   if (perm && !resume && !otp) return showJoin('Enter a new code from your authenticator app');
   let c = null;
@@ -244,7 +246,15 @@ function connect() {
       setTimeout(() => wantConnected && !conn && connect(), fatal ? 3000 : 1000);
     },
   };
-  c = key ? rtcLink(code, key, handlers) : wsLink(handlers);
+  // The direct path failed and the computer named its relay: meet there instead.
+  handlers.relay = (url) => {
+    if (conn !== c || !wantConnected) return;
+    rememberRelay(url);
+    c = relayLink(code, key, url, handlers);
+    conn = c;
+  };
+  const relayed = key ? knownRelay() : '';
+  c = !key ? wsLink(handlers) : relayed ? relayLink(code, key, relayed, handlers) : rtcLink(code, key, handlers);
   conn = c;
 }
 
@@ -280,7 +290,10 @@ const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884
 const ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
 const NO_BROKER = 'Could not reach the public servers that find the computer — check the internet connection';
 const NO_ANSWER = 'The computer does not answer. Is RDC running there? The link changes with every new code.';
-const NO_PATH = 'Could not connect directly: the networks on both sides do not allow it (RDC has no relay). Try another network, for example Wi-Fi instead of mobile data.';
+const NO_PATH = 'Could not connect directly: the networks on both sides do not allow it, and the relay is off in RDC\'s Settings on the computer. Try another network, for example Wi-Fi instead of mobile data.';
+const NO_RELAY = 'Could not connect directly, and not through the relay either. Check the internet connection, or try another network.';
+// How long a direct path may take to open before the relay is tried.
+const DIRECT_MS = 9000;
 const MAX_AGE_MS = 60000; // keep in sync with max_skew_ms in src/net/signal.zig
 
 const te = new TextEncoder();
@@ -300,6 +313,25 @@ async function deriveSignal(code, key) {
   const topic = 'rdc/' + hex(bits.subarray(0, 16));
   const aes = await crypto.subtle.importKey('raw', bits.slice(16, 48), 'AES-GCM', false, ['encrypt', 'decrypt']);
   return { topic, aes, ad: te.encode(topic) };
+}
+
+// The relay (src/net/relay.zig): the room and the key from the link's secret and 16 random bytes.
+async function deriveRelay(code, key, r) {
+  const ikm = await crypto.subtle.importKey('raw', te.encode(code), 'HKDF', false, ['deriveBits']);
+  const info = new Uint8Array(12 + r.length);
+  info.set(te.encode('rdc relay v1'));
+  info.set(r, 12);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: b64urlBytes(key), info }, ikm, 48 * 8));
+  const room = hex(bits.subarray(0, 16));
+  const aes = await crypto.subtle.importKey('raw', bits.slice(16, 48), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  return { room, aes, ad: te.encode(room) };
+}
+
+// Which relay worked for this link lately: reconnects go straight there instead of waiting for the direct path.
+const relaySlot = () => 'rdc.relay.' + code + '-' + key;
+function knownRelay() { try { return sessionStorage.getItem(relaySlot()) || ''; } catch (_) { return ''; } }
+function rememberRelay(url) {
+  try { if (url) sessionStorage.setItem(relaySlot(), url); else sessionStorage.removeItem(relaySlot()); } catch (_) {}
 }
 
 async function seal(k, obj) {
@@ -466,6 +498,14 @@ function rtcLink(code, key, h) {
     if (pc) { pc.onconnectionstatechange = null; try { pc.close(); } catch (_) {} }
   };
   const fail = (why, fatal) => { if (ended) return; end(); h.close(why, fatal); };
+  let relayUrl = '';
+  // No direct path: through the computer's relay if it has one.
+  const noPath = () => {
+    if (ended) return;
+    if (!relayUrl || !h.relay) return fail(NO_PATH, true);
+    end();
+    h.relay(relayUrl);
+  };
 
   (async () => {
     progress(host ? 'Reconnecting…' : 'Looking for the computer…');
@@ -475,7 +515,7 @@ function rtcLink(code, key, h) {
     pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
     dc = pc.createDataChannel('rdc', { negotiated: true, id: 0, ordered: true });
     dc.binaryType = 'arraybuffer';
-    dc.onopen = () => { clearTimeout(timer); h.open(); };
+    dc.onopen = () => { clearTimeout(timer); via = 'WebRTC'; h.open(); };
     dc.onclose = () => fail('', false);
     dc.onmessage = (ev) => {
       if (typeof ev.data === 'string') return h.message(ev.data);
@@ -491,7 +531,7 @@ function rtcLink(code, key, h) {
       parts = [];
       h.message(msg.buffer);
     };
-    pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') fail(NO_PATH, true); };
+    pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') noPath(); };
     let offered = false;
     let sig = null;
     pc.addEventListener('icecandidate', (e) => {
@@ -510,9 +550,10 @@ function rtcLink(code, key, h) {
       if (m.t !== 'answer' || answered) return;
       answered = true;
       clearTimeout(timer);
+      if (typeof m.relay === 'string' && /^https?:\/\/[^\s/?#]+$/.test(m.relay)) relayUrl = m.relay;
       progress(host ? 'Reconnecting…' : 'Connecting directly…');
       try { await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp }); } catch (e) { return fail(String(e.message || e), true); }
-      timer = setTimeout(() => fail(NO_PATH, true), 15000);
+      timer = setTimeout(noPath, relayUrl ? DIRECT_MS : 15000);
     });
     offered = true; // candidates found from now on follow the offer
     await sig.send({ t: 'offer', id, ts: Date.now(), sdp: pc.localDescription.sdp });
@@ -522,6 +563,113 @@ function rtcLink(code, key, h) {
   return {
     send(d) { if (dc && dc.readyState === 'open') dc.send(d); },
     buffered() { return dc ? dc.bufferedAmount : 0; },
+    close() { if (!ended) end(); },
+  };
+}
+
+// The relay: both ends meet in a room on a Cloudflare Worker (relay/worker.js) that passes their
+// messages along. Each message is sealed — counter (8) ‖ ciphertext ‖ tag; the nonce is the direction
+// (0 — from here, 1 — from the computer), three zeros and the counter. Inside, the first byte is
+// 't' (text), 'b' (a piece of a binary message, more follow) or 'e' (its last piece).
+function relayLink(code, key, url, h) {
+  let sock = null, timer = 0, off = null, ended = false, ready = false;
+  let k = null, outCtr = 0, inCtr = 0, pending = 0;
+  let outChain = Promise.resolve(), inChain = Promise.resolve();
+  let parts = [];
+  const id = randomHex(8);
+  const end = () => {
+    ended = true;
+    clearTimeout(timer);
+    if (off) off();
+    if (sock) { sock.onclose = null; sock.onmessage = null; try { sock.close(); } catch (_) {} }
+  };
+  const fail = (why, fatal) => {
+    if (ended) return;
+    end();
+    if (fatal) rememberRelay(''); // next time the direct path gets its chance again
+    h.close(why, fatal);
+  };
+  const iv = (dir, n) => {
+    const b = new Uint8Array(12);
+    b[0] = dir;
+    new DataView(b.buffer).setBigUint64(4, BigInt(n));
+    return b;
+  };
+  const sealPiece = (kind, bytes) => {
+    pending++;
+    outChain = outChain.then(async () => {
+      const plain = new Uint8Array(1 + bytes.length);
+      plain[0] = kind.charCodeAt(0);
+      plain.set(bytes, 1);
+      const n = outCtr++;
+      const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv(0, n), additionalData: k.ad }, k.aes, plain));
+      const msg = new Uint8Array(8 + ct.length);
+      new DataView(msg.buffer).setBigUint64(0, BigInt(n));
+      msg.set(ct, 8);
+      if (!ended && sock && sock.readyState === WebSocket.OPEN) sock.send(msg);
+    }).catch(() => fail('', false)).finally(() => { pending--; });
+  };
+  const receive = async (data) => {
+    const b = new Uint8Array(data);
+    if (b.length < 24) throw new Error('short');
+    const n = Number(new DataView(b.buffer, b.byteOffset).getBigUint64(0));
+    if (n !== inCtr) throw new Error('out of order');
+    const plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv(1, n), additionalData: k.ad }, k.aes, b.subarray(8)));
+    inCtr++;
+    const kind = String.fromCharCode(plain[0]);
+    const body = plain.subarray(1);
+    if (kind === 't') return h.message(td.decode(body));
+    if (kind !== 'b' && kind !== 'e') throw new Error('unknown');
+    parts.push(body);
+    if (kind === 'b') return;
+    const total = parts.reduce((s, p) => s + p.length, 0);
+    const whole = new Uint8Array(total);
+    let o = 0;
+    for (const p of parts) { whole.set(p, o); o += p.length; }
+    parts = [];
+    h.message(whole.buffer);
+  };
+
+  (async () => {
+    progress(host ? 'Reconnecting through the relay…' : 'Connecting through the relay…');
+    const r = crypto.getRandomValues(new Uint8Array(16));
+    k = await deriveRelay(code, key, r);
+    const sig = await signaling(code, key);
+    if (ended) return;
+    off = sig.on((m) => {
+      if (m.id !== id || ended) return;
+      if (typeof m.ts !== 'number' || Math.abs(Date.now() - m.ts) > MAX_AGE_MS) return;
+      if (m.t === 'err') fail(m.msg || NO_RELAY, true);
+    });
+    sock = new WebSocket(url.replace(/^http/, 'ws') + '/r/' + k.room);
+    sock.binaryType = 'arraybuffer';
+    sock.onopen = () => { const ts = Date.now(); sig.send({ t: 'relay', id, ts, r: hex(r) }); };
+    sock.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        if (ev.data === 'ready' && !ready) { ready = true; clearTimeout(timer); via = 'relay'; h.open(); }
+        else if (ev.data === 'gone') fail('', false);
+        return;
+      }
+      inChain = inChain.then(() => receive(ev.data)).catch(() => fail('A message through the relay was damaged', false));
+    };
+    sock.onclose = () => fail(ready ? '' : NO_RELAY, !ready);
+    timer = setTimeout(() => fail(NO_RELAY, true), 15000);
+  })().catch((e) => fail(String((e && e.message) || e), true));
+
+  return {
+    send(d) {
+      if (!ready || ended) return;
+      if (typeof d === 'string') return sealPiece('t', te.encode(d));
+      const bytes = d instanceof Uint8Array ? d : new Uint8Array(d);
+      const PIECE = 60 * 1024;
+      let o = 0;
+      do {
+        const take = Math.min(PIECE, bytes.length - o);
+        sealPiece(o + take >= bytes.length ? 'e' : 'b', bytes.subarray(o, o + take));
+        o += take;
+      } while (o < bytes.length);
+    },
+    buffered() { return (sock ? sock.bufferedAmount : 0) + pending * 1024; },
     close() { if (!ended) end(); },
   };
 }
@@ -959,8 +1107,8 @@ setInterval(() => {
   const mbps = (stats.bytes * 8 / dt / 1e6).toFixed(1);
   stats.frames = 0; stats.bytes = 0; stats.t0 = now;
   const codec = host ? (host.codec === 'h264' ? 'H.264' : 'JPEG') : '';
-  const via = key ? ' · WebRTC' : '';
-  $('stat').textContent = host ? `${codec} · ${fps} fps · ${mbps} Mbps · ${Math.round(stats.rtt)} ms${via}` : '';
+  const path = via ? ' · ' + via : '';
+  $('stat').textContent = host ? `${codec} · ${fps} fps · ${mbps} Mbps · ${Math.round(stats.rtt)} ms${path}` : '';
   send(JSON.stringify({ t: 'ping', ts: now }));
 }, 1000);
 

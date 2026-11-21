@@ -23,6 +23,7 @@ const signal = @import("net/signal.zig");
 const totp = @import("core/totp.zig");
 const qr = @import("core/qr.zig");
 const webrtc = @import("net/webrtc.zig");
+const relay = @import("net/relay.zig");
 const proto = @import("core/proto.zig");
 const keymap = @import("core/keymap.zig");
 const Code = @import("core/code.zig").Code;
@@ -47,6 +48,10 @@ pub const max_remote_url_len = 200;
 const max_remote_link_len = max_remote_url_len + "#123456789-".len + signal.salt_text_len;
 /// An offer refused for its clock gets an answer at most this often: it may be a replay.
 const clock_reply_every_us: u64 = 5_000_000;
+/// The relay everyone gets unless Settings say otherwise (relay/README.md: deploy your own).
+pub const default_relay = "https://rdc-relay.timoshkin-timofey.workers.dev";
+/// A relay session whose browser has not said hello by then is dropped.
+const relay_start_us: u64 = 25_000_000;
 const queue_cap = 16;
 const max_frames_queued = 6;
 const max_ws_payload = 16 * 1024;
@@ -73,6 +78,8 @@ pub const Options = struct {
     remote_url: []const u8 = "https://anods.github.io/RDC/",
     /// Started by the OS at login: the window stays hidden (the platform layer reads the flag itself).
     login: bool = false,
+    /// --relay URL|off: the relay for this run, in place of the one in Settings.
+    relay: ?[]const u8 = null,
 };
 
 /// How long a browser that entered an authenticator code may reconnect without a new one.
@@ -105,6 +112,7 @@ fn platformKey(usage: u16) ?c_int {
     return switch (builtin.os.tag) {
         .macos => if (keymap.macKeycode(usage)) |k| @intCast(k) else null,
         .windows => if (keymap.winScancode(usage)) |k| @intCast(k) else null,
+        .linux => if (keymap.x11Keycode(usage)) |k| @intCast(k) else null,
         else => null,
     };
 }
@@ -192,12 +200,14 @@ const Peer = struct {
 const Link = union(enum) {
     ws: net.Stream,
     rtc: *webrtc.Session,
+    relay: *relay.Session,
 
     /// Wakes the connection's reader, or ends the session. `graceful` lets queued messages (a "bye") get through.
     fn shutdown(l: Link, io: Io, graceful: bool) void {
         switch (l) {
             .ws => |s| s.shutdown(io, .both) catch {},
             .rtc => |s| if (graceful) s.closeAfter(1000) else s.close(),
+            .relay => |s| if (graceful) s.closeAfter(1000) else s.close(),
         }
     }
 };
@@ -375,6 +385,11 @@ const Viewer = struct {
                 m.release(v.host.gpa);
                 if (!ok) break;
             },
+            .relay => |session| while (v.pop()) |m| {
+                const ok = m.opcode == .pong or if (session.send(m.opcode == .binary, m.payload())) true else |_| false;
+                m.release(v.host.gpa);
+                if (!ok) break;
+            },
         }
         v.lock();
         const graceful = v.closing and !v.aborted;
@@ -419,6 +434,11 @@ pub const Host = struct {
     identity: dtls.Identity = undefined,
     signal: ?*signal.Signal = null,
     rtc: [max_rtc]?*RtcConn = @splat(null),
+    relays: [max_rtc]?*RelayConn = @splat(null),
+    /// The relay in use (under mutex): empty — none.
+    relay_url_buf: [relay.max_url]u8 = undefined,
+    relay_url_len: usize = 0,
+    relay_trust: relay.Trust = .{},
     /// Offers already taken (the same offer arrives through every broker, and may be replayed)
     /// and when the last sessions started.
     guard: signal.Guard = .{},
@@ -602,6 +622,10 @@ pub const Host = struct {
         switch (link) {
             .ws => |stream| h.sendDirect(stream, json),
             .rtc => |s| {
+                s.sendText(json);
+                s.closeAfter(1000);
+            },
+            .relay => |s| {
                 s.sendText(json);
                 s.closeAfter(1000);
             },
@@ -1281,6 +1305,7 @@ pub const Host = struct {
     // Viewers from anywhere: signaling messages → WebRTC sessions → the viewer logic above.
 
     fn startRemote(h: *Host) void {
+        h.loadRelay();
         h.identity = dtls.Identity.generate(h.io) catch |e| {
             log("connections from anywhere are off: no DTLS certificate ({t})", .{e});
             return;
@@ -1301,21 +1326,26 @@ pub const Host = struct {
     fn onSignal(ctx: *anyopaque, text: []const u8) void {
         const port: *Port = @ptrCast(@alignCast(ctx));
         const h = port.host;
-        const SignalMsg = struct { t: []const u8 = "", id: []const u8 = "", ts: i64 = 0, sdp: []const u8 = "", c: []const u8 = "" };
+        const SignalMsg = struct { t: []const u8 = "", id: []const u8 = "", ts: i64 = 0, sdp: []const u8 = "", c: []const u8 = "", r: []const u8 = "" };
         const parsed = std.json.parseFromSlice(SignalMsg, h.gpa, text, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
         const m = parsed.value;
         if (m.id.len == 0 or m.id.len > signal.max_id_len) return;
         for (m.id) |c| if (!std.ascii.isAlphanumeric(c)) return;
         const is_offer = std.mem.eql(u8, m.t, "offer");
-        // Our own answers come back too: everything but offers and candidates is ignored.
-        if (!is_offer and !std.mem.eql(u8, m.t, "cand")) return;
+        const is_relay = std.mem.eql(u8, m.t, "relay");
+        // Our own answers come back too: everything but offers, relay requests and candidates is ignored.
+        if (!is_offer and !is_relay and !std.mem.eql(u8, m.t, "cand")) return;
         const skew = signal.skewMs(m.ts, realMs(h.io));
         if (!signal.fresh(skew)) {
-            if (is_offer) h.onStaleOffer(port, m.id, m.ts, skew);
+            if (is_offer or is_relay) h.onStaleOffer(port, m.id, m.ts, skew);
             return;
         }
         if (is_offer) return h.onOffer(port, m.id, m.ts, m.sdp);
+        if (is_relay) {
+            const refusal = h.startRelay(port.permanent, m.id, m.r) orelse return;
+            return h.signalError(port.permanent, m.id, m.ts, refusal);
+        }
         h.lock();
         defer h.unlock();
         for (h.rtc) |maybe| {
@@ -1346,6 +1376,102 @@ pub const Host = struct {
         // The reply to a refused offer goes out after the lock: publishing is network I/O.
         const refusal = h.startSession(port.permanent, id, ts, offer) orelse return;
         h.signalError(port.permanent, id, ts, refusal);
+    }
+
+    /// A browser that could not connect directly asks to meet in a room on the relay.
+    /// null — started or a repeat; otherwise why not.
+    fn startRelay(h: *Host, permanent: bool, id: []const u8, token_hex: []const u8) ?[]const u8 {
+        var token: [relay.token_len]u8 = undefined;
+        if (token_hex.len != token.len * 2) return null;
+        _ = std.fmt.hexToBytes(&token, token_hex) catch return null;
+        const now = nowUs(h.io);
+        h.lock();
+        defer h.unlock();
+        if (h.relay_url_len == 0) return "This computer has no relay: in RDC's Settings there, relay is off";
+        if (!h.guard.remember(id)) return null;
+        const slot = for (h.relays, 0..) |c, i| {
+            if (c == null) break i;
+        } else return "The computer has too many connections — try again in a minute";
+        if (!h.guard.allowStart(now)) return "Too many connection attempts — try again in a few seconds";
+        const keys = if (permanent) blk: {
+            const pid = h.perm orelse return "Permanent access is off on the computer";
+            break :blk relay.derive(totp.link_name, &pid.link_key, &token);
+        } else relay.derive(&h.code.digits, &h.salt, &token);
+        const conn = h.gpa.create(RelayConn) catch return null;
+        conn.* = .{ .host = h, .session = undefined, .permanent = permanent, .started_us = now };
+        conn.session = relay.Session.start(h.gpa, h.io, &h.relay_trust, h.relay_url_buf[0..h.relay_url_len], keys, .{
+            .ctx = conn,
+            .message = relayMessage,
+            .closed = relayClosed,
+        }) catch |e| {
+            h.gpa.destroy(conn);
+            log("relay: cannot start a session: {t}", .{e});
+            return "RDC on the computer cannot reach its relay";
+        };
+        h.relays[slot] = conn;
+        log("relay: a browser asked to meet at {s}", .{h.relay_url_buf[0..h.relay_url_len]});
+        return null;
+    }
+
+    fn relayMessage(ctx: *anyopaque, s: *relay.Session, binary: bool, data: []const u8) void {
+        const c: *RelayConn = @ptrCast(@alignCast(ctx));
+        if (!c.host.onMessage(.{ .relay = s }, Peer.fromText("relay"), &c.viewer, if (binary) .binary else .text, data, c.permanent)) {
+            s.closeAfter(1000);
+        }
+    }
+
+    fn relayClosed(ctx: *anyopaque, s: *relay.Session, reason: []const u8) void {
+        _ = s;
+        const c: *RelayConn = @ptrCast(@alignCast(ctx));
+        const h = c.host;
+        if (c.viewer) |v| {
+            h.removeViewer(v);
+        } else {
+            log("relay: a browser did not connect: {s}", .{reason});
+        }
+        h.lock();
+        for (&h.relays) |*slot| {
+            if (slot.* == c) slot.* = null;
+        }
+        h.unlock();
+        h.gpa.destroy(c);
+    }
+
+    /// Relay sessions whose browser never said hello.
+    fn dropStaleRelays(h: *Host) void {
+        const now = nowUs(h.io);
+        h.lock();
+        defer h.unlock();
+        for (h.relays) |maybe| {
+            const c = maybe orelse continue;
+            if (c.viewer == null and !c.dropped and now -| c.started_us > relay_start_us) {
+                c.dropped = true;
+                c.session.close();
+            }
+        }
+    }
+
+    /// The relay from --relay, or else Settings: not set — the default one, "off" — none.
+    fn loadRelay(h: *Host) void {
+        var buf: [relay.max_url + 1]u8 = undefined;
+        var url: []const u8 = default_relay;
+        if (h.opts.relay) |r| {
+            url = r;
+        } else {
+            const n = plat.rdc_pref_string("relay", &buf, buf.len);
+            if (n >= 0) url = buf[0..@intCast(n)];
+        }
+        if (std.mem.eql(u8, url, "off") or url.len == 0) url = "";
+        if (url.len > 0 and (url.len > relay.max_url or relay.Url.parse(url) == null)) {
+            log("relay: \"{s}\" is not a relay address (https://…) — using the default one", .{url});
+            url = default_relay;
+        }
+        const trimmed = std.mem.trimEnd(u8, std.mem.trim(u8, url, " \t"), "/");
+        h.lock();
+        @memcpy(h.relay_url_buf[0..trimmed.len], trimmed);
+        h.relay_url_len = trimmed.len;
+        h.unlock();
+        log("relay: {s}", .{if (trimmed.len == 0) "off" else trimmed});
     }
 
     fn signalFor(h: *Host, permanent: bool) ?*signal.Signal {
@@ -1401,7 +1527,13 @@ pub const Host = struct {
             0...0x09, 0x0b, 0x0c, 0x0e...0x1f => {},
             else => w.writeByte(ch) catch return,
         };
-        w.writeAll("\"}") catch return;
+        w.writeAll("\"") catch return;
+        // Where to meet if the direct path fails.
+        const h = c.host;
+        h.lock();
+        if (h.relay_url_len > 0) w.print(",\"relay\":\"{s}\"", .{h.relay_url_buf[0..h.relay_url_len]}) catch {};
+        h.unlock();
+        w.writeAll("}") catch return;
         if (c.host.signalFor(c.permanent)) |sig| sig.send(w.buffered());
     }
 
@@ -1542,6 +1674,7 @@ pub const Host = struct {
             }
             if (h.signal) |s| s.keepalive();
             if (h.perm_signal) |s| s.keepalive();
+            h.dropStaleRelays();
             h.watchRemote();
             h.updater.tick(h.viewerCount());
         }
@@ -1549,6 +1682,16 @@ pub const Host = struct {
 };
 
 /// A WebRTC session and, once the browser has sent the right code, its viewer.
+/// A relay session and, once the browser has sent the right code, its viewer.
+const RelayConn = struct {
+    host: *Host,
+    session: *relay.Session,
+    viewer: ?*Viewer = null,
+    permanent: bool,
+    started_us: u64,
+    dropped: bool = false,
+};
+
 const RtcConn = struct {
     host: *Host,
     session: *webrtc.Session,
@@ -1601,6 +1744,7 @@ fn onAction(ctx: ?*anyopaque, action: c_int) callconv(.c) void {
             h.setPermanent(action == plat.action_permanent_on, false);
         },
         plat.action_permanent_reset => h.setPermanent(true, true),
+        plat.action_relay_changed => h.loadRelay(),
         plat.action_check_update => h.updater.checkNow(),
         plat.action_install_update => {
             h.kickAll("The computer is updating RDC — reconnect in a minute");

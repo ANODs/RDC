@@ -4,3 +4,5 @@ zig-out/
 builds/
 third_party/steamworks/
 .DS_Store
+relay/.wrangler/
+relay/node_modules/
