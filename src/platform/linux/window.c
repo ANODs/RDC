@@ -222,6 +222,8 @@ static struct {
 } S = {.code = "— — —", .status = "Starting…", .autoupd = 1};
 
 static atomic_int g_mode;  // 0 — not running yet, 1 — GTK window, 2 — no window
+// Another launch asked for the window before it existed: show it once it does.
+static atomic_int g_show_pending;
 static atomic_int g_refresh_queued;
 static rdc_ctx_cb g_on_ready;
 static rdc_action_cb g_on_action;
@@ -775,8 +777,11 @@ static void *instance_main(void *arg) {
         if (read(c, buf, sizeof buf) < 0) {
         }
         close(c);
-        if (atomic_load(&g_mode) == 1)
+        int mode = atomic_load(&g_mode);
+        if (mode == 1)
             G.idle_add(present_idle, NULL);
+        else if (mode == 0)
+            atomic_store(&g_show_pending, 1);
         else
             rlog("another launch of RDC asked for the window, but this one has none");
     }
@@ -823,6 +828,7 @@ void rdc_app_run(rdc_ctx_cb on_ready, rdc_action_cb on_action, void *ctx) {
     G.widget_show_all(w_main);
     refresh();
     G.idle_add(ready_idle, NULL);
+    if (atomic_exchange(&g_show_pending, 0)) G.idle_add(present_idle, NULL);
     G.main();
     rlog("window closed, RDC quits");
     exit(0);

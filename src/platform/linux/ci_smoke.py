@@ -189,7 +189,9 @@ def main():
 
     # 3. A mouse move from the viewer moves the X pointer; the cursor in the picture brings a frame.
     width, height = (int(v) for v in xdotool("getdisplaygeometry").split())
-    nx, ny = 0.25, 0.75
+    # Somewhere the pointer is not yet: an earlier run may have left it at the first spot.
+    loc = dict(kv.split("=", 1) for kv in xdotool("getmouselocation", "--shell").split())
+    nx, ny = (0.25, 0.75) if int(loc["X"]) > width // 2 or int(loc["Y"]) < height // 2 else (0.7, 0.3)
     ws.send(2, struct.pack("<Bff", 1, nx, ny))
     time.sleep(0.5)
     loc = dict(kv.split("=", 1) for kv in xdotool("getmouselocation", "--shell").split())
